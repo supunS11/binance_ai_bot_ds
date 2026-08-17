@@ -328,6 +328,120 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertTrue(manager.has_open_position("BTCUSDT"))
         self.assertEqual(manager.positions["BTCUSDT"]["sl_order_id"], "")
 
+    def _dca_shape_open_orders(self):
+        # No STOP_MARKET at all - TP1 (partial) + TP2 (full) both resting,
+        # exactly what execution.enter_trade_dca_pending produces and
+        # nothing else in this codebase does. See _recover_dca_pending_position.
+        return [
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "false", "triggerPrice": "102", "origQty": "0.8", "algoId": "tp1_1"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "104", "algoId": "tp2_1"},
+        ]
+
+    class _FakeCandleStore:
+        def __init__(self, candles):
+            self._candles = candles
+
+        def get(self, symbol):
+            return self._candles
+
+    class _FakeFeed:
+        def __init__(self, candles):
+            self.candles = ReconcileOnStartupTests._FakeCandleStore(candles)
+
+    def test_dca_pending_shape_with_feed_recovers_dca_pending_stage(self):
+        manager = PositionManager()
+        feed = self._FakeFeed(["candle"])  # non-empty is all _adopt_position checks
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.5), \
+             patch.object(risk_manager, "compute_dca_price", return_value=96.0) as compute_dca, \
+             patch.object(exchange, "place_stop_loss") as place_sl:
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        self.assertEqual(position["dca_price"], 96.0)
+        self.assertIsNone(position["sl_order_id"])
+        self.assertFalse(position["dca_applied"])
+        self.assertEqual(position["tp1_price"], 102.0)
+        self.assertEqual(position["tp2_price"], 104.0)
+        self.assertEqual(position["tp1_quantity"], 0.8)
+        self.assertIsNone(position["risk_distance"])  # honest - no recoverable original stop
+        place_sl.assert_not_called()  # no emergency stop - the DCA mechanism survived instead
+        compute_dca.assert_called_once_with(100.0, "BUY", [], atr=0.5)
+
+    def test_dca_pending_shape_without_feed_falls_back_to_emergency_stop(self):
+        # No feed passed (matches every existing call site/test above,
+        # and a real run with WS_ENABLED off) - can't recompute dca_price
+        # without candles, so this must degrade to the same safe,
+        # already-proven emergency-stop path as any other no-SL position,
+        # not silently drop the position or crash.
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}) as place_sl:
+            manager.reconcile_on_startup()  # feed defaults to None
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        place_sl.assert_called_once()
+        self.assertEqual(position["sl_order_id"], "emergency_sl")
+
+    def test_dca_pending_shape_but_dca_disabled_falls_back_to_emergency_stop(self):
+        # Same TP1+TP2-no-SL shape, but DCA_ENABLED=False means this
+        # codebase's only producer of that shape isn't active - treat it
+        # like any other anomalous no-SL position instead of assuming DCA.
+        manager = PositionManager()
+        feed = self._FakeFeed(["candle"])
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", False), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}) as place_sl:
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        place_sl.assert_called_once()
+
+    def test_dca_pending_recovery_with_no_candles_falls_back_to_emergency_stop(self):
+        manager = PositionManager()
+        feed = self._FakeFeed([])  # feed present but empty history
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}) as place_sl:
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        place_sl.assert_called_once()
+
+    def test_dca_pending_recovery_with_uncomputable_dca_price_falls_back(self):
+        manager = PositionManager()
+        feed = self._FakeFeed(["candle"])
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.5), \
+             patch.object(risk_manager, "compute_dca_price", return_value=None), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}) as place_sl:
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        place_sl.assert_called_once()
+
 
 class ReentryCooldownTests(unittest.TestCase):
     def test_symbol_never_closed_is_not_in_cooldown(self):
@@ -1145,6 +1259,34 @@ class ReplaceSlOrderTests(unittest.TestCase):
             )
 
         self.assertEqual(outcome, "BREAKEVEN_TRIGGER_MARKET_CLOSE")  # neither profit flag set
+        self.assertFalse(replaced)
+        market_close.assert_called_once()
+
+    def test_minus_2021_on_dca_active_position_closes_as_dca_sl_hit(self):
+        # Real VPS evidence (2026-08-17, SCRUSDT): DCA only fires while
+        # price is already moving hard against the position, so by the
+        # time the post-DCA SL order goes out, price has often already
+        # traded through it - this -2021 fallback is DCA_ACTIVE's most
+        # common real SL-hit path, not an edge case. It must not fall
+        # through to the generic pre-DCA BREAKEVEN_TRIGGER_MARKET_CLOSE
+        # label, which hid this exact loss from DCA-specific analysis.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["stage"] = DCA_ACTIVE
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(
+                 exchange, "place_stop_loss",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close, \
+             patch.object(exchange, "cancel_all_open_orders"):
+            outcome, replaced = manager._replace_sl_order(
+                manager.positions["BTCUSDT"], 101.0, "test reason"
+            )
+
+        self.assertEqual(outcome, "DCA_SL_HIT")
         self.assertFalse(replaced)
         market_close.assert_called_once()
 
@@ -3479,6 +3621,35 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         self.assertIsNone(outcome)
         new_sl.assert_not_called()
         self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 101.0)
+
+    def test_minus_2021_during_structure_trailing_closes_as_dca_sl_hit(self):
+        # Same real-world race as ReplaceSlOrderTests' equivalent, hit via
+        # the structure-trailing path specifically (poll_live's own -2021
+        # fallback for DCA_ACTIVE, not just the direct unit test).
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position["breakeven_price"] = 98.02
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 99.0},
+             ), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(
+                 exchange, "place_stop_loss",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close, \
+             patch.object(exchange, "cancel_all_open_orders"):
+            outcome = manager.poll_live("BTCUSDT", candles=["candle"])
+
+        self.assertEqual(outcome, "DCA_SL_HIT")
+        market_close.assert_called_once()
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
 
 
 if __name__ == "__main__":

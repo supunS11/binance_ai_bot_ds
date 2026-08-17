@@ -341,7 +341,7 @@ class PositionManager:
         self.positions[symbol] = position
         return position
 
-    def reconcile_on_startup(self):
+    def reconcile_on_startup(self, feed=None):
         """Rebuild tracking for positions already open on the exchange
         when the process starts - crash, manual restart, or a redeploy.
         Without this, a restart makes the bot blind to real open
@@ -350,7 +350,15 @@ class PositionManager:
         top of it), and the existing position would never get TP1 ->
         breakeven promotion, missing-order self-heal, or its outcome
         journaled - even though its real SL/TP1/TP2 orders keep working
-        on Binance's side regardless of whether the bot remembers them."""
+        on Binance's side regardless of whether the bot remembers them.
+
+        `feed` (RealtimeMarketData, already REST-seeded by the time
+        main.py calls this - see feed.start()) is optional and used only
+        to recover a genuine DCA_PENDING position's dca_price/atr from
+        fresh candles - see _recover_dca_pending_position. Without it,
+        such a position still gets protected (falls through to the
+        existing emergency-stop path below), it just can't resume
+        waiting for its DCA level."""
         live_positions = exchange.get_all_open_positions()
         adopted = 0
 
@@ -360,7 +368,7 @@ class PositionManager:
             if symbol in self.positions:
                 continue
 
-            self._adopt_position(symbol, live_position)
+            self._adopt_position(symbol, live_position, feed=feed)
             adopted += 1
 
         if live_positions:
@@ -411,7 +419,88 @@ class PositionManager:
                 f"entry order(s) cancelled"
             )
 
-    def _adopt_position(self, symbol, live_position):
+    @staticmethod
+    def _recover_dca_pending_position(symbol, side, entry_price, quantity, tp1_order, tp2_order, feed):
+        """A real position with BOTH TP1 and TP2 resting but no SL at all,
+        under config.DCA_ENABLED, is unambiguous - that's the only entry
+        path DCA_ENABLED ever uses (see main._evaluate_symbol), and no
+        other stage in this codebase produces that exact shape - so this
+        is a genuine DCA_PENDING position, not an anomaly to protect
+        defensively. Its exact original dca_price can't survive a
+        restart (it only ever lived in memory - the whole DCA mechanism
+        deliberately has no resting exchange order for it, see the DCA
+        plan's accepted-risk note), but recomputing one fresh from
+        CURRENT structure/ATR via the same deterministic risk_manager
+        function signal time uses is honest, not a guess - if price
+        already passed the new level while the bot was down, the DCA
+        simply fires on the very next poll instead of being silently
+        lost. Returns None (caller falls back to the pre-DCA emergency-
+        stop path) when no candle history is available to compute it
+        from - a symbol that fell out of the current watchlist, or a run
+        with WS_ENABLED off."""
+        candles = feed.candles.get(symbol) if feed is not None else []
+
+        if not candles:
+            return None
+
+        pools = market_structure.find_liquidity_pools(market_structure.find_swing_points(candles))
+        atr = market_structure.average_true_range(candles)
+        dca_price = risk_manager.compute_dca_price(entry_price, side, pools, atr=atr)
+
+        if dca_price is None or dca_price <= 0:
+            return None
+
+        def _trigger_price(order):
+            return _safe_float(order.get("triggerPrice") or order.get("stopPrice"))
+
+        tp1_quantity = _safe_float(tp1_order.get("quantity") or tp1_order.get("origQty"))
+        if tp1_quantity is None:
+            tp1_quantity = round(quantity * min(max(float(config.TP1_CLOSE_PCT), 0), 100) / 100, 8)
+        tp2_quantity = max(round(quantity - tp1_quantity, 8), 0)
+
+        return {
+            "symbol": symbol,
+            "trade_id": f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "side": side,
+            "entry_price": entry_price,
+            # Reference-only, never a real resting order in this stage -
+            # same convention register_dca_pending's own sl_price follows.
+            "sl_price": risk_manager._apply_min_stop_distance(entry_price, entry_price, side),
+            "tp1_price": _trigger_price(tp1_order),
+            "tp2_price": _trigger_price(tp2_order),
+            "breakeven_price": risk_manager.compute_breakeven_price(entry_price, side),
+            "quantity": quantity,
+            "tp1_quantity": tp1_quantity,
+            "tp2_quantity": tp2_quantity,
+            "sl_order_id": None,
+            "tp1_order_id": exchange._accepted_order_id(tp1_order),
+            "tp2_order_id": exchange._accepted_order_id(tp2_order),
+            "stage": DCA_PENDING,
+            "shadow": False,
+            "opened_at": time.time(),
+            "confluence_ratio": None,
+            "early_breakeven_applied": False,
+            "early_breakeven_profit_locked": False,
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
+            "profit_protection_peak_price": None,
+            "trailing_stop_locked_profit": False,
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
+            # No original stop survives a restart to measure this from -
+            # None (unknown) is honest, same policy the plain-adopt path
+            # below already follows for a reconciled BREAKEVEN_ACTIVE.
+            "risk_distance": None,
+            "structure_level": None,
+            "trigger_candle_open_time": None,
+            "break_confirmed_by_close": None,
+            "dca_price": dca_price,
+            "dca_quantity": round(quantity * max(float(config.DCA_SIZE_MULTIPLIER), 0), 8),
+            "dca_applied": False,
+            "atr": atr,
+        }
+
+    def _adopt_position(self, symbol, live_position, feed=None):
         side = live_position["side"]
         entry_price = live_position["entry_price"]
         quantity = live_position["quantity"]
@@ -433,11 +522,29 @@ class PositionManager:
 
         sl_price = _trigger_price(sl_order)
 
+        if sl_price is None and config.DCA_ENABLED and tp1_order and tp2_order:
+            recovered = self._recover_dca_pending_position(
+                symbol, side, entry_price, quantity, tp1_order, tp2_order, feed
+            )
+
+            if recovered is not None:
+                self.positions[symbol] = recovered
+                log_info(
+                    f"{symbol} adopted existing open position | side={side} "
+                    f"entry={entry_price} stage=DCA_PENDING (no SL by design) "
+                    f"dca_price={recovered['dca_price']} tp1={recovered['tp1_price']} "
+                    f"tp2={recovered['tp2_price']}"
+                )
+                return
+
         if sl_price is None:
             # A real open position with no stop at all - treat as an
             # emergency: reconstruct a minimum-distance stop and place it
             # immediately rather than leave it unprotected until the next
-            # opportunity to notice.
+            # opportunity to notice. Reached either because this isn't a
+            # DCA_PENDING position at all, or it is one but no candle
+            # history was available to recompute its dca_price above -
+            # either way, protecting it now beats leaving it exposed.
             sl_price = risk_manager._apply_min_stop_distance(entry_price, entry_price, side)
             log_warning(
                 f"{symbol} open position found with NO stop-loss during "
@@ -824,6 +931,12 @@ class PositionManager:
                 "TRAILING_STOP_PROFIT_HIT" if position.get("trailing_stop_locked_profit")
                 else "PROFIT_PROTECTION_HIT" if position.get("profit_protection_profit_locked")
                 else "EARLY_BREAKEVEN_PROFIT_HIT" if position.get("early_breakeven_profit_locked")
+                # A DCA_ACTIVE position never has an EARLY_BREAKEVEN promotion
+                # of its own (that path only exists pre-DCA), so this is
+                # unambiguous - reached only when the -2021 fallback fires on
+                # a DCA position's SL with no profit locked yet, i.e. a real
+                # DCA stop-loss, not a leftover pre-DCA breakeven close.
+                else "DCA_SL_HIT" if position.get("stage") == DCA_ACTIVE
                 else "BREAKEVEN_TRIGGER_MARKET_CLOSE"
             )
             return self._close(symbol, outcome)
