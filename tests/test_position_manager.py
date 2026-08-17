@@ -3117,6 +3117,63 @@ class PollShadowDcaActiveTests(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertTrue(manager.has_open_position("BTCUSDT"))
 
+    def test_profit_protection_can_arm_a_dca_active_position(self):
+        # The actual fix, exercised end to end: entry=98, tp_price=106 (8
+        # wide). ACTIVATION_PCT_OF_TP1=50 -> arms once price is 4 above
+        # entry (102). close=103 clears that. LOCK_PCT_OF_TP1=25 -> flat
+        # floor of 98+2=100; RETRACE_PCT=50 off a peak of 103 -> 98 +
+        # (103-98)*0.5 = 100.5, the more favorable of the two.
+        manager = self._manager_with_dca_active()
+        candle = _candle(high=103, low=99, close=103)
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 50), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["profit_protection_applied"])
+        self.assertEqual(position["stage"], DCA_ACTIVE)  # no stage transition needed - already protected
+        self.assertAlmostEqual(position["sl_price"], 100.5)
+
+    def test_profit_protection_trails_further_once_armed(self):
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position.update({
+            "profit_protection_applied": True,
+            "profit_protection_profit_locked": True,
+            "profit_protection_peak_price": 103.0,
+            "sl_price": 100.5,
+        })
+        candle = _candle(high=105, low=104, close=105)
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["profit_protection_peak_price"], 105.0)
+        # retrace_price = 98 + (105-98)*0.5 = 101.5; flat lock = 100 - max is 101.5
+        self.assertAlmostEqual(position["sl_price"], 101.5)
+
+    def test_profit_protection_disabled_is_a_noop(self):
+        manager = self._manager_with_dca_active()
+        candle = _candle(high=103, low=99, close=103)
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", False):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["profit_protection_applied"])
+        self.assertEqual(position["sl_price"], 94.0)  # untouched
+
 
 class PollLiveDcaPendingTests(unittest.TestCase):
     def setUp(self):
@@ -3190,9 +3247,15 @@ class PollLiveDcaPendingTests(unittest.TestCase):
 
 class PollLiveDcaActiveTests(unittest.TestCase):
     def setUp(self):
-        self.mae_patcher = patch.object(config, "MAE_TRACKING_ENABLED", False)
-        self.mae_patcher.start()
-        self.addCleanup(self.mae_patcher.stop)
+        # PROFIT_PROTECTION_ENABLED now applies to DCA_ACTIVE too (see
+        # _is_dca_profit_protection_candidate) - off by default here so
+        # these SL/TP-status tests stay isolated from it and don't need
+        # to mock exchange.get_mark_price. DcaActiveProfitProtectionTests
+        # below covers the promotion/trailing behavior directly.
+        for name, value in (("MAE_TRACKING_ENABLED", False), ("PROFIT_PROTECTION_ENABLED", False)):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _manager_with_dca_active(self):
         manager = PositionManager()
@@ -3245,6 +3308,63 @@ class PollLiveDcaActiveTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+    def test_profit_protection_can_arm_a_dca_active_position(self):
+        # Same numbers as PollShadowDcaActiveTests' equivalent test:
+        # entry=98, tp_price=106, ACTIVATION_PCT_OF_TP1=50 arms at 102,
+        # mark price 103 clears it, lock/retrace both computed the same
+        # way -> 100.5.
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 50), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "get_mark_price", return_value=103.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_pp"}) as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["profit_protection_applied"])
+        cancel.assert_called_once_with("BTCUSDT", "sl_new")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 100.5)
+        self.assertEqual(position["sl_order_id"], "sl_pp")
+        self.assertEqual(position["sl_price"], 100.5)
+
+    def test_profit_protection_trails_once_armed(self):
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position.update({
+            "profit_protection_applied": True,
+            "profit_protection_profit_locked": True,
+            "profit_protection_peak_price": 103.0,
+            "sl_price": 100.5,
+            "sl_order_id": "sl_pp",
+        })
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "get_mark_price", return_value=105.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_pp2"}) as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        cancel.assert_called_once_with("BTCUSDT", "sl_pp")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 101.5)
+        self.assertEqual(position["sl_price"], 101.5)
 
 
 if __name__ == "__main__":
