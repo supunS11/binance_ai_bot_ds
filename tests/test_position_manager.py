@@ -2880,6 +2880,20 @@ class ExecuteDcaShadowTests(unittest.TestCase):
         args, _ = build_plan.call_args
         self.assertEqual(args[2], 96)
 
+    def test_breakeven_price_is_recomputed_from_the_new_blended_entry(self):
+        # Real gap this closes: left stale at the ORIGINAL (pre-DCA)
+        # entry's breakeven, config.STRUCTURE_STOP_MANAGEMENT_ENABLED's
+        # trailing_stop_locked_profit flag would compare a post-DCA
+        # trail against the wrong reference price.
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
+            manager._execute_dca(position)
+
+        self.assertAlmostEqual(position["breakeven_price"], 98.0 * 1.0002)
+
     def test_no_exchange_calls_happen_in_shadow_mode(self):
         manager = self._manager_with_dca_pending()
         position = manager.positions["BTCUSDT"]
@@ -3174,6 +3188,60 @@ class PollShadowDcaActiveTests(unittest.TestCase):
         self.assertFalse(position["profit_protection_applied"])
         self.assertEqual(position["sl_price"], 94.0)  # untouched
 
+    def test_structure_trailing_can_replace_a_dca_active_sl(self):
+        # breakeven_price set explicitly to what _execute_dca would
+        # really compute for entry=98 (see ExecuteDcaShadowTests.test_
+        # breakeven_price_is_recomputed_from_the_new_blended_entry) - a
+        # candidate of 99.0 is a genuine locked profit against THAT
+        # reference, but would wrongly read as a scratch against the
+        # stale pre-DCA breakeven (100.02) this fixture used to leave in
+        # place before that fix.
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position["breakeven_price"] = 98.02
+        candle = _candle(high=103, low=99, close=102)
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", False), \
+             patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 99.0},
+             ):
+            outcome = manager.poll_shadow("BTCUSDT", candle, candles=["candle"])
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(position["sl_price"], 99.0)
+        self.assertTrue(position["trailing_stop_locked_profit"])
+
+    def test_structure_trailing_does_not_loosen_an_already_better_sl(self):
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position["sl_price"] = 101.0  # already better than the swing below
+        candle = _candle(high=104, low=101.5, close=103)  # stays clear of both sl_price and tp_price
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", False), \
+             patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 99.0},
+             ):
+            outcome = manager.poll_shadow("BTCUSDT", candle, candles=["candle"])
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 101.0)  # untouched
+
+    def test_structure_trailing_disabled_or_no_candles_is_a_noop(self):
+        manager = self._manager_with_dca_active()
+        candle = _candle(high=103, low=99, close=102)
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", False), \
+             patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True):
+            outcome = manager.poll_shadow("BTCUSDT", candle, candles=None)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 94.0)  # untouched
+
 
 class PollLiveDcaPendingTests(unittest.TestCase):
     def setUp(self):
@@ -3365,6 +3433,52 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         cancel.assert_called_once_with("BTCUSDT", "sl_pp")
         new_sl.assert_called_once_with("BTCUSDT", "BUY", 101.5)
         self.assertEqual(position["sl_price"], 101.5)
+
+    def test_structure_trailing_can_replace_a_dca_active_sl(self):
+        # Same breakeven_price reasoning as the shadow-mode equivalent -
+        # a candidate of 99.0 only reads as a genuine locked profit
+        # against the post-DCA breakeven (98.02), not the stale pre-DCA
+        # one this fixture used to leave in place.
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position["breakeven_price"] = 98.02
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 99.0},
+             ), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_struct"}) as new_sl:
+            outcome = manager.poll_live("BTCUSDT", candles=["candle"])
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        cancel.assert_called_once_with("BTCUSDT", "sl_new")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 99.0)
+        self.assertEqual(position["sl_price"], 99.0)
+        self.assertTrue(position["trailing_stop_locked_profit"])
+
+    def test_structure_trailing_does_not_loosen_an_already_better_sl(self):
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position["sl_price"] = 101.0  # already better than the swing below
+
+        with patch.object(config, "STRUCTURE_STOP_MANAGEMENT_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "last_swing_low": 99.0},
+             ), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "place_stop_loss") as new_sl:
+            outcome = manager.poll_live("BTCUSDT", candles=["candle"])
+
+        self.assertIsNone(outcome)
+        new_sl.assert_not_called()
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 101.0)
 
 
 if __name__ == "__main__":

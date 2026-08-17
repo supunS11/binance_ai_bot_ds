@@ -957,6 +957,16 @@ class PositionManager:
         position["tp_price"] = plan["tp_price"]
         position["quantity"] = plan["quantity"]
         position["risk_distance"] = plan["risk_distance"]
+        # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - _trail_stop_if_
+        # improved derives trailing_stop_locked_profit from position[
+        # "breakeven_price"] directly (not recomputed each call, unlike
+        # _structure_stop_candidate's own internal breakeven check) - left
+        # stale at the ORIGINAL (pre-DCA) entry's breakeven, that flag
+        # would misclassify a genuine post-DCA trail against the wrong
+        # reference price. Recomputed here from the new blended entry.
+        position["breakeven_price"] = risk_manager.compute_breakeven_price(
+            plan["entry_price"], side
+        )
         position["dca_applied"] = True
         position["stage"] = DCA_ACTIVE
         log_info(
@@ -1333,7 +1343,13 @@ class PositionManager:
                 if outcome is not None:
                     return outcome
 
-            return None
+            # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - _structure_stop_
+            # candidate and _trail_stop_if_improved are both already
+            # generic over position["entry_price"]/["side"]/["sl_price"]/
+            # ["breakeven_price"] - no DCA-specific logic needed here, as
+            # long as _execute_dca kept those fields current (it does).
+            # Same ratchet-only trail BREAKEVEN_ACTIVE already uses below.
+            return self._trail_stop_if_improved(position, candles)
 
         if position["stage"] == TP1_PENDING:
             if self._try_early_promotions(
@@ -1758,6 +1774,21 @@ class PositionManager:
                         f"{symbol} [SHADOW] profit protection trailing stop (post-DCA) | "
                         f"SL -> {candidate}"
                     )
+
+            # config.STRUCTURE_STOP_MANAGEMENT_ENABLED - _structure_stop_
+            # candidate is already generic over position["entry_price"]/
+            # ["side"] - _execute_dca keeps breakeven_price current too,
+            # so trailing_stop_locked_profit below compares against the
+            # post-DCA breakeven, not the stale pre-DCA one.
+            if config.STRUCTURE_STOP_MANAGEMENT_ENABLED and candles:
+                candidate = _structure_stop_candidate(position, candles)
+
+                if candidate is not None and _more_favorable(side, candidate, position["sl_price"]):
+                    position["sl_price"] = candidate
+                    position["trailing_stop_locked_profit"] = _more_favorable(
+                        side, candidate, position["breakeven_price"]
+                    )
+                    log_info(f"{symbol} [SHADOW] structure trailing stop (post-DCA) | SL -> {candidate}")
 
             return None
 
