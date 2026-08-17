@@ -871,7 +871,8 @@ class PositionManager:
                 # the same failing order.
                 log_warning(
                     f"{symbol} new SL level already reached by price - "
-                    "closing remainder at market"
+                    f"closing remainder at market ({reason}, attempted "
+                    f"target={target_price})"
                 )
                 return self._close_remainder_at_market(position), False
 
