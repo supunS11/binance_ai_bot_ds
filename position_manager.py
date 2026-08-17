@@ -1081,6 +1081,11 @@ class PositionManager:
             plan["entry_price"], side
         )
         position["dca_applied"] = True
+        # config.DCA_BREAKEVEN_ENABLED - DCA_ACTIVE always starts unarmed,
+        # same reasoning as profit_protection_applied above (a DCA that
+        # fires always comes from DCA_PENDING, never an already-promoted
+        # position).
+        position["dca_breakeven_applied"] = False
         position["stage"] = DCA_ACTIVE
         log_info(
             f"{symbol}{' [SHADOW]' if shadow else ''} DCA fired | "
@@ -1201,6 +1206,32 @@ class PositionManager:
             return False
 
         return position.get("tp_price") is not None
+
+    @staticmethod
+    def _is_dca_breakeven_candidate(position):
+        """config.DCA_BREAKEVEN_ENABLED - see its config.py comment for
+        the gap this closes: between firing and either PROFIT_PROTECTION's
+        much deeper ROI-of-TP threshold or a lagging confirmed structure
+        swing, a DCA_ACTIVE position that merely recovers to breakeven has
+        nothing protecting it. One-time arm, same shape as
+        _is_dca_profit_protection_candidate - dca_breakeven_applied is set
+        the moment it fires and never re-checked again for this position."""
+        if not config.DCA_BREAKEVEN_ENABLED or position.get("dca_breakeven_applied"):
+            return False
+
+        return position["stage"] == DCA_ACTIVE
+
+    @staticmethod
+    def _dca_breakeven_price_reached(position, current_price):
+        """Has price reached position["breakeven_price"] yet - shared by
+        poll_live (real mark price) and poll_shadow (simulated candle
+        touch), same pattern as _dca_price_reached."""
+        if current_price is None or current_price <= 0:
+            return False
+
+        side = position["side"]
+        breakeven = position["breakeven_price"]
+        return current_price >= breakeven if side == "BUY" else current_price <= breakeven
 
     @staticmethod
     def _profit_protection_lock_price(position, target_price=None):
@@ -1365,11 +1396,13 @@ class PositionManager:
         )
         dca_candidate = self._is_dca_candidate(position)
         dca_profit_protection_candidate = self._is_dca_profit_protection_candidate(position)
+        dca_breakeven_candidate = self._is_dca_breakeven_candidate(position)
         current_price = None
 
         if (
             config.MAE_TRACKING_ENABLED or early_breakeven_candidate
             or profit_protection_candidate or dca_candidate or dca_profit_protection_candidate
+            or dca_breakeven_candidate
         ):
             current_price = exchange.get_mark_price(symbol)
             self._update_mae_mfe(position, current_price)
@@ -1431,6 +1464,29 @@ class PositionManager:
                         position["profit_protection_profit_locked"] = True
 
                     return None
+
+            # config.DCA_BREAKEVEN_ENABLED - same "fresh arm" shape as
+            # profit protection above, checked second (mirrors
+            # _try_early_promotions' profit-protection-then-early-
+            # breakeven ordering): if this tick's move already satisfied
+            # profit protection's much deeper threshold, that arm already
+            # fired and returned above - this only fires on its own for a
+            # smaller recovery that reaches breakeven but not that far.
+            if (
+                dca_breakeven_candidate
+                and self._dca_breakeven_price_reached(position, current_price)
+            ):
+                outcome, replaced = self._replace_sl_order(
+                    position, position["breakeven_price"], "DCA breakeven (price reached)",
+                )
+
+                if outcome is not None:
+                    return outcome
+
+                if replaced:
+                    position["dca_breakeven_applied"] = True
+
+                return None
 
             sl_status = self._status_or_missing(symbol, position["sl_order_id"])
 
@@ -1868,6 +1924,23 @@ class PositionManager:
                         f"SL -> {position['sl_price']}"
                     )
                     return None
+
+            # config.DCA_BREAKEVEN_ENABLED - same "fresh arm" shape as
+            # profit protection above, checked second: if this candle's
+            # move already satisfied profit protection's much deeper
+            # threshold, that arm already fired and returned above - this
+            # only fires on its own for a smaller recovery.
+            if (
+                self._is_dca_breakeven_candidate(position)
+                and self._dca_breakeven_price_reached(position, latest_candle["close"])
+            ):
+                position["dca_breakeven_applied"] = True
+                position["sl_price"] = position["breakeven_price"]
+                log_info(
+                    f"{symbol} [SHADOW] DCA breakeven (price reached) | "
+                    f"SL -> {position['sl_price']}"
+                )
+                return None
 
             if position.get("profit_protection_applied"):
                 peak_source = high if side == "BUY" else low

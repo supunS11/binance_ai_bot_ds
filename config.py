@@ -1008,6 +1008,22 @@ DCA_TP_MAX_R_MULTIPLE = env_float("DCA_TP_MAX_R_MULTIPLE", 10.0)
 # placed once DCA fires - mirrors STRUCTURE_STOP_ATR_BUFFER's own role for
 # the (unused, pre-DCA) original stop calculation.
 DCA_STRUCTURE_STOP_ATR_BUFFER = env_float("DCA_STRUCTURE_STOP_ATR_BUFFER", 0.5)
+# Real gap found live (2026-08-17, operator observation): a DCA_ACTIVE
+# position's only two protection mechanisms are PROFIT_PROTECTION_ENABLED
+# (needs PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 of the way to the single,
+# wide post-DCA TP - a deep move) and STRUCTURE_STOP_MANAGEMENT_ENABLED
+# (needs a NEW confirmed swing, which can lag hours). Between those, a
+# trade that recovers all the way to breakeven and then reverses has
+# nothing moving its stop - it rides back down to the original post-DCA
+# SL (a real loss) with zero protection in between. This closes that gap
+# the same way MOVE_SL_TO_BREAKEVEN_AFTER_TP1 already does for a genuine
+# TP1 fill: the moment price reaches position["breakeven_price"], replace
+# the SL there. One-time arm per position (see dca_breakeven_applied) -
+# profit protection/structure trailing still run on top of it afterward.
+# Default ON: same "turns a full loss into a scratch" reasoning already
+# behind EARLY_BREAKEVEN_ENABLED's default in this project, just applied
+# to the post-DCA stage instead of the pre-DCA one.
+DCA_BREAKEVEN_ENABLED = env_bool("DCA_BREAKEVEN_ENABLED", "True")
 
 # =========================
 # EXECUTION

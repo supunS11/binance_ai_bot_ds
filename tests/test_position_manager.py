@@ -3236,6 +3236,16 @@ class PollShadowDcaPendingTests(unittest.TestCase):
 
 
 class PollShadowDcaActiveTests(unittest.TestCase):
+    def setUp(self):
+        # config.DCA_BREAKEVEN_ENABLED defaults True - off here so these
+        # SL/TP-status and structure-trailing tests stay isolated from it
+        # (this fixture's breakeven_price is left at register_dca_pending's
+        # pre-DCA value, not recomputed for entry=98, so it would otherwise
+        # arm unexpectedly). DcaBreakevenTests below covers it directly.
+        patcher = patch.object(config, "DCA_BREAKEVEN_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _manager_with_dca_active(self):
         manager = PositionManager()
         manager.register_dca_pending(_dca_plan(), {"shadow": True})
@@ -3243,6 +3253,7 @@ class PollShadowDcaActiveTests(unittest.TestCase):
         position.update({
             "stage": DCA_ACTIVE, "entry_price": 98.0, "sl_price": 94.0,
             "tp_price": 106.0, "quantity": 2.0, "dca_applied": True,
+            "dca_breakeven_applied": False,
         })
         return manager
 
@@ -3272,6 +3283,47 @@ class PollShadowDcaActiveTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+    def test_dca_breakeven_arms_when_price_reaches_breakeven(self):
+        # entry=98, sl=94 (a real loss level) - a candle whose close
+        # reaches breakeven_price=98.02 closes the gap this feature
+        # exists for: nothing else would have moved this SL yet.
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+        candle = _candle(high=98.5, low=97.5, close=98.02)
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertEqual(position["sl_price"], 98.02)
+
+    def test_dca_breakeven_does_not_arm_below_breakeven(self):
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+        candle = _candle(high=97.5, low=95, close=97.0)
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["dca_breakeven_applied"])
+        self.assertEqual(position["sl_price"], 94.0)
+
+    def test_dca_breakeven_disabled_is_a_noop(self):
+        manager = self._manager_with_dca_active()  # DCA_BREAKEVEN_ENABLED=False from setUp
+        manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+        candle = _candle(high=99, low=97.5, close=98.5)  # would otherwise arm
+
+        outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["dca_breakeven_applied"])
+        self.assertEqual(position["sl_price"], 94.0)
 
     def test_profit_protection_can_arm_a_dca_active_position(self):
         # The actual fix, exercised end to end: entry=98, tp_price=106 (8
@@ -3457,12 +3509,17 @@ class PollLiveDcaPendingTests(unittest.TestCase):
 
 class PollLiveDcaActiveTests(unittest.TestCase):
     def setUp(self):
-        # PROFIT_PROTECTION_ENABLED now applies to DCA_ACTIVE too (see
-        # _is_dca_profit_protection_candidate) - off by default here so
-        # these SL/TP-status tests stay isolated from it and don't need
-        # to mock exchange.get_mark_price. DcaActiveProfitProtectionTests
-        # below covers the promotion/trailing behavior directly.
-        for name, value in (("MAE_TRACKING_ENABLED", False), ("PROFIT_PROTECTION_ENABLED", False)):
+        # PROFIT_PROTECTION_ENABLED and DCA_BREAKEVEN_ENABLED both apply to
+        # DCA_ACTIVE (see _is_dca_profit_protection_candidate/
+        # _is_dca_breakeven_candidate) and both default True - off here so
+        # these SL/TP-status tests stay isolated and don't need to mock
+        # exchange.get_mark_price. DcaActiveProfitProtectionTests/
+        # DcaBreakevenTests below cover each directly.
+        for name, value in (
+            ("MAE_TRACKING_ENABLED", False),
+            ("PROFIT_PROTECTION_ENABLED", False),
+            ("DCA_BREAKEVEN_ENABLED", False),
+        ):
             patcher = patch.object(config, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -3479,7 +3536,7 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         position.update({
             "stage": DCA_ACTIVE, "sl_order_id": "sl_new", "tp_order_id": "tp_new",
             "entry_price": 98.0, "sl_price": 94.0, "tp_price": 106.0, "quantity": 2.0,
-            "dca_applied": True,
+            "dca_applied": True, "dca_breakeven_applied": False,
         })
         return manager
 
@@ -3518,6 +3575,88 @@ class PollLiveDcaActiveTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+    def test_dca_breakeven_arms_when_price_reaches_breakeven(self):
+        # entry=98, sl=94 (a real loss level) - mark price recovers to
+        # breakeven_price=98.02, the fix closes that gap by moving the SL
+        # there so the trade can no longer close as a full loss.
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=98.02), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        cancel.assert_called_once_with("BTCUSDT", "sl_new")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 98.02)
+        self.assertEqual(position["sl_order_id"], "sl_be")
+        self.assertEqual(position["sl_price"], 98.02)
+
+    def test_dca_breakeven_does_not_arm_below_breakeven(self):
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=97.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "place_stop_loss") as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["dca_breakeven_applied"])
+        self.assertEqual(position["sl_price"], 94.0)
+        new_sl.assert_not_called()
+
+    def test_dca_breakeven_does_not_re_arm_once_already_applied(self):
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position.update({"breakeven_price": 98.02, "dca_breakeven_applied": True, "sl_price": 98.02})
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "place_stop_loss") as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        new_sl.assert_not_called()  # already armed - structure/profit-protection trailing takes over from here
+
+    def test_profit_protection_arm_takes_priority_over_dca_breakeven_in_the_same_tick(self):
+        # Mirrors _try_early_promotions' profit-protection-then-early-
+        # breakeven ordering: if one tick's move already clears profit
+        # protection's deeper threshold, that arm wins and returns first -
+        # DCA breakeven's own arm never gets a chance to fire that tick.
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 50), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "get_mark_price", return_value=103.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_pp"}):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["profit_protection_applied"])
+        self.assertFalse(position["dca_breakeven_applied"])
+        self.assertEqual(position["sl_price"], 100.5)
 
     def test_profit_protection_can_arm_a_dca_active_position(self):
         # Same numbers as PollShadowDcaActiveTests' equivalent test:
