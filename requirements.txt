@@ -1,0 +1,6 @@
+python-binance==1.0.36
+websockets==16.1
+pandas==2.2.2
+python-dotenv==1.0.1
+colorama==0.4.6
+requests==2.32.3

@@ -1,0 +1,195 @@
+"""Append-only CSV journal of every generated entry signal and its
+eventual outcome - the same "always write real evidence, never trust
+memory" convention as v7/v8's signal_journal.py.
+
+Only signals that actually pass signal_engine (a real BUY/SELL, not every
+rejected NO_SIGNAL evaluation - that would be enormous at tick frequency)
+get a row here.
+
+Each signal gets a `trade_id`; its eventual outcome is appended as a
+separate row carrying the same `trade_id` (append-only, crash-safe - never
+mutates the original row). journal_analysis.py joins the two by that id -
+without it, a symbol with several signals close together (a known real
+pattern - see the repeated PIPPINUSDT/MANAUSDT re-entries) can't be told
+apart, which makes "why did this SL hit" unanswerable.
+"""
+import csv
+from pathlib import Path
+import time
+
+import config
+from logger import log_warning
+
+
+JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
+
+FIELDNAMES = [
+    "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
+    "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
+    "structure_level", "entry_extension_r", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
+    "zone_retracement_pct",
+    "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
+    "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
+    "liquidation_cluster", "liquidation_aligned", "efficiency_ratio", "efficiency_favorable",
+    "btc_correlation", "btc_aligned", "funding_rate", "funding_favorable", "long_short_ratio",
+    "long_short_favorable", "confluence_score", "confluence_total",
+    "confluence_ratio", "quote_volume_usdt", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
+    "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
+    "break_confirmed_by_close", "dca_applied", "outcome",
+]
+
+
+def _existing_header(path):
+    try:
+        with open(path, newline="") as handle:
+            return next(csv.reader(handle), None)
+    except (OSError, StopIteration):
+        return None
+
+
+def _ensure_header():
+    JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not JOURNAL_PATH.exists():
+        with open(JOURNAL_PATH, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=FIELDNAMES).writeheader()
+        return
+
+    # A schema change (new diagnostic fields, most recently ema_value)
+    # while a journal already exists leaves the OLD header sitting above
+    # NEW-shaped rows - csv.DictReader then keys everything off the stale
+    # header, so trade_id and every newer field silently stop resolving
+    # for every row (confirmed live: journal_analysis.py reported zero
+    # resolved trades despite real matching data being in the file).
+    # Back the mismatched file up - matching this project's existing
+    # signal_journal.bak_* convention - and start a fresh, correctly
+    # headered file rather than let analysis silently break again on the
+    # next field added.
+    existing = _existing_header(JOURNAL_PATH)
+
+    if existing is not None and existing != FIELDNAMES:
+        backup_path = JOURNAL_PATH.with_name(
+            f"signal_journal.bak_{int(time.time())}.csv"
+        )
+        JOURNAL_PATH.rename(backup_path)
+        log_warning(
+            f"signal_journal.csv header didn't match the current schema - "
+            f"backed up to {backup_path.name} and started a fresh file"
+        )
+
+        with open(JOURNAL_PATH, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=FIELDNAMES).writeheader()
+
+
+def _append_row(row):
+    _ensure_header()
+
+    with open(JOURNAL_PATH, "a", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=FIELDNAMES).writerow(row)
+
+
+def _make_trade_id(symbol):
+    return f"{symbol}_{int(time.time() * 1000)}"
+
+
+def append_signal(signal, plan):
+    """Returns the trade_id so the caller can pass it to position_manager,
+    which threads it through to append_outcome when the trade closes."""
+    trade_id = _make_trade_id(signal.get("symbol") or "UNKNOWN")
+    entry_price = plan.get("entry_price") or 0
+    risk_distance = plan.get("risk_distance") or 0
+
+    row = {field: "" for field in FIELDNAMES}
+    row.update({
+        "timestamp": time.time(),
+        "trade_id": trade_id,
+        "symbol": signal.get("symbol"),
+        "side": signal.get("signal"),
+        "entry_price": entry_price,
+        "sl_price": plan.get("sl_price"),
+        "tp1_price": plan.get("tp1_price"),
+        "tp2_price": plan.get("tp2_price"),
+        "quantity": plan.get("quantity"),
+        "risk_distance_pct": (
+            round(risk_distance / entry_price * 100, 4) if entry_price else ""
+        ),
+        "structure_level": signal.get("structure_level"),
+        # How far entry_price had already run past structure_level, in R,
+        # at the moment this trade was taken (risk_manager.build_trade_plan's
+        # entry_extension_r - already computed and used for market/limit
+        # routing and the MAX_ENTRY_EXTENSION_R reject, but never
+        # journaled before now). Added specifically to test whether
+        # "wrong from the first tick" LOSS trades (see
+        # journal_analysis.py's near-zero-MFE cohort breakdown) are
+        # systematically entering on an already-exhausted move - none of
+        # the other informational fields (CVD, sweep, EMA, OI) discriminate
+        # that cohort from the rest, so this is the next real hypothesis
+        # worth having evidence for.
+        "entry_extension_r": plan.get("entry_extension_r"),
+        "signal_trigger": signal.get("signal_trigger"),
+        "atr": signal.get("atr"),
+        "ema_value": signal.get("ema_value"),
+        "ema_aligned": signal.get("ema_aligned"),
+        "htf_trend": signal.get("htf_trend"),
+        "premium_discount_zone": signal.get("premium_discount_zone"),
+        "zone_retracement_pct": signal.get("zone_retracement_pct"),
+        "order_block_present": bool(signal.get("order_block")),
+        "fvg_present": bool(signal.get("fvg")),
+        "cvd_score": signal.get("cvd_score"),
+        "depth_imbalance": signal.get("depth_imbalance"),
+        "sweep_confluence": signal.get("sweep_confluence"),
+        "oi_change_pct": signal.get("oi_change_pct"),
+        "oi_rising": signal.get("oi_rising"),
+        "liquidation_notional_net": signal.get("liquidation_notional_net"),
+        "liquidation_cluster": signal.get("liquidation_cluster"),
+        "liquidation_aligned": signal.get("liquidation_aligned"),
+        "efficiency_ratio": signal.get("efficiency_ratio"),
+        "efficiency_favorable": signal.get("efficiency_favorable"),
+        "btc_correlation": signal.get("btc_correlation"),
+        "btc_aligned": signal.get("btc_aligned"),
+        "funding_rate": signal.get("funding_rate"),
+        "funding_favorable": signal.get("funding_favorable"),
+        "long_short_ratio": signal.get("long_short_ratio"),
+        "long_short_favorable": signal.get("long_short_favorable"),
+        "confluence_score": signal.get("confluence_score"),
+        "confluence_total": signal.get("confluence_total"),
+        "confluence_ratio": signal.get("confluence_ratio"),
+        "quote_volume_usdt": signal.get("quote_volume_usdt"),
+        "size_multiplier": plan.get("size_multiplier"),
+        "tp1_r_multiple": config.TP1_R_MULTIPLE,
+        "tp2_r_multiple": config.TP2_R_MULTIPLE,
+        "execution_mode": config.EXECUTION_MODE,
+    })
+    _append_row(row)
+    return trade_id
+
+
+def append_outcome(
+    symbol, outcome, trade_id=None, mae_r_multiple=None, mfe_r_multiple=None,
+    early_breakeven_applied=None, break_confirmed_by_close=None, dca_applied=None,
+):
+    row = {field: "" for field in FIELDNAMES}
+    row["timestamp"] = time.time()
+    row["trade_id"] = trade_id or ""
+    row["symbol"] = symbol
+    row["outcome"] = outcome
+
+    if mae_r_multiple is not None:
+        row["mae_r_multiple"] = mae_r_multiple
+
+    if mfe_r_multiple is not None:
+        row["mfe_r_multiple"] = mfe_r_multiple
+
+    if early_breakeven_applied is not None:
+        row["early_breakeven_applied"] = early_breakeven_applied
+
+    if break_confirmed_by_close is not None:
+        row["break_confirmed_by_close"] = break_confirmed_by_close
+
+    # config.DCA_ENABLED - was this trade averaged into before it
+    # resolved? Lets journal_analysis.py eventually compare DCA'd vs
+    # never-DCA'd outcomes directly, once enough of each accumulate.
+    if dca_applied is not None:
+        row["dca_applied"] = dca_applied
+
+    _append_row(row)
