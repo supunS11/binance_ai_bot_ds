@@ -997,13 +997,35 @@ DCA_ENABLED = env_bool("DCA_ENABLED", "True")
 # entry exactly halfway between the two fills.
 DCA_SIZE_MULTIPLIER = env_float("DCA_SIZE_MULTIPLIER", 1.0)
 # The single post-DCA TP's minimum/maximum room, in R-multiples of the
-# NEW risk distance (blended entry to the new post-DCA SL) - same shape
-# as TP2_R_MULTIPLE/TP2_MAX_R_MULTIPLE above, just for the single target
-# that replaces TP1+TP2 once a DCA has happened. Defaults mirror TP2's own
-# values: after averaging in, the position needs at least as much room as
-# the ordinary "second," further target already required.
-DCA_TP_R_MULTIPLE = env_float("DCA_TP_R_MULTIPLE", 4.0)
-DCA_TP_MAX_R_MULTIPLE = env_float("DCA_TP_MAX_R_MULTIPLE", 10.0)
+# NEW risk distance (blended entry to the new post-DCA SL).
+#
+# Real bug found live (2026-08-17, operator observation - "new TP feels
+# too high once DCA happened", confirmed against 3 real DCA fires):
+# these originally mirrored TP2_R_MULTIPLE/TP2_MAX_R_MULTIPLE's raw
+# numbers (4.0/10.0), on the reasoning that a post-DCA position "needs at
+# least as much room as the ordinary second target already required." That
+# reasoning missed that the DENOMINATOR changed too - the post-DCA risk
+# distance (blended entry to the structure-anchored stop beyond the DCA
+# fill) isn't the same size as the original entry's risk distance, it's
+# structurally wider, since it already spans both the entry-to-DCA leg AND
+# the DCA-fill-to-new-SL leg. Measured directly across the first 3 real
+# DCA fires: post-DCA risk distance came out ~3.5-4.4x (avg ~3.8x) the
+# original pre-DCA risk distance every time. Reusing TP2's raw R-multiple
+# against that already-3.8x-wider risk therefore put the target ~3.8x
+# further in absolute price terms than TP2 itself would ever have been -
+# not "at least as much room as TP2", several multiples beyond it.
+#
+# Fixed by dividing TP2's original multiples by that same ~3.8x factor
+# (4.0/3.8 and 10.0/3.8, rounded) - preserves the ORIGINAL intent (this
+# target's absolute distance should be comparable to what TP2 would have
+# been) instead of the accidental compounding. Still real-structure-first
+# via _resolve_target/compute_dca_target - these are only the floor/cap a
+# real liquidity pool gets clamped between, same as TP1/TP2 always were.
+# Only 3 real data points behind the 3.8x factor - directionally
+# consistent but not tightly calibrated; revisit once more DCA_TP_HIT/
+# DCA_SL_HIT trades exist to check against real outcomes.
+DCA_TP_R_MULTIPLE = env_float("DCA_TP_R_MULTIPLE", 1.0)
+DCA_TP_MAX_R_MULTIPLE = env_float("DCA_TP_MAX_R_MULTIPLE", 2.5)
 # ATR buffer beyond the structure level used for the first-ever real SL,
 # placed once DCA fires - mirrors STRUCTURE_STOP_ATR_BUFFER's own role for
 # the (unused, pre-DCA) original stop calculation.
