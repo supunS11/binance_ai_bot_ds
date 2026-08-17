@@ -507,6 +507,20 @@ class EarlyBreakevenEligibilityTests(unittest.TestCase):
                 self._position(stage=BREAKEVEN_ACTIVE)
             ))
 
+    def test_dca_pending_is_also_a_candidate(self):
+        # Real gap found live (2026-08-17, operator question): a DCA-
+        # pending position is ALSO still waiting on TP1 with no real SL
+        # placed yet - the same condition TP1_PENDING represents. Before
+        # this fix, this stage check was `!= TP1_PENDING` only, so while
+        # config.DCA_ENABLED is True (every position starts in
+        # DCA_PENDING) this could never arm at all.
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
+            self.assertTrue(manager._is_early_breakeven_candidate(
+                self._position(stage=DCA_PENDING)
+            ))
+
     def test_zero_risk_distance_is_not_a_candidate(self):
         manager = PositionManager()
 
@@ -585,6 +599,16 @@ class ProfitProtectionEligibilityTests(unittest.TestCase):
 
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
             self.assertTrue(manager._is_profit_protection_candidate(self._position()))
+
+    def test_dca_pending_is_also_a_candidate(self):
+        # See EarlyBreakevenEligibilityTests.test_dca_pending_is_also_a_
+        # candidate - identical real gap, same fix.
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+            self.assertTrue(manager._is_profit_protection_candidate(
+                self._position(stage=DCA_PENDING)
+            ))
 
 
 class ProfitProtectionPriceReachedTests(unittest.TestCase):
@@ -2969,6 +2993,21 @@ class ExecuteDcaLiveTests(unittest.TestCase):
 
 
 class PollShadowDcaPendingTests(unittest.TestCase):
+    def setUp(self):
+        # PROFIT_PROTECTION_ENABLED/EARLY_BREAKEVEN_ENABLED now correctly
+        # apply during DCA_PENDING too (see _is_profit_protection_
+        # candidate/_is_early_breakeven_candidate's stage check - real
+        # gap fixed 2026-08-17) - off by default here so these tests stay
+        # isolated to the TP1-vs-DCA race itself, same discipline
+        # PollLiveTests already uses. TryEarlyPromotionsShadowTests below
+        # covers the promotion behavior directly.
+        self.pp_patcher = patch.object(config, "PROFIT_PROTECTION_ENABLED", False)
+        self.eb_patcher = patch.object(config, "EARLY_BREAKEVEN_ENABLED", False)
+        self.pp_patcher.start()
+        self.eb_patcher.start()
+        self.addCleanup(self.pp_patcher.stop)
+        self.addCleanup(self.eb_patcher.stop)
+
     def _manager_with_dca_pending(self):
         manager = PositionManager()
         manager.register_dca_pending(_dca_plan(), {"shadow": True})
@@ -3017,6 +3056,28 @@ class PollShadowDcaPendingTests(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
 
+    def test_profit_protection_can_promote_a_dca_pending_position_before_tp1_or_dca(self):
+        # The actual fix, exercised end to end: a DCA-pending position
+        # that moves favorably enough gets promoted to BREAKEVEN_ACTIVE
+        # with a real SL for the first time, same as a TP1_PENDING
+        # position always could - it never reaches the DCA touch or the
+        # TP1 touch at all.
+        manager = self._manager_with_dca_pending()
+        # _dca_plan(): entry=100, tp1=102, dca_price=96. 101 is short of
+        # TP1 and far from dca_price - only a profit-protection arm
+        # explains a promotion here.
+        candle = _candle(high=101, low=99.5, close=101)
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 1), \
+             patch.object(config, "LEVERAGE", 10):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["profit_protection_applied"])
+
 
 class PollShadowDcaActiveTests(unittest.TestCase):
     def _manager_with_dca_active(self):
@@ -3059,9 +3120,16 @@ class PollShadowDcaActiveTests(unittest.TestCase):
 
 class PollLiveDcaPendingTests(unittest.TestCase):
     def setUp(self):
-        self.mae_patcher = patch.object(config, "MAE_TRACKING_ENABLED", False)
-        self.mae_patcher.start()
-        self.addCleanup(self.mae_patcher.stop)
+        # See PollShadowDcaPendingTests.setUp - same isolation, same
+        # real gap it's guarding against.
+        for name, value in (
+            ("MAE_TRACKING_ENABLED", False),
+            ("PROFIT_PROTECTION_ENABLED", False),
+            ("EARLY_BREAKEVEN_ENABLED", False),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _manager_with_dca_pending(self):
         manager = PositionManager()

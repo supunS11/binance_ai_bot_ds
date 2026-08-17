@@ -986,7 +986,14 @@ class PositionManager:
         if not config.EARLY_BREAKEVEN_ENABLED or position.get("early_breakeven_applied"):
             return False
 
-        if position["stage"] != TP1_PENDING:
+        # config.DCA_ENABLED - a DCA-pending position is ALSO still
+        # waiting on TP1 to genuinely fill (no real SL exists yet either
+        # way), the same "hasn't been promoted yet" condition TP1_PENDING
+        # represents - real gap found live (2026-08-17, operator
+        # question): this used to check `!= TP1_PENDING` only, so while
+        # DCA_ENABLED is True (every position starts in DCA_PENDING, not
+        # TP1_PENDING) this could never arm at all, silently.
+        if position["stage"] not in (TP1_PENDING, DCA_PENDING):
             return False
 
         return abs(position["entry_price"] - position["sl_price"]) > 0
@@ -1043,7 +1050,9 @@ class PositionManager:
         if not config.PROFIT_PROTECTION_ENABLED or position.get("profit_protection_applied"):
             return False
 
-        if position["stage"] != TP1_PENDING:
+        # config.DCA_ENABLED - see the identical note in
+        # _is_early_breakeven_candidate.
+        if position["stage"] not in (TP1_PENDING, DCA_PENDING):
             return False
 
         return position.get("tp1_price") is not None
@@ -1117,6 +1126,56 @@ class PositionManager:
         side = position["side"]
         return current_price >= lock_price if side == "BUY" else current_price <= lock_price
 
+    def _try_early_promotions(
+        self, position, current_price, candles, profit_protection_candidate, early_breakeven_candidate,
+    ):
+        """Shared by poll_live's TP1_PENDING and DCA_PENDING branches -
+        both are "still waiting on TP1 to genuinely fill, no real SL
+        placed by this promotion path yet" states (see
+        _is_early_breakeven_candidate/_is_profit_protection_candidate,
+        both of which now accept either stage - config.DCA_ENABLED gap
+        found live, 2026-08-17). Checked before EARLY_BREAKEVEN: mutually
+        exclusive at the promotion moment (both check the same stage set
+        and stop applying once promoted), so whichever fires here is
+        simply whichever threshold was reached first in time,
+
+        Returns True if a promotion happened this call (caller should
+        stop processing this tick and return None), False otherwise."""
+        if (
+            profit_protection_candidate
+            and self._profit_protection_price_reached(position, current_price)
+        ):
+            position["profit_protection_peak_price"] = current_price
+            lock_price = self._profit_protection_trailing_floor(position, current_price)
+
+            if lock_price is not None:
+                position["profit_protection_applied"] = True
+                position["profit_protection_profit_locked"] = True
+                self._promote_to_breakeven(
+                    position,
+                    reason="Profit protection (ROI-of-TP1 trailing arm)",
+                    target_price=lock_price,
+                )
+                return True
+
+        if (
+            early_breakeven_candidate
+            and self._early_breakeven_price_reached(position, current_price)
+        ):
+            lock_price = self._early_breakeven_lock_price(position, candles)
+            position["early_breakeven_applied"] = True
+            position["early_breakeven_profit_locked"] = _more_favorable(
+                position["side"], lock_price, position["breakeven_price"]
+            )
+            self._promote_to_breakeven(
+                position,
+                reason="Early breakeven (profit-lock)",
+                target_price=lock_price,
+            )
+            return True
+
+        return False
+
     def poll_live(self, symbol, candles=None):
         """Returns an outcome string if the position closed this call,
         otherwise None. `candles` (LTF history for the symbol) is only
@@ -1134,10 +1193,12 @@ class PositionManager:
         # both early-promotion checks below - no reason to pay for extra
         # REST calls when any of them need the same current price.
         early_breakeven_candidate = (
-            position["stage"] == TP1_PENDING and self._is_early_breakeven_candidate(position)
+            position["stage"] in (TP1_PENDING, DCA_PENDING)
+            and self._is_early_breakeven_candidate(position)
         )
         profit_protection_candidate = (
-            position["stage"] == TP1_PENDING and self._is_profit_protection_candidate(position)
+            position["stage"] in (TP1_PENDING, DCA_PENDING)
+            and self._is_profit_protection_candidate(position)
         )
         dca_candidate = self._is_dca_candidate(position)
         current_price = None
@@ -1150,8 +1211,18 @@ class PositionManager:
             self._update_mae_mfe(position, current_price)
 
         if position["stage"] == DCA_PENDING:
+            # DCA (adverse) checked before the early-promotion (favorable)
+            # checks - same conservative "adverse event wins ties" bias
+            # poll_shadow's own docstring already applies, kept consistent
+            # here since both are mark-price-threshold checks rather than
+            # real order-fill status.
             if dca_candidate and self._dca_price_reached(position, current_price):
                 return self._execute_dca(position, candles=candles)
+
+            if self._try_early_promotions(
+                position, current_price, candles, profit_protection_candidate, early_breakeven_candidate,
+            ):
+                return None
 
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
 
@@ -1182,42 +1253,9 @@ class PositionManager:
             return None
 
         if position["stage"] == TP1_PENDING:
-            # Checked before EARLY_BREAKEVEN: mutually exclusive at the
-            # promotion moment (both check stage==TP1_PENDING and stop
-            # applying once promoted), so whichever fires here is simply
-            # whichever threshold was reached first in time - order only
-            # matters on the rare tick where both would qualify at once.
-            if (
-                profit_protection_candidate
-                and self._profit_protection_price_reached(position, current_price)
+            if self._try_early_promotions(
+                position, current_price, candles, profit_protection_candidate, early_breakeven_candidate,
             ):
-                position["profit_protection_peak_price"] = current_price
-                lock_price = self._profit_protection_trailing_floor(position, current_price)
-
-                if lock_price is not None:
-                    position["profit_protection_applied"] = True
-                    position["profit_protection_profit_locked"] = True
-                    self._promote_to_breakeven(
-                        position,
-                        reason="Profit protection (ROI-of-TP1 trailing arm)",
-                        target_price=lock_price,
-                    )
-                    return None
-
-            if (
-                early_breakeven_candidate
-                and self._early_breakeven_price_reached(position, current_price)
-            ):
-                lock_price = self._early_breakeven_lock_price(position, candles)
-                position["early_breakeven_applied"] = True
-                position["early_breakeven_profit_locked"] = _more_favorable(
-                    position["side"], lock_price, position["breakeven_price"]
-                )
-                self._promote_to_breakeven(
-                    position,
-                    reason="Early breakeven (profit-lock)",
-                    target_price=lock_price,
-                )
                 return None
 
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
@@ -1465,6 +1503,52 @@ class PositionManager:
         log_info(f"{symbol} TP1 quantity closed at market (price already past TP1)")
         self._promote_to_breakeven(position)
 
+    def _try_early_promotions_shadow(self, position, latest_candle, candles):
+        """Shadow-mode counterpart to _try_early_promotions - shared by
+        poll_shadow's TP1_PENDING and DCA_PENDING branches (see
+        _is_early_breakeven_candidate/_is_profit_protection_candidate,
+        both of which now accept either stage - config.DCA_ENABLED gap
+        found live, 2026-08-17). Returns True if a promotion happened
+        this call."""
+        symbol = position["symbol"]
+        side = position["side"]
+
+        if self._is_profit_protection_candidate(position) and self._profit_protection_price_reached(
+            position, latest_candle["close"]
+        ):
+            arm_price = latest_candle["close"]
+            position["profit_protection_peak_price"] = arm_price
+            lock_price = self._profit_protection_trailing_floor(position, arm_price)
+
+            if lock_price is not None:
+                position["profit_protection_applied"] = True
+                position["profit_protection_profit_locked"] = True
+                position["stage"] = BREAKEVEN_ACTIVE
+                position["sl_price"] = lock_price
+                log_info(
+                    f"{symbol} [SHADOW] profit protection (ROI-of-TP1 trailing arm) | "
+                    f"SL -> {position['sl_price']}"
+                )
+                return True
+
+        if self._is_early_breakeven_candidate(position) and self._early_breakeven_price_reached(
+            position, latest_candle["close"]
+        ):
+            lock_price = self._early_breakeven_lock_price(position, candles)
+            position["early_breakeven_applied"] = True
+            position["early_breakeven_profit_locked"] = _more_favorable(
+                side, lock_price, position["breakeven_price"]
+            )
+            position["stage"] = BREAKEVEN_ACTIVE
+            position["sl_price"] = lock_price
+            log_info(
+                f"{symbol} [SHADOW] early breakeven (profit-lock) | "
+                f"SL -> {position['sl_price']}"
+            )
+            return True
+
+        return False
+
     def poll_shadow(self, symbol, latest_candle, candles=None):
         """Simulates the same TP1 -> breakeven -> TP2/SL sequence against
         live price action. When both the stop and a target fall inside the
@@ -1495,40 +1579,7 @@ class PositionManager:
             if hit_sl:
                 return self._close(symbol, "SHADOW_SL_HIT")
 
-            # Checked before EARLY_BREAKEVEN - see the identical note in
-            # poll_live.
-            if self._is_profit_protection_candidate(position) and self._profit_protection_price_reached(
-                position, latest_candle["close"]
-            ):
-                arm_price = latest_candle["close"]
-                position["profit_protection_peak_price"] = arm_price
-                lock_price = self._profit_protection_trailing_floor(position, arm_price)
-
-                if lock_price is not None:
-                    position["profit_protection_applied"] = True
-                    position["profit_protection_profit_locked"] = True
-                    position["stage"] = BREAKEVEN_ACTIVE
-                    position["sl_price"] = lock_price
-                    log_info(
-                        f"{symbol} [SHADOW] profit protection (ROI-of-TP1 trailing arm) | "
-                        f"SL -> {position['sl_price']}"
-                    )
-                    return None
-
-            if self._is_early_breakeven_candidate(position) and self._early_breakeven_price_reached(
-                position, latest_candle["close"]
-            ):
-                lock_price = self._early_breakeven_lock_price(position, candles)
-                position["early_breakeven_applied"] = True
-                position["early_breakeven_profit_locked"] = _more_favorable(
-                    side, lock_price, position["breakeven_price"]
-                )
-                position["stage"] = BREAKEVEN_ACTIVE
-                position["sl_price"] = lock_price
-                log_info(
-                    f"{symbol} [SHADOW] early breakeven (profit-lock) | "
-                    f"SL -> {position['sl_price']}"
-                )
+            if self._try_early_promotions_shadow(position, latest_candle, candles):
                 return None
 
             hit_tp1 = (
@@ -1555,6 +1606,9 @@ class PositionManager:
 
                 if touched_dca:
                     return self._execute_dca(position, candles=candles)
+
+            if self._try_early_promotions_shadow(position, latest_candle, candles):
+                return None
 
             hit_tp1 = (
                 high >= position["tp1_price"]
