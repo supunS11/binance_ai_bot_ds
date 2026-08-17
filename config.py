@@ -829,7 +829,22 @@ SYMBOL_REENTRY_COOLDOWN_SECONDS = env_int("SYMBOL_REENTRY_COOLDOWN_SECONDS", 360
 # breakeven; TP2 closes what's left)
 # =========================
 TP1_CLOSE_PCT = env_float("TP1_CLOSE_PCT", 50)
-TP1_R_MULTIPLE = env_float("TP1_R_MULTIPLE", 2.0)
+# Real bug found live (2026-08-17, operator observation - "TP1 feels too
+# high", checked against binance_ai_bot_smc's own real trade history since
+# this R-multiple was inherited unchanged from there: 270 real trades, 237
+# resolved). Outcome split: SL_HIT 173 (73%), BREAKEVEN_STOP_HIT 35 (15%,
+# reached TP1 then scratched), TP2_HIT 29 (12%). Of the 114 SL_HIT losses
+# with MFE data, only 3% ever ran far enough to reach the OLD 2.0R TP1
+# target before reversing - but 22% ran to at least 1.0R. That's a real,
+# sizeable population of trades currently guaranteed a full loss that a
+# closer target would convert into a partial win instead. Rough
+# expectancy at the old 2.0/4.0 split: 0.73*(-1R) + 0.15*(0) + 0.12*(+4R)
+# ~= -0.25R/trade - negative. Of trades that DO reach TP1, 45% (29/64) go
+# on to a full TP2 win - that leg isn't obviously broken the same way, so
+# TP2_R_MULTIPLE/the MAX multiples below are left alone; this is a TP1-
+# specific fix. Evidence is inherited from smc, not binance_ai_bot_ds's
+# own trade history yet - revisit once this project has enough of its own.
+TP1_R_MULTIPLE = env_float("TP1_R_MULTIPLE", 1.0)
 TP2_R_MULTIPLE = env_float("TP2_R_MULTIPLE", 4.0)
 # Upper bound on how far a real structure target is allowed to be. The
 # R-multiples above are a MINIMUM room requirement - without a maximum
