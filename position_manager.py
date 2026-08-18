@@ -909,6 +909,28 @@ class PositionManager:
 
         return None
 
+    def _promote_to_breakeven_on_tp1_fill(self, position, candles=None):
+        """A genuine TP1 fill used to promote the remainder to FLAT
+        breakeven only (compute_breakeven_price - a fee-buffer, not a real
+        profit) even though price has, by definition, already moved at
+        least TP1_R_MULTIPLE R in the position's favor by this point -
+        further than EARLY_BREAKEVEN_R_MULTIPLE's own trigger. Real gap
+        found live (2026-08-18, operator observation): "closing from
+        breakeven" was landing at a bare scratch instead of a small real
+        profit. Reuses the same real-structure-first/EARLY_BREAKEVEN_LOCK_
+        R_MULTIPLE lock _early_breakeven_lock_price already computes for
+        the pre-TP1 trigger - same real evidence behind that number,
+        applied here too instead of inventing a second one. Sets
+        early_breakeven_profit_locked (not early_breakeven_applied - that
+        flag means specifically "the pre-TP1 trigger fired", a different
+        event) so an eventual stop-out on this ratcheted level is
+        classified as EARLY_BREAKEVEN_PROFIT_HIT, not a plain scratch."""
+        lock_price = self._early_breakeven_lock_price(position, candles)
+        position["early_breakeven_profit_locked"] = _more_favorable(
+            position["side"], lock_price, position["breakeven_price"]
+        )
+        return self._promote_to_breakeven(position, target_price=lock_price)
+
     def _close_remainder_at_market(self, position):
         symbol = position["symbol"]
 
@@ -1425,7 +1447,7 @@ class PositionManager:
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
 
             if tp1_status == "FINISHED":
-                return self._promote_to_breakeven(position)
+                return self._promote_to_breakeven_on_tp1_fill(position, candles)
 
             tp2_status = self._status_or_missing(symbol, position["tp2_order_id"])
 
@@ -1530,7 +1552,7 @@ class PositionManager:
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
 
             if tp1_status == "FINISHED":
-                return self._promote_to_breakeven(position)
+                return self._promote_to_breakeven_on_tp1_fill(position, candles)
 
             sl_status = self._status_or_missing(symbol, position["sl_order_id"])
 
@@ -1770,7 +1792,7 @@ class PositionManager:
             return
 
         log_info(f"{symbol} TP1 quantity closed at market (price already past TP1)")
-        self._promote_to_breakeven(position)
+        self._promote_to_breakeven_on_tp1_fill(position)
 
     def _try_early_promotions_shadow(self, position, latest_candle, candles):
         """Shadow-mode counterpart to _try_early_promotions - shared by
@@ -1858,9 +1880,13 @@ class PositionManager:
             )
 
             if hit_tp1:
+                lock_price = self._early_breakeven_lock_price(position, candles)
+                position["early_breakeven_profit_locked"] = _more_favorable(
+                    side, lock_price, position["breakeven_price"]
+                )
                 position["stage"] = BREAKEVEN_ACTIVE
-                position["sl_price"] = position["breakeven_price"]
-                log_info(f"{symbol} [SHADOW] TP1 would have filled | SL -> breakeven")
+                position["sl_price"] = lock_price
+                log_info(f"{symbol} [SHADOW] TP1 would have filled | SL -> {lock_price}")
 
             return None
 
@@ -1886,9 +1912,13 @@ class PositionManager:
             )
 
             if hit_tp1:
+                lock_price = self._early_breakeven_lock_price(position, candles)
+                position["early_breakeven_profit_locked"] = _more_favorable(
+                    side, lock_price, position["breakeven_price"]
+                )
                 position["stage"] = BREAKEVEN_ACTIVE
-                position["sl_price"] = position["breakeven_price"]
-                log_info(f"{symbol} [SHADOW] TP1 would have filled | SL -> breakeven")
+                position["sl_price"] = lock_price
+                log_info(f"{symbol} [SHADOW] TP1 would have filled | SL -> {lock_price}")
 
             return None
 

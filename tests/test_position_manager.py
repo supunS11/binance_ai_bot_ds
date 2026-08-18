@@ -1666,6 +1666,10 @@ class PollShadowTests(unittest.TestCase):
         self.assertFalse(manager.has_open_position("BTCUSDT"))
 
     def test_tp1_pending_tp1_hit_moves_to_breakeven_and_stays_open(self):
+        # Real profit lock now, not flat breakeven - entry=100, sl=98 ->
+        # risk_distance=2, EARLY_BREAKEVEN_LOCK_R_MULTIPLE=0.3 (default)
+        # -> 100 + 0.3*2 = 100.6. See test_tp1_finished_promotes_to_
+        # breakeven (the live-mode equivalent) for the same math.
         manager = self._manager_with_position()
         outcome = manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # high >= tp1(102)
 
@@ -1673,7 +1677,8 @@ class PollShadowTests(unittest.TestCase):
         self.assertTrue(manager.has_open_position("BTCUSDT"))
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
-        self.assertEqual(position["sl_price"], position["breakeven_price"])
+        self.assertEqual(position["sl_price"], 100.6)
+        self.assertTrue(position["early_breakeven_profit_locked"])
 
     def test_ambiguous_candle_hitting_both_is_conservatively_sl(self):
         manager = self._manager_with_position()
@@ -1690,11 +1695,31 @@ class PollShadowTests(unittest.TestCase):
         self.assertEqual(outcome, "SHADOW_TP2_HIT")
 
     def test_breakeven_stage_stop_hit_closes_as_breakeven_stop(self):
+        # Promotion now locks real profit at 100.6 (see
+        # test_tp1_pending_tp1_hit_moves_to_breakeven_and_stays_open), so a
+        # stop-out here is a genuine small win, not a flat scratch -
+        # EARLY_BREAKEVEN_PROFIT_HIT, not the generic BREAKEVEN_STOP_HIT.
+        # See test_breakeven_stage_stop_hit_is_a_flat_scratch_when_lock_
+        # multiple_is_zero below for the case that still produces this
+        # outcome.
         manager = self._manager_with_position()
         manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to breakeven
         outcome = manager.poll_shadow(
-            "BTCUSDT", _candle(high=100.5, low=100.0)
-        )  # low <= breakeven(100.02)
+            "BTCUSDT", _candle(high=100.7, low=100.5)
+        )  # low <= locked sl(100.6)
+
+        self.assertEqual(outcome, "SHADOW_EARLY_BREAKEVEN_PROFIT_HIT")
+
+    def test_breakeven_stage_stop_hit_is_a_flat_scratch_when_lock_multiple_is_zero(self):
+        # EARLY_BREAKEVEN_LOCK_R_MULTIPLE=0 preserves the original flat-
+        # breakeven (fee-buffer-only) behavior exactly - compute_early_
+        # breakeven_price falls through to compute_breakeven_price.
+        with patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0):
+            manager = self._manager_with_position()
+            manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to breakeven
+            outcome = manager.poll_shadow(
+                "BTCUSDT", _candle(high=100.5, low=100.0)
+            )  # low <= breakeven(100.02)
 
         self.assertEqual(outcome, "SHADOW_BREAKEVEN_STOP_HIT")
 
@@ -1966,6 +1991,11 @@ class PollLiveTests(unittest.TestCase):
         return manager
 
     def test_tp1_finished_promotes_to_breakeven(self):
+        # A genuine TP1 fill now locks real profit (EARLY_BREAKEVEN_LOCK_
+        # R_MULTIPLE, default 0.3), not just a flat fee-buffer scratch -
+        # price has, by definition, already moved at least TP1_R_MULTIPLE
+        # R in the position's favor by this point. entry=100, sl=98 ->
+        # risk_distance=2 -> lock = 100 + 0.3*2 = 100.6.
         manager = self._manager_with_position()
 
         def status_side_effect(symbol, order_id):
@@ -1982,8 +2012,9 @@ class PollLiveTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertEqual(position["sl_order_id"], "sl2")
+        self.assertTrue(position["early_breakeven_profit_locked"])
         cancel.assert_called_once_with("BTCUSDT", "sl1")
-        new_sl.assert_called_once_with("BTCUSDT", "BUY", position["breakeven_price"])
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 100.6)
 
     def test_breakeven_promotion_cancels_the_real_sl_not_a_stale_local_id(self):
         # Real bug seen live: local tracking's sl_order_id can be stale
@@ -2050,8 +2081,11 @@ class PollLiveTests(unittest.TestCase):
 
     def test_breakeven_placement_immediately_triggers_closes_at_market(self):
         # Binance rejects a stop that would fire the instant it's placed -
-        # that means price already passed the breakeven level, so the
-        # remainder must be closed at market instead of left unprotected.
+        # that means price already passed the (now real-profit-locked, see
+        # test_tp1_finished_promotes_to_breakeven) level, so the remainder
+        # must be closed at market instead of left unprotected. Still a
+        # real locked-profit exit, not a scratch - hence EARLY_BREAKEVEN_
+        # PROFIT_HIT, not the generic BREAKEVEN_TRIGGER_MARKET_CLOSE.
         manager = self._manager_with_position()
 
         def status_side_effect(symbol, order_id):
@@ -2074,7 +2108,7 @@ class PollLiveTests(unittest.TestCase):
              patch.object(exchange, "close_position_market") as market_close:
             outcome = manager.poll_live("BTCUSDT")
 
-        self.assertEqual(outcome, "BREAKEVEN_TRIGGER_MARKET_CLOSE")
+        self.assertEqual(outcome, "EARLY_BREAKEVEN_PROFIT_HIT")
         self.assertFalse(manager.has_open_position("BTCUSDT"))
         market_close.assert_called_once_with("BTCUSDT", "BUY", 0.5)
         # The original SL (via the targeted cancel before the failed
@@ -3180,6 +3214,9 @@ class PollShadowDcaPendingTests(unittest.TestCase):
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
 
     def test_tp1_fires_when_dca_price_not_reached(self):
+        # Real profit lock now, not flat breakeven - same 100.6 math as
+        # PollShadowTests.test_tp1_pending_tp1_hit_moves_to_breakeven_and_
+        # stays_open (entry=100, sl=98 via _dca_plan's underlying _plan()).
         manager = self._manager_with_dca_pending()
         candle = _candle(high=103, low=99)  # clears TP1=102, never reaches dca_price=96
 
@@ -3188,7 +3225,8 @@ class PollShadowDcaPendingTests(unittest.TestCase):
         self.assertIsNone(outcome)
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
-        self.assertEqual(position["sl_price"], position["breakeven_price"])
+        self.assertEqual(position["sl_price"], 100.6)
+        self.assertTrue(position["early_breakeven_profit_locked"])
 
     def test_dca_checked_before_tp1_when_both_touch_the_same_candle(self):
         # Deliberately conservative, same bias poll_shadow's own docstring
