@@ -264,6 +264,29 @@ OI_HISTORY_MAX_SAMPLES = env_int("OI_HISTORY_MAX_SAMPLES", 1440)
 # this long before trying it again, instead of hammering it every
 # OI_POLL_INTERVAL_SECONDS indefinitely.
 OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS = env_int("OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS", 3600)
+# Reject outright when oi_rising is True - a real gate, not informational
+# like the rest of OI_CONFIRMATION_ENABLED's fields above. Evidence
+# (2026-08-18, 26 resolved binance_ai_bot_ds trades, entry signal recovered
+# by symbol-match since a restart-recovered close's trade_id no longer
+# links to its original entry row): oi_rising=True at entry saw DCA fire
+# 69% of the time (9/13) vs 17% (2/12) when oi_rising was False/unavailable
+# - the opposite of oi_rising's original "confirming" assumption baked into
+# confluence_fields below (fresh OI piling in right as the trigger fires
+# reads more like late, crowded positioning than genuine confirmation in
+# this sample). None of the other confluence fields (ema_aligned came
+# closer - 53% vs 22% - but not as wide) showed a comparable split, and
+# signal_trigger itself didn't - CHOCH_RETEST's high DCA volume was just it
+# being the highest-volume trigger overall, not disproportionately risky
+# per DCA trade. Small sample (12/13 split inside 26 total, one trigger -
+# OI_DIVERGENCE - never live in it) but risk-reducing by construction
+# (only ever rejects, same precedent as EFFICIENCY_RATIO_GATE_ENABLED) -
+# ships live immediately rather than sitting informational-only first.
+# Applied universally (no TRIGGER_GATE_PROFILES entry, same as
+# NOT_IN_DISCOUNT/DEPTH_OPPOSING below) since the evidence found no
+# per-trigger split to differentiate on. No-ops whenever oi_rising itself
+# is unavailable (OI_CONFIRMATION_ENABLED=False, or no OI data for the
+# symbol yet).
+OI_RISING_REJECT_ENABLED = env_bool("OI_RISING_REJECT_ENABLED", "True")
 # Liquidation clustering - informational only, NOT a gate. Real forced
 # liquidations at/around a detected sweep are the closest confirmation
 # ICT's "stop hunt" concept has to actual ground truth: a BULLISH break
@@ -546,10 +569,10 @@ def trigger_gate_profiles():
     """{trigger_name: frozenset(gate names that actually apply)} - the
     single source signal_engine._evaluate_direction reads from. Only
     gates with real per-trigger variation are listed; NOT_IN_DISCOUNT/
-    NOT_IN_PREMIUM and DEPTH_OPPOSING apply to every trigger unconditionally
-    (checked directly in signal_engine.py, no profile entry needed - see
-    their own comments there for why they fit universally, unlike the six
-    below).
+    NOT_IN_PREMIUM, DEPTH_OPPOSING, and OI_RISING apply to every trigger
+    unconditionally (checked directly in signal_engine.py, no profile entry
+    needed - see their own comments there for why they fit universally,
+    unlike the six below).
 
     Deliberately a function called fresh on every use, NOT a module-level
     constant computed once at import time - the 5 flags above are exactly

@@ -526,6 +526,17 @@ def evaluate(
             if oi_change_pct is not None:
                 oi_rising = oi_change_pct > 0
 
+        # OI_RISING - a real gate, unlike every other field in this
+        # function (see config.OI_RISING_REJECT_ENABLED for the evidence).
+        # Universal across triggers (same as NOT_IN_DISCOUNT/DEPTH_OPPOSING
+        # below), not read from applicable_gates - no per-trigger split was
+        # found to differentiate on. Reason string deliberately carries no
+        # continuous value (same convention as CVD_NOT_CONFIRMED/
+        # DEPTH_OPPOSING below) so main.py's reject-reason tally aggregates
+        # it into one count instead of one per oi_change_pct value.
+        if config.OI_RISING_REJECT_ENABLED and oi_rising:
+            return _reject("OI_RISING")
+
         # Liquidation clustering: informational only, NOT a gate - see
         # config.LIQUIDATION_CONFIRMATION_ENABLED for rationale. A
         # BULLISH break aligns with long-liquidation flow (forced SELL

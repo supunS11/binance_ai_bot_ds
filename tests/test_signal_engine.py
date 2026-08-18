@@ -91,6 +91,7 @@ class SignalEngineTests(unittest.TestCase):
         btc_correlation=0.5,
         btc_return=0.02,
         funding_rate=None,
+        oi_rising_reject_enabled=False,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -161,7 +162,14 @@ class SignalEngineTests(unittest.TestCase):
         def _ema_side_effect(candles, period=None):
             return htf_trend_ema if period is not None else ema_value
 
-        with patch.object(market_structure, "structure_state", return_value=htf_structure), \
+        # OI_RISING_REJECT_ENABLED defaults True in config.py (real gate,
+        # see its own comment) but oi_snapshot's own default above
+        # (OI_RISING) is rising - defaulting this kwarg to False keeps
+        # every test above and below that doesn't care about this specific
+        # gate exercising its old, pre-gate behavior; opt in explicitly
+        # (oi_rising_reject_enabled=True) to test the gate itself.
+        with patch.object(config, "OI_RISING_REJECT_ENABLED", oi_rising_reject_enabled), \
+             patch.object(market_structure, "structure_state", return_value=htf_structure), \
              patch.object(market_structure, "premium_discount_zone", return_value=zone), \
              patch.object(market_structure, "analyze", return_value=ltf_analysis), \
              patch.object(market_structure, "find_order_block", return_value=order_block), \
@@ -535,12 +543,38 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["ema_value"])
         self.assertIsNone(result["ema_aligned"])
 
-    def test_oi_rising_is_recorded_but_does_not_block_a_signal(self):
+    def test_oi_rising_is_recorded_when_the_reject_gate_is_off(self):
         result = self._run(oi_snapshot={"available": True, "oi_change_pct": 8.0})
 
         self.assertEqual(result["signal"], "BUY")
         self.assertEqual(result["oi_change_pct"], 8.0)
         self.assertTrue(result["oi_rising"])
+
+    def test_oi_rising_rejects_when_the_reject_gate_is_on(self):
+        result = self._run(
+            oi_snapshot={"available": True, "oi_change_pct": 8.0},
+            oi_rising_reject_enabled=True,
+        )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "OI_RISING")
+
+    def test_oi_falling_is_not_rejected_even_when_the_gate_is_on(self):
+        result = self._run(
+            oi_snapshot={"available": True, "oi_change_pct": -3.0},
+            oi_rising_reject_enabled=True,
+        )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertFalse(result["oi_rising"])
+
+    def test_oi_unavailable_is_not_rejected_even_when_the_gate_is_on(self):
+        result = self._run(
+            oi_snapshot={"available": False}, oi_rising_reject_enabled=True,
+        )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["oi_rising"])
 
     def test_oi_falling_is_recorded_but_does_not_block_a_signal(self):
         result = self._run(oi_snapshot={"available": True, "oi_change_pct": -3.0})
@@ -990,7 +1024,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "price_correlation", return_value=0.5), \
              patch.object(market_structure, "price_return", return_value=0.02), \
              patch.object(liquidity_sweep, "detect_sweep", return_value={"direction": "BULLISH", "level": 89}) as mock_detect, \
-             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False), \
+             patch.object(config, "OI_RISING_REJECT_ENABLED", False):
             signal_engine.evaluate(
                 "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
                 {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
@@ -1011,7 +1046,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "price_correlation", return_value=0.5), \
              patch.object(market_structure, "price_return", return_value=0.02), \
              patch.object(liquidity_sweep, "detect_sweep", return_value={"direction": "BULLISH", "level": 89}) as mock_detect, \
-             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_RISING_REJECT_ENABLED", False):
             signal_engine.evaluate(
                 "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
                 {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
@@ -1988,7 +2024,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(liquidity_sweep, "detect_sweep", return_value={"direction": "BULLISH", "level": 92}) as mock_detect, \
              patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
              patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
-             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True):
+             patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True), \
+             patch.object(config, "OI_RISING_REJECT_ENABLED", False):
             result = signal_engine.evaluate(
                 "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
                 {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
