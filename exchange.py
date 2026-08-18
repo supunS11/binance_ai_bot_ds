@@ -1118,10 +1118,19 @@ def _accepted_order_id(order):
     return order.get("orderId") or order.get("algoId") or ""
 
 
-def place_stop_loss(symbol, side, trigger_price):
+def place_stop_loss(symbol, side, trigger_price, client_algo_id=None):
     """Full-position STOP_MARKET, closePosition=true - always closes
     everything still open on that symbol, so it stays valid through a TP1
-    partial fill without needing to be resized."""
+    partial fill without needing to be resized.
+
+    `client_algo_id` (optional) tags the real exchange order with a
+    caller-chosen clientAlgoId - see position_manager._execute_dca's own
+    use of this (a "dcaSL..." prefix) for why: a DCA_ACTIVE position's
+    real SL+TP shape (one full-position STOP_MARKET + one full-position
+    TAKE_PROFIT_MARKET, no partial TP) is otherwise indistinguishable
+    from an ordinary post-TP1 BREAKEVEN_ACTIVE position on a restart -
+    this tag is what lets _adopt_position tell the two apart from real
+    exchange state instead of guessing."""
     close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
     trigger_price = normalize_trigger_price(symbol, side, "STOP_MARKET", trigger_price)
 
@@ -1130,7 +1139,7 @@ def place_stop_loss(symbol, side, trigger_price):
 
     trigger_price = _format_price_for_api(symbol, trigger_price)
 
-    return place_algo_order(
+    params = dict(
         symbol=symbol,
         side=close_side,
         type="STOP_MARKET",
@@ -1140,6 +1149,11 @@ def place_stop_loss(symbol, side, trigger_price):
         priceProtect="TRUE",
         timeInForce="GTC",
     )
+
+    if client_algo_id:
+        params["clientAlgoId"] = client_algo_id
+
+    return place_algo_order(**params)
 
 
 def place_take_profit_partial(symbol, side, quantity, trigger_price):
@@ -1170,9 +1184,10 @@ def place_take_profit_partial(symbol, side, quantity, trigger_price):
     )
 
 
-def place_take_profit_full(symbol, side, trigger_price):
-    """Full-position TAKE_PROFIT_MARKET, closePosition=true - this is TP2,
-    closing whatever remains after TP1."""
+def place_take_profit_full(symbol, side, trigger_price, client_algo_id=None):
+    """Full-position TAKE_PROFIT_MARKET, closePosition=true - this is TP2
+    (or, post-DCA, the single replacement target), closing whatever
+    remains. `client_algo_id` - see place_stop_loss's own docstring."""
     close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
     trigger_price = normalize_trigger_price(symbol, side, "TAKE_PROFIT_MARKET", trigger_price)
 
@@ -1181,7 +1196,7 @@ def place_take_profit_full(symbol, side, trigger_price):
 
     trigger_price = _format_price_for_api(symbol, trigger_price)
 
-    return place_algo_order(
+    params = dict(
         symbol=symbol,
         side=close_side,
         type="TAKE_PROFIT_MARKET",
@@ -1191,6 +1206,11 @@ def place_take_profit_full(symbol, side, trigger_price):
         priceProtect="TRUE",
         timeInForce="GTC",
     )
+
+    if client_algo_id:
+        params["clientAlgoId"] = client_algo_id
+
+    return place_algo_order(**params)
 
 
 def cancel_algo_order(symbol, algo_id):

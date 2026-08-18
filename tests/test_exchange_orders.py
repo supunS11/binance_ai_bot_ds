@@ -49,6 +49,36 @@ class OrderParameterTests(unittest.TestCase):
         self.assertNotIn("stopPrice", kwargs)
         self.assertEqual(kwargs["closePosition"], "true")
 
+    def test_place_stop_loss_without_client_algo_id_omits_the_key(self):
+        # Every ordinary (non-DCA) caller - clientAlgoId must not appear
+        # at all, not even as an empty string, so _adopt_position's DCA
+        # tag check never false-positives on an untagged order.
+        with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
+            exchange.place_stop_loss("BTCUSDT", "BUY", 98.0)
+
+        _, kwargs = mock_place.call_args
+        self.assertNotIn("clientAlgoId", kwargs)
+
+    def test_place_stop_loss_with_client_algo_id_passes_it_through(self):
+        with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
+            exchange.place_stop_loss("BTCUSDT", "BUY", 98.0, client_algo_id="dcaSL123")
+
+        _, kwargs = mock_place.call_args
+        self.assertEqual(kwargs["clientAlgoId"], "dcaSL123")
+
+    def test_place_take_profit_full_with_client_algo_id_passes_it_through(self):
+        with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
+            exchange.place_take_profit_full("BTCUSDT", "BUY", 104.0, client_algo_id="dcaTP123")
+
+        _, kwargs = mock_place.call_args
+        self.assertEqual(kwargs["clientAlgoId"], "dcaTP123")
+
 
 class FormatPriceForApiTests(unittest.TestCase):
     """Real bug found live (NEIROUSDT, 2026-08-10, 100% reproducible):

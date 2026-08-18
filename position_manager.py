@@ -44,6 +44,14 @@ DCA_ACTIVE = "DCA_ACTIVE"
 # placed, same as capital is nominally committed the moment it rests on
 # the book.
 PENDING_LIMIT_FILL = "PENDING_LIMIT_FILL"
+# Tags the real SL/TP orders _execute_dca places, so a restart's
+# _adopt_position can tell a genuine DCA_ACTIVE position apart from an
+# ordinary post-TP1 BREAKEVEN_ACTIVE one - both are otherwise the exact
+# same shape on the exchange (one full-position STOP_MARKET + one full-
+# position TAKE_PROFIT_MARKET, no partial TP). See exchange.
+# place_stop_loss's own docstring for the mechanism.
+_DCA_SL_CLIENT_ALGO_ID_PREFIX = "dcaSL"
+_DCA_TP_CLIENT_ALGO_ID_PREFIX = "dcaTP"
 
 
 def _order_type(order):
@@ -547,6 +555,70 @@ class PositionManager:
             "atr": atr,
         }
 
+    @staticmethod
+    def _recover_dca_active_position(symbol, side, entry_price, quantity, sl_order, tp_order):
+        """sl_order's clientAlgoId carries the _DCA_SL_CLIENT_ALGO_ID_
+        PREFIX tag _execute_dca stamped on it - unlike the DCA_PENDING
+        recovery above, nothing needs to be recomputed here: the real
+        sl_price/tp_price are read directly off the real resting orders,
+        exactly as accurate as they were the moment DCA fired. Returns
+        None (caller falls through to the ordinary BREAKEVEN_ACTIVE/
+        TP1_PENDING adoption path) only if the tagged SL's trigger price
+        can't be read at all - a real order existing with no readable
+        price is the one case worth falling back rather than trusting."""
+        def _trigger_price(order):
+            if not order:
+                return None
+            return _safe_float(order.get("triggerPrice") or order.get("stopPrice"))
+
+        sl_price = _trigger_price(sl_order)
+
+        if sl_price is None:
+            return None
+
+        tp_price = _trigger_price(tp_order)
+
+        return {
+            "symbol": symbol,
+            "trade_id": f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "side": side,
+            "entry_price": entry_price,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            "breakeven_price": risk_manager.compute_breakeven_price(entry_price, side),
+            "quantity": quantity,
+            "sl_order_id": exchange._accepted_order_id(sl_order),
+            "tp_order_id": exchange._accepted_order_id(tp_order) if tp_order else None,
+            "stage": DCA_ACTIVE,
+            "shadow": False,
+            "opened_at": time.time(),
+            "confluence_ratio": None,
+            "early_breakeven_applied": False,
+            "early_breakeven_profit_locked": False,
+            # Conservative on restart, same as the plain adoption path
+            # below: we can't know from here whether profit protection
+            # had already armed pre-restart, so this starts unarmed
+            # rather than guessing. The real SL/TP stay exactly where
+            # they already were regardless - this only affects whether a
+            # fresh arm attempt happens on the next qualifying poll.
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
+            "profit_protection_peak_price": None,
+            "trailing_stop_locked_profit": False,
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
+            # No original (pre-DCA) risk distance survives a restart -
+            # same honesty policy _recover_dca_pending_position/the plain
+            # BREAKEVEN_ACTIVE adoption path already follow.
+            "risk_distance": None,
+            "structure_level": None,
+            "trigger_candle_open_time": None,
+            "break_confirmed_by_close": None,
+            "dca_applied": True,
+            "dca_breakeven_applied": False,
+            "atr": None,
+        }
+
     def _adopt_position(self, symbol, live_position, feed=None):
         side = live_position["side"]
         entry_price = live_position["entry_price"]
@@ -568,6 +640,20 @@ class PositionManager:
             return _safe_float(order.get("triggerPrice") or order.get("stopPrice"))
 
         sl_price = _trigger_price(sl_order)
+
+        if sl_order and str(sl_order.get("clientAlgoId") or "").startswith(_DCA_SL_CLIENT_ALGO_ID_PREFIX):
+            recovered = self._recover_dca_active_position(
+                symbol, side, entry_price, quantity, sl_order, tp2_order
+            )
+
+            if recovered is not None:
+                self.positions[symbol] = recovered
+                log_info(
+                    f"{symbol} adopted existing open position | side={side} "
+                    f"entry={entry_price} sl={recovered['sl_price']} "
+                    f"tp={recovered['tp_price']} stage=DCA_ACTIVE"
+                )
+                return
 
         if sl_price is None and config.DCA_ENABLED and tp1_order and tp2_order:
             recovered = self._recover_dca_pending_position(
@@ -1114,14 +1200,20 @@ class PositionManager:
                 log_warning(f"{symbol} DCA TP1/TP2 cancel error (continuing): {exc}")
 
             try:
-                tp_order = exchange.place_take_profit_full(symbol, side, plan["tp_price"])
+                tp_order = exchange.place_take_profit_full(
+                    symbol, side, plan["tp_price"],
+                    client_algo_id=f"{_DCA_TP_CLIENT_ALGO_ID_PREFIX}{int(time.time() * 1000)}",
+                )
                 position["tp_order_id"] = exchange._accepted_order_id(tp_order)
             except Exception as exc:
                 log_warning(f"{symbol} post-DCA single-TP placement failed: {exc}")
                 position["tp_order_id"] = None
 
             try:
-                sl_order = exchange.place_stop_loss(symbol, side, plan["sl_price"])
+                sl_order = exchange.place_stop_loss(
+                    symbol, side, plan["sl_price"],
+                    client_algo_id=f"{_DCA_SL_CLIENT_ALGO_ID_PREFIX}{int(time.time() * 1000)}",
+                )
                 position["sl_order_id"] = exchange._accepted_order_id(sl_order)
             except Exception as exc:
                 log_error(

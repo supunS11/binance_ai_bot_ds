@@ -442,6 +442,73 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["stage"], TP1_PENDING)
         place_sl.assert_called_once()
 
+    def _dca_active_open_orders(self, sl_tag="dcaSL1787000000000", tp_tag="dcaTP1787000000000"):
+        # Same shape a genuine post-DCA position always has: one real
+        # full-position SL, one real full-position TP, no partial TP -
+        # the tag (see _execute_dca) is the only thing that lets
+        # _adopt_position tell this apart from an ordinary BREAKEVEN_
+        # ACTIVE position, which looks identical otherwise.
+        return [
+            {
+                "type": "STOP_MARKET", "closePosition": "true",
+                "triggerPrice": "0.038", "algoId": "sl_real", "clientAlgoId": sl_tag,
+            },
+            {
+                "type": "TAKE_PROFIT_MARKET", "closePosition": "true",
+                "triggerPrice": "0.043", "algoId": "tp_real", "clientAlgoId": tp_tag,
+            },
+        ]
+
+    def test_dca_active_shape_with_the_tag_is_recovered_as_dca_active(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_active_open_orders()):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_ACTIVE)
+        self.assertEqual(position["sl_price"], 0.038)
+        self.assertEqual(position["tp_price"], 0.043)
+        self.assertEqual(position["sl_order_id"], "sl_real")
+        self.assertEqual(position["tp_order_id"], "tp_real")
+        self.assertTrue(position["dca_applied"])
+        self.assertFalse(position["dca_breakeven_applied"])
+        self.assertIsNone(position["risk_distance"])  # honest - no original stop survives a restart
+        self.assertNotIn("tp1_price", position)  # DCA_ACTIVE has no TP1/TP2 concept
+        self.assertNotIn("tp2_price", position)
+
+    def test_same_shape_without_the_tag_is_not_treated_as_dca_active(self):
+        # An ordinary post-TP1 BREAKEVEN_ACTIVE position (SL already
+        # promoted, TP1 already resolved) has this exact same order
+        # shape - only the missing tag distinguishes it, and it must
+        # fall through to the existing generic adoption logic instead.
+        manager = PositionManager()
+        orders = self._dca_active_open_orders()
+        orders[0].pop("clientAlgoId")  # no tag at all - real orders predating this fix
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertNotIn("dca_applied", position)
+
+    def test_a_different_clientalgoid_is_not_treated_as_dca_active(self):
+        # Only this codebase's own dcaSL-prefixed tag counts - an
+        # unrelated auto-generated clientAlgoId (every real order has
+        # one) must not false-positive.
+        manager = PositionManager()
+        orders = self._dca_active_open_orders(sl_tag="x-Cb7ytekJ7f08390857d3692432277d")
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+
 
 class ReentryCooldownTests(unittest.TestCase):
     def test_symbol_never_closed_is_not_in_cooldown(self):
@@ -3207,8 +3274,16 @@ class ExecuteDcaLiveTests(unittest.TestCase):
             original_entry, original_quantity, 96.0, 1.0, "BUY", None, atr=original_atr,
         )
         self.assertEqual(cancel.call_count, 2)  # old TP1 + old TP2
-        tp_order.assert_called_once_with("BTCUSDT", "BUY", 106.0)
-        sl_order.assert_called_once_with("BTCUSDT", "BUY", 94.0)
+        # Both the price/side args AND the clientAlgoId tag (see
+        # _adopt_position's DCA_ACTIVE recovery, the reason this tag
+        # exists at all) - checked separately since the tag's timestamp
+        # suffix is non-deterministic.
+        tp_order.assert_called_once()
+        self.assertEqual(tp_order.call_args.args, ("BTCUSDT", "BUY", 106.0))
+        self.assertTrue(tp_order.call_args.kwargs["client_algo_id"].startswith("dcaTP"))
+        sl_order.assert_called_once()
+        self.assertEqual(sl_order.call_args.args, ("BTCUSDT", "BUY", 94.0))
+        self.assertTrue(sl_order.call_args.kwargs["client_algo_id"].startswith("dcaSL"))
         self.assertEqual(position["stage"], DCA_ACTIVE)
         self.assertEqual(position["tp_order_id"], "tp_new")
         self.assertEqual(position["sl_order_id"], "sl_new")
