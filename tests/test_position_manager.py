@@ -1,5 +1,8 @@
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import config
@@ -93,6 +96,153 @@ class OrderTypeFieldTests(unittest.TestCase):
         self.assertEqual(found["algoId"], "real_tp2")
 
 
+class SaveAndLoadStateTests(unittest.TestCase):
+    """position_manager.STATE_PATH's own comment explains why this exists
+    - a full-fidelity snapshot of self.positions, preferred over
+    exchange-shape reconciliation on restart wherever available."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.path = Path(self._tmpdir.name) / "position_state.json"
+
+    def test_save_then_load_round_trips_exactly(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True}, trade_id="BTCUSDT_123")
+
+        manager.save_state(self.path)
+        loaded = PositionManager.load_state(self.path)
+
+        self.assertEqual(loaded, manager.positions)
+
+    def test_save_creates_the_parent_directory_if_missing(self):
+        nested_path = Path(self._tmpdir.name) / "nested" / "position_state.json"
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True})
+
+        manager.save_state(nested_path)
+
+        self.assertTrue(nested_path.exists())
+
+    def test_save_leaves_no_leftover_temp_file(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True})
+        manager.save_state(self.path)
+
+        self.assertFalse(self.path.with_suffix(".json.tmp").exists())
+
+    def test_load_missing_file_returns_empty_dict(self):
+        loaded = PositionManager.load_state(self.path)  # never saved
+        self.assertEqual(loaded, {})
+
+    def test_load_corrupt_json_returns_empty_dict_not_raise(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json")
+
+        loaded = PositionManager.load_state(self.path)  # must not raise
+
+        self.assertEqual(loaded, {})
+
+    def test_load_non_dict_json_returns_empty_dict(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(["not", "a", "dict"]))
+
+        loaded = PositionManager.load_state(self.path)
+
+        self.assertEqual(loaded, {})
+
+    def test_save_failure_does_not_raise(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True})
+
+        # A directory where the file should be - mkdir/open both fail.
+        bad_path = Path(self._tmpdir.name) / "not_writable_dir"
+        bad_path.mkdir()
+
+        manager.save_state(bad_path)  # must not raise
+
+
+class TryRestoreFromSavedStateTests(unittest.TestCase):
+    def _live_position(self, side="BUY", quantity=1.0):
+        return {"symbol": "BTCUSDT", "side": side, "entry_price": 100.0, "quantity": quantity}
+
+    def _saved_position(self, side="BUY", quantity=1.0, stage=DCA_ACTIVE):
+        return {"side": side, "quantity": quantity, "stage": stage, "entry_price": 98.0}
+
+    def test_no_saved_entry_for_symbol_returns_false(self):
+        manager = PositionManager()
+        result = manager._try_restore_from_saved_state("BTCUSDT", self._live_position(), {})
+        self.assertFalse(result)
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_matching_side_and_quantity_restores_verbatim(self):
+        manager = PositionManager()
+        saved = self._saved_position()
+
+        result = manager._try_restore_from_saved_state(
+            "BTCUSDT", self._live_position(), {"BTCUSDT": saved}
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(manager.positions["BTCUSDT"], saved)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_side_mismatch_is_rejected(self):
+        manager = PositionManager()
+        saved = self._saved_position(side="SELL")
+
+        result = manager._try_restore_from_saved_state(
+            "BTCUSDT", self._live_position(side="BUY"), {"BTCUSDT": saved}
+        )
+
+        self.assertFalse(result)
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_quantity_within_one_percent_tolerance_is_accepted(self):
+        manager = PositionManager()
+        saved = self._saved_position(quantity=100.0)
+
+        result = manager._try_restore_from_saved_state(
+            "BTCUSDT", self._live_position(quantity=100.5), {"BTCUSDT": saved}
+        )
+
+        self.assertTrue(result)
+
+    def test_quantity_beyond_tolerance_is_rejected(self):
+        # Real motivation: a manual partial close (or any other out-of-
+        # band change) since the last save makes the saved snapshot
+        # unreliable - same discipline as the XNYUSDT investigation.
+        manager = PositionManager()
+        saved = self._saved_position(quantity=100.0)
+
+        result = manager._try_restore_from_saved_state(
+            "BTCUSDT", self._live_position(quantity=50.0), {"BTCUSDT": saved}
+        )
+
+        self.assertFalse(result)
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_zero_live_quantity_is_rejected(self):
+        manager = PositionManager()
+        saved = self._saved_position(quantity=100.0)
+
+        result = manager._try_restore_from_saved_state(
+            "BTCUSDT", self._live_position(quantity=0), {"BTCUSDT": saved}
+        )
+
+        self.assertFalse(result)
+
+    def test_missing_saved_quantity_is_rejected(self):
+        manager = PositionManager()
+        saved = {"side": "BUY", "stage": DCA_ACTIVE, "entry_price": 98.0}  # no quantity key
+
+        result = manager._try_restore_from_saved_state(
+            "BTCUSDT", self._live_position(), {"BTCUSDT": saved}
+        )
+
+        self.assertFalse(result)
+
+
 class ReconcileOnStartupTests(unittest.TestCase):
     def _live_position(self, symbol="BTCUSDT", side="BUY", entry=100.0, qty=1.0):
         return {"symbol": symbol, "side": side, "entry_price": entry, "quantity": qty}
@@ -104,6 +254,31 @@ class ReconcileOnStartupTests(unittest.TestCase):
             manager.reconcile_on_startup()
 
         self.assertEqual(manager.open_count(), 0)
+
+    def test_matching_saved_state_is_preferred_over_exchange_shape_guessing(self):
+        saved = {"side": "BUY", "quantity": 1.0, "stage": DCA_ACTIVE, "entry_price": 98.0}
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(PositionManager, "load_state", return_value={"BTCUSDT": saved}), \
+             patch.object(exchange, "get_open_algo_orders") as get_orders:
+            manager = PositionManager()
+            manager.reconcile_on_startup()
+
+        self.assertEqual(manager.positions["BTCUSDT"], saved)
+        get_orders.assert_not_called()  # never fell through to _adopt_position's own guessing
+
+    def test_no_matching_saved_state_falls_back_to_exchange_shape_guessing(self):
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position()]), \
+             patch.object(PositionManager, "load_state", return_value={}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[
+                 {"type": "STOP_MARKET", "triggerPrice": "98", "algoId": "sl1"},
+             ]):
+            manager = PositionManager()
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertEqual(position["sl_order_id"], "sl1")
 
     def test_already_tracked_symbol_is_not_re_adopted(self):
         manager = PositionManager()

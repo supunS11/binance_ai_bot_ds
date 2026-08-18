@@ -338,6 +338,14 @@ def _poll_positions(feed, positions):
         else:
             positions.poll_live(symbol, candles=feed.candles.get(symbol))
 
+    # Full-fidelity snapshot for the next restart - see position_manager.
+    # STATE_PATH's own comment for why this beats reconstructing from bare
+    # exchange order shape. Once per poll cycle (not per-symbol/per-
+    # mutation) is enough - worst-case loss on a crash is one cycle's
+    # worth of updates, which the existing exchange-shape reconciliation
+    # already covers safely as a fallback for whatever that window missed.
+    positions.save_state()
+
 
 def _resolve_break_confirmations(feed, positions):
     positions.resolve_break_confirmations(feed.candles)

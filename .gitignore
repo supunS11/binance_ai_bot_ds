@@ -15,8 +15,9 @@ __pycache__/
 logs/
 *.log
 
-# Generated trade data (journal history, backtest cache)
+# Generated trade data (journal history, backtest cache, live position state)
 data/*.csv
+data/*.json
 data/backtest_cache/
 
 # OS files

@@ -10,7 +10,9 @@ simulated against the live candle stream instead - shadow trades still
 produce real win/loss evidence about signal quality before anything is
 placed for real.
 """
+import json
 import time
+from pathlib import Path
 
 import config
 import exchange
@@ -18,6 +20,21 @@ import market_structure
 import risk_manager
 import signal_journal
 from logger import log_error, log_info, log_warning
+
+# Full-fidelity snapshot of self.positions, refreshed roughly every
+# POSITION_POLL_INTERVAL_SECONDS (see main._poll_positions's own call to
+# save_state) - see reconcile_on_startup/load_state for why this exists:
+# reconstructing position state from bare exchange order shape alone is
+# fundamentally ambiguous for some real cases (DCA_ACTIVE vs an ordinary
+# post-TP1 BREAKEVEN_ACTIVE position look identical on the exchange - see
+# _recover_dca_active_position's own docstring) and lossy for all of them
+# (structure_level, confluence_ratio, risk_distance, MAE/MFE tracking,
+# profit-protection arm state etc. have no exchange-side representation
+# at all). A restart now prefers this file wholesale over guessing,
+# falling back to the existing exchange-shape reconciliation only for a
+# symbol this file doesn't know about (first run, deleted/corrupted
+# file, or a real position the bot never registered itself).
+STATE_PATH = Path(__file__).resolve().parent / "data" / "position_state.json"
 
 
 TP1_PENDING = "TP1_PENDING"
@@ -156,6 +173,50 @@ class PositionManager:
     def __init__(self):
         self.positions = {}
         self._closed_at = {}  # symbol -> timestamp of its most recent close
+
+    def save_state(self, path=None):
+        """Full snapshot of self.positions to disk - see STATE_PATH's own
+        comment for why. Atomic (write to a temp file, then os.replace)
+        so a crash mid-write can never leave a half-written/corrupt file
+        for the next startup to trip over - load_state treats a corrupt
+        file as "no state" (logs and falls back to guessing), never
+        raises. Called once per poll cycle (main._poll_positions), not
+        on every individual mutation - worst-case data loss on a crash
+        is one POSITION_POLL_INTERVAL_SECONDS-ish window, which the
+        existing exchange-shape reconciliation already covers safely for
+        whatever that window missed."""
+        path = path or STATE_PATH
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(".json.tmp")
+
+            with open(tmp_path, "w") as handle:
+                json.dump(self.positions, handle)
+
+            tmp_path.replace(path)
+        except Exception as exc:
+            log_warning(f"Failed to save position state (continuing): {exc}")
+
+    @staticmethod
+    def load_state(path=None):
+        """The inverse of save_state - returns {} (not an error) for a
+        missing, empty, or corrupt file, so a first-ever run or a lost/
+        deleted state file just falls back to the existing exchange-
+        shape reconciliation for every symbol, exactly as before this
+        feature existed."""
+        path = path or STATE_PATH
+
+        try:
+            with open(path) as handle:
+                data = json.load(handle)
+
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            log_warning(f"Failed to load saved position state (ignoring): {exc}")
+            return {}
 
     def has_open_position(self, symbol):
         return symbol in self.positions
@@ -413,14 +474,29 @@ class PositionManager:
         fresh candles - see _recover_dca_pending_position. Without it,
         such a position still gets protected (falls through to the
         existing emergency-stop path below), it just can't resume
-        waiting for its DCA level."""
+        waiting for its DCA level.
+
+        Tries save_state's persisted snapshot FIRST for each real
+        position found (see STATE_PATH's own comment for why - it has
+        full fidelity where exchange-shape reconciliation is ambiguous
+        or lossy) via _try_restore_from_saved_state, falling back to the
+        existing _adopt_position guessing only for a symbol that isn't
+        in the saved state at all (first run, deleted/corrupted file, or
+        a real position the bot never registered itself)."""
         live_positions = exchange.get_all_open_positions()
         adopted = 0
+        restored = 0
+        saved_state = self.load_state()
 
         for live_position in live_positions:
             symbol = live_position["symbol"]
 
             if symbol in self.positions:
+                continue
+
+            if self._try_restore_from_saved_state(symbol, live_position, saved_state):
+                restored += 1
+                adopted += 1
                 continue
 
             self._adopt_position(symbol, live_position, feed=feed)
@@ -429,7 +505,8 @@ class PositionManager:
         if live_positions:
             log_info(
                 f"Startup reconciliation | {len(live_positions)} open "
-                f"position(s) found on the exchange | {adopted} adopted"
+                f"position(s) found on the exchange | {adopted} adopted "
+                f"({restored} from saved state)"
             )
 
     def reconcile_pending_entries_on_startup(self):
@@ -473,6 +550,54 @@ class PositionManager:
                 f"Startup reconciliation | {cancelled} resting limit "
                 f"entry order(s) cancelled"
             )
+
+    def _try_restore_from_saved_state(self, symbol, live_position, saved_state):
+        """Restores position_manager's own last-saved snapshot for
+        `symbol` verbatim, if one exists and passes a cheap sanity check
+        against the real exchange position - side must match, quantity
+        must be close. That check exists for the real case that
+        genuinely invalidates stale local state: a manual intervention
+        on the exchange between the last save and this restart (see the
+        XNYUSDT investigation, 2026-08-17) - a saved snapshot that no
+        longer matches reality is worse than falling through to
+        _adopt_position's own from-scratch reconciliation.
+
+        Order ids/prices in the restored snapshot can be up to one
+        POSITION_POLL_INTERVAL_SECONDS stale (save_state runs once per
+        poll cycle, not on every mutation) - left to the existing self-
+        heal/ground-truth-check machinery (_ensure_protection_orders,
+        _replace_sl_order's own live check before acting) to catch and
+        correct on the very next poll, same as it already does for a
+        freshly-adopted position today."""
+        saved = saved_state.get(symbol)
+
+        if not saved:
+            return False
+
+        if saved.get("side") != live_position.get("side"):
+            return False
+
+        saved_quantity = saved.get("quantity")
+        live_quantity = live_position.get("quantity")
+
+        if not saved_quantity or not live_quantity or live_quantity <= 0:
+            return False
+
+        if abs(saved_quantity - live_quantity) / live_quantity > 0.01:
+            log_warning(
+                f"{symbol} saved position state quantity ({saved_quantity}) "
+                f"doesn't match the real exchange quantity ({live_quantity}) "
+                f"- likely a manual intervention since the last save, "
+                f"falling back to reconciling from exchange state instead"
+            )
+            return False
+
+        self.positions[symbol] = dict(saved)
+        log_info(
+            f"{symbol} restored from saved position state | side={saved.get('side')} "
+            f"stage={saved.get('stage')} entry={saved.get('entry_price')}"
+        )
+        return True
 
     @staticmethod
     def _recover_dca_pending_position(symbol, side, entry_price, quantity, tp1_order, tp2_order, feed):
