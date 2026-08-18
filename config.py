@@ -935,6 +935,30 @@ PROFIT_PROTECTION_ENABLED = env_bool("PROFIT_PROTECTION_ENABLED", "False")
 PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 = env_float(
     "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60
 )
+# Real operator concern (2026-08-18): waiting for 80% of TP1's own ROI
+# feels safe when TP1 only pays out a modest amount, but not when TP1
+# itself is a big ROI move - 80% of a large number is still a large
+# amount of unrealized profit sitting completely unprotected while
+# waiting for activation. When TP1's own ROI exceeds this threshold, a
+# separate (lower) activation fraction is used instead - see
+# PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI below. Below the
+# threshold, behavior is unchanged (plain PROFIT_PROTECTION_ACTIVATION_
+# PCT_OF_TP1 still applies). Only the ARM trigger is tiered this way -
+# PROFIT_PROTECTION_LOCK_PCT_OF_TP1/RETRACE_PCT (what happens once
+# already armed) are untouched, same for every trade regardless of TP1's
+# own ROI.
+PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT = env_float(
+    "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 50
+)
+# The activation fraction used instead of PROFIT_PROTECTION_ACTIVATION_
+# PCT_OF_TP1 once TP1's own ROI clears the threshold above - deliberately
+# lower, so a big-ROI TP1 still arms protection at a comparable absolute
+# ROI level instead of making the operator wait through a much larger
+# unrealized-profit swing first. Starting value, not yet calibrated
+# against real trade data.
+PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI = env_float(
+    "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI", 50
+)
 # 2026-08-15, explicit operator report: locking the SL at the exact
 # activation price left ~zero room between the stop and current price
 # the moment it fired, so ordinary noise closed the trade right at

@@ -790,11 +790,16 @@ class ProfitProtectionPriceReachedTests(unittest.TestCase):
             )
 
     def test_buy_reaches_trigger_at_the_lock_price(self):
-        # lock price = 106 (see ComputeProfitProtectionLockPriceTests)
+        # lock price = 106 (see ComputeProfitProtectionLockPriceTests) -
+        # tp1 ROI here is 100%, above PROFIT_PROTECTION_HIGH_TP1_ROI_
+        # THRESHOLD_PCT's default (50), so it's pinned high to keep this
+        # test on the plain (non-tiered) activation path it's actually
+        # about - see ComputeProfitProtectionLockPriceHighTp1RoiTests.
         manager = PositionManager()
 
         with patch.object(config, "LEVERAGE", 10), \
-             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 200):
             self.assertTrue(manager._profit_protection_price_reached(self._position(), 106))
             self.assertFalse(manager._profit_protection_price_reached(self._position(), 105.9))
 
@@ -803,7 +808,8 @@ class ProfitProtectionPriceReachedTests(unittest.TestCase):
         position = self._position(side="SELL", entry_price=100, tp1_price=90)
 
         with patch.object(config, "LEVERAGE", 10), \
-             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 200):
             self.assertTrue(manager._profit_protection_price_reached(position, 94))
             self.assertFalse(manager._profit_protection_price_reached(position, 94.1))
 

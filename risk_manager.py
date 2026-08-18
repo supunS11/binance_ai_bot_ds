@@ -351,10 +351,28 @@ def compute_profit_protection_lock_price(entry_price, side, tp1_price):
     next tick closed the trade immediately - explicit operator report,
     fixed by separating "enough profit to arm" from "where the stop
     actually sits" the same way v7's evaluate_route_profit_protection
-    separates trigger_roi from lock_roi/retrace_pct)."""
-    return _price_at_tp1_roi_fraction(
-        entry_price, side, tp1_price, config.PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1
-    )
+    separates trigger_roi from lock_roi/retrace_pct).
+
+    Real operator concern (2026-08-18): when TP1's own ROI clears
+    PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT, waiting for the normal
+    (higher) PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 fraction of it means
+    a large amount of unrealized profit sits unprotected in absolute ROI
+    terms - PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI (lower) is
+    used instead in that case. Only the ARM fraction is tiered this way;
+    compute_profit_protection_trailing_floor's LOCK_PCT_OF_TP1/RETRACE_PCT
+    (what happens once already armed) are unaffected."""
+    if entry_price > 0 and tp1_price is not None:
+        tp1_roi_pct = _roi_pct(entry_price, abs(tp1_price - entry_price))
+        threshold = max(float(config.PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT), 0)
+        activation_pct = (
+            config.PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI
+            if tp1_roi_pct > threshold
+            else config.PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1
+        )
+    else:
+        activation_pct = config.PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1
+
+    return _price_at_tp1_roi_fraction(entry_price, side, tp1_price, activation_pct)
 
 
 def compute_profit_protection_trailing_floor(entry_price, side, tp1_price, peak_price):

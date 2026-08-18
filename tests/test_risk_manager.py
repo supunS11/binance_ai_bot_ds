@@ -298,34 +298,43 @@ class ComputeProfitProtectionLockPriceTests(unittest.TestCase):
     """config.PROFIT_PROTECTION_ENABLED - locks in
     PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1% of TP1's own ROI (at
     LEVERAGE), used as both the activation trigger and the lock target
-    (position_manager._profit_protection_lock_price)."""
+    (position_manager._profit_protection_lock_price). All fixtures here
+    use a TP1 ROI of 100% (entry=100, tp1=110/90, leverage=10) - well
+    above PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT's default (50), so
+    HIGH_TP1_ROI_THRESHOLD_PCT is pinned high here to keep exercising the
+    plain (non-tiered) activation path this class is actually about - see
+    ComputeProfitProtectionLockPriceHighTp1RoiTests for the tiering itself."""
 
     def test_buy_locks_the_configured_pct_of_tp1s_roi(self):
         # entry=100, tp1=110 -> tp1 move=10 -> tp1 ROI = 10/100*10*100=100%
         # -> 60% of that = 60% ROI -> price move = 60/100/10*100 = 6
         with patch.object(config, "LEVERAGE", 10), \
-             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 200):
             price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
 
         self.assertAlmostEqual(price, 106)
 
     def test_sell_locks_the_configured_pct_of_tp1s_roi(self):
         with patch.object(config, "LEVERAGE", 10), \
-             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 200):
             price = risk_manager.compute_profit_protection_lock_price(100, "SELL", 90)
 
         self.assertAlmostEqual(price, 94)
 
     def test_zero_activation_pct_locks_exactly_at_entry(self):
         with patch.object(config, "LEVERAGE", 10), \
-             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 0):
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 0), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 200):
             price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
 
         self.assertAlmostEqual(price, 100)
 
     def test_negative_activation_pct_is_clamped_to_zero(self):
         with patch.object(config, "LEVERAGE", 10), \
-             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", -10):
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", -10), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 200):
             price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
 
         self.assertAlmostEqual(price, 100)
@@ -348,6 +357,63 @@ class ComputeProfitProtectionLockPriceTests(unittest.TestCase):
             price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
 
         self.assertIsNone(price)
+
+
+class ComputeProfitProtectionLockPriceHighTp1RoiTests(unittest.TestCase):
+    """config.PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT/
+    PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI - real operator
+    concern (2026-08-18): waiting for 80% of TP1's own ROI is fine when
+    TP1 only pays out a modest amount, but not when TP1 itself is a big
+    ROI move, where 80% of it is still a lot of unrealized profit sitting
+    unprotected. Above the threshold, the HIGH_ROI activation fraction is
+    used instead of the plain one."""
+
+    def test_tp1_roi_above_threshold_uses_the_high_roi_activation_pct(self):
+        # entry=100, tp1=110, leverage=10 -> tp1 ROI=100%, above the 50%
+        # threshold -> uses ACTIVATION_PCT_OF_TP1_HIGH_ROI (50), not the
+        # plain ACTIVATION_PCT_OF_TP1 (80) -> price move = 50/100/10*100 = 5
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 80), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 50), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI", 50):
+            price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 110)
+
+        self.assertAlmostEqual(price, 105)
+
+    def test_tp1_roi_at_or_below_threshold_uses_the_plain_activation_pct(self):
+        # entry=100, tp1=104, leverage=10 -> tp1 ROI=40%, below the 50%
+        # threshold -> uses the plain ACTIVATION_PCT_OF_TP1 (80), not
+        # HIGH_ROI -> target ROI = 80% of 40% = 32% -> price move =
+        # 32/100/10*100 = 3.2
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 80), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 50), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI", 50):
+            price = risk_manager.compute_profit_protection_lock_price(100, "BUY", 104)
+
+        self.assertAlmostEqual(price, 103.2)
+
+    def test_tp1_roi_exactly_at_threshold_uses_the_plain_activation_pct(self):
+        # entry=100, tp1=105, leverage=10 -> tp1 ROI=50%, exactly at the
+        # threshold - strictly-greater-than semantics, so this still uses
+        # the plain ACTIVATION_PCT_OF_TP1 (80): target ROI = 80% of 50% =
+        # 40% -> price move = 40/100/10*100 = 4
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 80), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 50), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI", 50):
+            price = risk_manager.compute_profit_protection_lock_price(100, "SELL", 95)
+
+        self.assertAlmostEqual(price, 96)
+
+    def test_sell_side_above_threshold_uses_the_high_roi_activation_pct(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 80), \
+             patch.object(config, "PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT", 50), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1_HIGH_ROI", 50):
+            price = risk_manager.compute_profit_protection_lock_price(100, "SELL", 90)
+
+        self.assertAlmostEqual(price, 95)
 
 
 class ComputeProfitProtectionTrailingFloorTests(unittest.TestCase):
