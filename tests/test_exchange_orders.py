@@ -744,6 +744,67 @@ class GetOrderStatusTests(unittest.TestCase):
         self.assertEqual(result["status"], "UNKNOWN")
 
 
+class ResolveMarketFillPriceTests(unittest.TestCase):
+    """The real average fill price for a just-placed MARKET order - see
+    position_manager._resolve_real_entry, the caller this exists for."""
+
+    def test_avg_price_already_in_the_create_order_response_is_used_directly(self):
+        order = {"orderId": "o1", "avgPrice": "100.5"}
+
+        with patch.object(exchange, "get_order_status") as status:
+            result = exchange.resolve_market_fill_price("BTCUSDT", order, 100.0)
+
+        self.assertEqual(result, 100.5)
+        status.assert_not_called()
+
+    def test_zero_avg_price_falls_back_to_a_fresh_status_lookup(self):
+        order = {"orderId": "o1", "avgPrice": "0"}
+
+        with patch.object(
+            exchange, "get_order_status",
+            return_value={"status": "FILLED", "executed_qty": 1.0, "avg_price": 100.7, "orig_qty": 1.0},
+        ) as status:
+            result = exchange.resolve_market_fill_price("BTCUSDT", order, 100.0)
+
+        self.assertEqual(result, 100.7)
+        status.assert_called_once_with("BTCUSDT", "o1")
+
+    def test_missing_avg_price_key_falls_back_to_a_fresh_status_lookup(self):
+        order = {"orderId": "o1"}
+
+        with patch.object(
+            exchange, "get_order_status",
+            return_value={"status": "FILLED", "executed_qty": 1.0, "avg_price": 100.7, "orig_qty": 1.0},
+        ):
+            result = exchange.resolve_market_fill_price("BTCUSDT", order, 100.0)
+
+        self.assertEqual(result, 100.7)
+
+    def test_status_lookup_also_empty_falls_back_to_the_planned_price(self):
+        order = {"orderId": "o1", "avgPrice": "0"}
+
+        with patch.object(
+            exchange, "get_order_status",
+            return_value={"status": "UNKNOWN", "executed_qty": 0.0, "avg_price": 0.0, "orig_qty": 0.0},
+        ):
+            result = exchange.resolve_market_fill_price("BTCUSDT", order, 100.0)
+
+        self.assertEqual(result, 100.0)
+
+    def test_no_order_id_falls_back_to_the_planned_price_without_a_lookup(self):
+        order = {"avgPrice": "0"}
+
+        with patch.object(exchange, "get_order_status") as status:
+            result = exchange.resolve_market_fill_price("BTCUSDT", order, 100.0)
+
+        self.assertEqual(result, 100.0)
+        status.assert_not_called()
+
+    def test_none_order_falls_back_to_the_planned_price(self):
+        result = exchange.resolve_market_fill_price("BTCUSDT", None, 100.0)
+        self.assertEqual(result, 100.0)
+
+
 class CancelOrderTests(unittest.TestCase):
     def test_calls_the_plain_cancel_endpoint(self):
         with patch.object(exchange.client, "futures_cancel_order", return_value={"status": "CANCELED"}) as mock_cancel:

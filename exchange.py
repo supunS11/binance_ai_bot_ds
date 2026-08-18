@@ -1321,6 +1321,34 @@ def get_order_status(symbol, order_id):
         return {"status": "UNKNOWN", "executed_qty": 0.0, "avg_price": 0.0, "orig_qty": 0.0}
 
 
+def resolve_market_fill_price(symbol, order, fallback_price):
+    """The real average fill price for a just-placed MARKET order - see
+    execution.py's own comment on why this project historically trusted
+    the planned (pre-order, signal-time) price instead of ever reading
+    this back. `avgPrice` is usually already populated in the create-
+    order response itself (market orders fill essentially synchronously),
+    but can occasionally still read back as 0/missing if the fill hasn't
+    fully propagated server-side yet - falls back to one fresh
+    get_order_status lookup (the same ground-truth call LIMIT fills
+    already use) in that case, and to `fallback_price` only if that also
+    comes back empty. Never raises, never blocks/delays the entry beyond
+    this one optional lookup - a real fill price is a bookkeeping
+    improvement (accurate entry_price/risk_distance for MAE/MFE and
+    R-multiple journaling), not something worth failing an entry over."""
+    avg_price = float((order or {}).get("avgPrice") or 0)
+
+    if avg_price > 0:
+        return avg_price
+
+    order_id = (order or {}).get("orderId")
+
+    if not order_id:
+        return fallback_price
+
+    status = get_order_status(symbol, order_id)
+    return status["avg_price"] if status["avg_price"] > 0 else fallback_price
+
+
 def cancel_order(symbol, order_id):
     """Plain (non-algo) cancel - distinct endpoint from cancel_algo_order.
     Never raises; logs and returns None on failure, same convention as

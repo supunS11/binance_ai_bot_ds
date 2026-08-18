@@ -56,6 +56,8 @@ def enter_trade(plan):
         log_error(f"{symbol} entry order error: {exc}")
         return {"ok": False, "shadow": False, "error": str(exc)}
 
+    real_entry_price = exchange.resolve_market_fill_price(symbol, entry_order, plan["entry_price"])
+
     try:
         sl_order = exchange.place_stop_loss(symbol, side, plan["sl_price"])
     except Exception as exc:
@@ -118,6 +120,7 @@ def enter_trade(plan):
         "sl_order": sl_order,
         "tp1_order": tp1_order,
         "tp2_order": tp2_order,
+        "real_entry_price": real_entry_price,
     }
 
 
@@ -161,6 +164,8 @@ def enter_trade_dca_pending(plan):
         log_error(f"{symbol} entry order error: {exc}")
         return {"ok": False, "shadow": False, "error": str(exc)}
 
+    real_entry_price = exchange.resolve_market_fill_price(symbol, entry_order, plan["entry_price"])
+
     # TP1/TP2 are best-effort, same as enter_trade - a missing TP here is
     # a degraded outcome (the trade still resolves via DCA-or-TP1 either
     # way), not a naked-position risk on its own, so it doesn't trigger
@@ -191,6 +196,7 @@ def enter_trade_dca_pending(plan):
         "entry_order": entry_order,
         "tp1_order": tp1_order,
         "tp2_order": tp2_order,
+        "real_entry_price": real_entry_price,
     }
 
 

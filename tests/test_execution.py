@@ -39,7 +39,7 @@ class EnterTradeLiveModeTests(unittest.TestCase):
     def test_live_mode_places_entry_then_sl_tp1_tp2(self):
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "status": "FILLED"}) as market_order, \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "status": "FILLED", "avgPrice": "100"}) as market_order, \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}) as stop_loss, \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}) as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp2:
@@ -51,6 +51,23 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         stop_loss.assert_called_once_with("BTCUSDT", "BUY", 98)
         tp1.assert_called_once_with("BTCUSDT", "BUY", 0.5, 102)
         tp2.assert_called_once_with("BTCUSDT", "BUY", 104)
+        self.assertEqual(result["real_entry_price"], 100.0)
+
+    def test_real_entry_price_reflects_actual_slippage_not_the_plan(self):
+        # SL/TP1/TP2 stay exactly as planned (real structure levels, not
+        # shifted for slippage) - only the reported real_entry_price
+        # differs, for position_manager._resolve_real_entry to pick up.
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100.12"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}) as tp1, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp2:
+            result = execution.enter_trade(_plan())
+
+        self.assertEqual(result["real_entry_price"], 100.12)
+        tp1.assert_called_once_with("BTCUSDT", "BUY", 0.5, 102)  # unshifted
+        tp2.assert_called_once_with("BTCUSDT", "BUY", 104)  # unshifted
 
     def test_live_mode_entry_failure_returns_not_ok(self):
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
@@ -81,7 +98,7 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         # left both naked and untracked (main.py only registers on ok=True).
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
              patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("SL rejected")), \
              patch.object(exchange, "close_position_market") as close_market, \
              patch.object(exchange, "place_take_profit_partial") as tp1, \
@@ -104,7 +121,7 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         # forever. Must be cleared as part of this same recovery.
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
              patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("APIError(code=-4130): An open stop or take profit order with GTE and closePosition in the direction is existing.")), \
              patch.object(exchange, "close_position_market") as close_market, \
              patch.object(exchange, "cancel_all_open_orders") as cancel_all:
@@ -120,7 +137,7 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         # no-op at best and a surprising side effect at worst.
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
              patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("SL rejected")), \
              patch.object(exchange, "close_position_market") as close_market, \
              patch.object(exchange, "cancel_all_open_orders") as cancel_all:
@@ -136,7 +153,7 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         # a normal not-ok result so the caller doesn't crash.
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
              patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("SL rejected")), \
              patch.object(exchange, "close_position_market", side_effect=RuntimeError("close also failed")):
             result = execution.enter_trade(_plan())
@@ -149,7 +166,7 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         # still be reported ok=True and get tracked.
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
              patch.object(exchange, "place_take_profit_partial", side_effect=RuntimeError("TP1 rejected")), \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
@@ -163,7 +180,7 @@ class EnterTradeLiveModeTests(unittest.TestCase):
     def test_tp2_failure_does_not_abort_the_trade(self):
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
              patch.object(exchange, "place_take_profit_full", side_effect=RuntimeError("TP2 rejected")):
@@ -252,7 +269,7 @@ class EnterTradeDcaPendingLiveModeTests(unittest.TestCase):
     def test_live_mode_places_entry_then_tp1_tp2_but_never_an_sl(self):
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}) as market_order, \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}) as market_order, \
              patch.object(exchange, "place_stop_loss") as stop_loss, \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}) as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp2:
@@ -265,6 +282,17 @@ class EnterTradeDcaPendingLiveModeTests(unittest.TestCase):
         tp1.assert_called_once_with("BTCUSDT", "BUY", 0.5, 102)
         tp2.assert_called_once_with("BTCUSDT", "BUY", 104)
         stop_loss.assert_not_called()
+        self.assertEqual(result["real_entry_price"], 100.0)
+
+    def test_real_entry_price_reflects_actual_slippage_not_the_plan(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "99.95"}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
+            result = execution.enter_trade_dca_pending(_dca_plan())
+
+        self.assertEqual(result["real_entry_price"], 99.95)
 
     def test_entry_order_failure_returns_not_ok(self):
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
@@ -291,7 +319,7 @@ class EnterTradeDcaPendingLiveModeTests(unittest.TestCase):
         # same "best-effort" treatment enter_trade already gives TP1/TP2.
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
-             patch.object(exchange, "place_market_order", return_value={"orderId": 1}), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
              patch.object(exchange, "place_take_profit_partial", side_effect=RuntimeError("rejected")), \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
             result = execution.enter_trade_dca_pending(_dca_plan())

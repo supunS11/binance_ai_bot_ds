@@ -504,6 +504,57 @@ class RegisterTests(unittest.TestCase):
         self.assertIsNone(position["sl_order_id"])
         self.assertEqual(position["stage"], TP1_PENDING)
 
+    def test_no_real_entry_price_uses_the_planned_entry_unchanged(self):
+        # No "real_entry_price" key at all (shadow mode's own execution_
+        # result shape) - must be byte-identical to the old behavior.
+        manager = PositionManager()
+        position = manager.register(_plan(), {"shadow": True})
+
+        self.assertEqual(position["entry_price"], 100)
+        self.assertEqual(position["breakeven_price"], 100.02)  # _plan()'s own value, untouched
+        self.assertEqual(position["risk_distance"], 2.0)
+        self.assertEqual(position["mae_price"], 100)
+        self.assertEqual(position["mfe_price"], 100)
+
+    def test_real_entry_price_corrects_entry_breakeven_and_risk_distance(self):
+        # entry=100 planned, sl=98 (_plan()) - a real fill at 100.5 (0.5%
+        # slippage) must NOT touch sl_price/tp1_price/tp2_price (real
+        # structure levels, unaffected by entry slippage), but does
+        # correct entry_price itself, the breakeven derived from it, and
+        # risk_distance (98 -> 100.5, was 100 -> 98 = 2.0, now 2.5).
+        manager = PositionManager()
+        execution_result = {"shadow": False, "real_entry_price": 100.5}
+        position = manager.register(_plan(), execution_result)
+
+        self.assertEqual(position["entry_price"], 100.5)
+        self.assertEqual(position["sl_price"], 98)  # unshifted
+        self.assertEqual(position["tp1_price"], 102)  # unshifted
+        self.assertEqual(position["tp2_price"], 104)  # unshifted
+        self.assertAlmostEqual(position["breakeven_price"], 100.5 * 1.0002)
+        self.assertEqual(position["risk_distance"], 2.5)
+        self.assertEqual(position["mae_price"], 100.5)
+        self.assertEqual(position["mfe_price"], 100.5)
+
+    def test_real_entry_price_matching_the_plan_exactly_is_a_noop(self):
+        manager = PositionManager()
+        execution_result = {"shadow": False, "real_entry_price": 100}
+        position = manager.register(_plan(), execution_result)
+
+        self.assertEqual(position["entry_price"], 100)
+        self.assertEqual(position["breakeven_price"], 100.02)  # _plan()'s own value
+        self.assertEqual(position["risk_distance"], 2.0)
+
+    def test_real_entry_price_of_zero_is_treated_as_unavailable(self):
+        # exchange.resolve_market_fill_price never actually returns 0 (it
+        # falls back to the planned price itself first) - defends against
+        # that invariant being violated rather than relying on it blindly.
+        manager = PositionManager()
+        execution_result = {"shadow": False, "real_entry_price": 0}
+        position = manager.register(_plan(), execution_result)
+
+        self.assertEqual(position["entry_price"], 100)
+        self.assertEqual(position["breakeven_price"], 100.02)
+
     def test_trade_id_is_stored_and_threaded_through_to_the_outcome_journal(self):
         manager = PositionManager()
         manager.register(_plan(), {"shadow": True}, trade_id="BTCUSDT_123456")
@@ -2980,6 +3031,26 @@ class RegisterDcaPendingTests(unittest.TestCase):
         position = manager.register_dca_pending(dict(_dca_plan(), atr=2.5), {"shadow": True})
         self.assertEqual(position["atr"], 2.5)
 
+    def test_real_entry_price_corrects_entry_breakeven_and_risk_distance(self):
+        # Same fix as RegisterTests' equivalent - dca_price (a real
+        # structure level, independent of entry slippage) stays untouched.
+        manager = PositionManager()
+        execution_result = {"shadow": False, "real_entry_price": 100.5}
+        position = manager.register_dca_pending(_dca_plan(), execution_result)
+
+        self.assertEqual(position["entry_price"], 100.5)
+        self.assertEqual(position["dca_price"], 96)  # unshifted
+        self.assertAlmostEqual(position["breakeven_price"], 100.5 * 1.0002)
+        self.assertEqual(position["risk_distance"], 2.5)
+
+    def test_no_real_entry_price_uses_the_planned_entry_unchanged(self):
+        manager = PositionManager()
+        position = manager.register_dca_pending(_dca_plan(), {"shadow": True})
+
+        self.assertEqual(position["entry_price"], 100)
+        self.assertEqual(position["breakeven_price"], 100.02)
+        self.assertEqual(position["risk_distance"], 2.0)
+
 
 class IsDcaCandidateTests(unittest.TestCase):
     def _position(self, **overrides):
@@ -3110,9 +3181,12 @@ class ExecuteDcaLiveTests(unittest.TestCase):
     def test_places_dca_order_cancels_old_tps_and_places_new_sl_and_tp(self):
         manager = self._manager_with_dca_pending()
         position = manager.positions["BTCUSDT"]
+        original_entry, original_quantity, original_atr = (
+            position["entry_price"], position["quantity"], position.get("atr")
+        )
 
-        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
-             patch.object(exchange, "place_market_order") as market_order, \
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan, \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}) as market_order, \
              patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}) as tp_order, \
@@ -3121,6 +3195,11 @@ class ExecuteDcaLiveTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         market_order.assert_called_once_with("BTCUSDT", "BUY", 1.0)  # dca_quantity
+        # The real fill price (96, from avgPrice) - not the planned
+        # dca_price trigger - is what gets passed into build_dca_plan.
+        build_plan.assert_called_once_with(
+            original_entry, original_quantity, 96.0, 1.0, "BUY", None, atr=original_atr,
+        )
         self.assertEqual(cancel.call_count, 2)  # old TP1 + old TP2
         tp_order.assert_called_once_with("BTCUSDT", "BUY", 106.0)
         sl_order.assert_called_once_with("BTCUSDT", "BUY", 94.0)
@@ -3140,7 +3219,7 @@ class ExecuteDcaLiveTests(unittest.TestCase):
         real_tp2 = {"type": "TAKE_PROFIT_MARKET", "closePosition": True, "algoId": "real_tp2"}
 
         with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
-             patch.object(exchange, "place_market_order"), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
              patch.object(exchange, "get_open_algo_orders", return_value=[real_tp1, real_tp2]), \
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
@@ -3155,7 +3234,7 @@ class ExecuteDcaLiveTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
 
         with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
-             patch.object(exchange, "place_market_order"), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
              patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "cancel_algo_order"), \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
@@ -3502,7 +3581,7 @@ class PollLiveDcaPendingTests(unittest.TestCase):
         manager = self._manager_with_dca_pending()
 
         with patch.object(exchange, "get_mark_price", return_value=95.0), \
-             patch.object(exchange, "place_market_order"), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
              patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "cancel_algo_order"), \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \

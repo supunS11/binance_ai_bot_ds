@@ -103,6 +103,47 @@ def _more_favorable(side, price, reference):
     return price > reference if side == "BUY" else price < reference
 
 
+def _resolve_real_entry(plan, execution_result, side):
+    """execution_result["real_entry_price"] (see exchange.
+    resolve_market_fill_price) - the real average fill Binance reports
+    for the entry's MARKET order, used instead of plan["entry_price"]
+    (the signal-time estimate the order was computed from) when it's
+    available. Real evidence (2026-08-18, 30 live entries checked
+    against actual account trade history): slippage up to +0.25% on this
+    bot's own fills - not huge, but a real fraction of risk_distance
+    floors as low as MIN_STOP_DISTANCE_PCT=0.6%, so it was showing up as
+    noise in every MAE/MFE and R-multiple stat derived from risk_distance.
+
+    Only entry_price/breakeven_price/risk_distance are corrected here -
+    NOT sl_price/tp1_price/tp2_price, which stay exactly as risk_manager
+    computed them (real structure levels or R-multiples of the ORIGINAL
+    planned risk_distance) - shifting a real liquidity-pool price to
+    chase half a percent of slippage on the entry would be wrong, that
+    level doesn't move just because the fill did.
+
+    Shadow mode (no real order, no real_entry_price) and any resolution
+    failure both fall through to the exact old behavior (the planned
+    price) - this is a bookkeeping accuracy improvement, never a reason
+    to fail or alter an entry."""
+    entry_price = execution_result.get("real_entry_price") or plan["entry_price"]
+
+    if entry_price == plan["entry_price"]:
+        return entry_price, plan["breakeven_price"], plan.get("risk_distance") or abs(
+            plan["entry_price"] - plan["sl_price"]
+        )
+
+    risk_distance = abs(entry_price - plan["sl_price"])
+
+    if risk_distance <= 0:
+        # Slippage carried the real fill past/onto the planned SL itself -
+        # pathological, but real_distance from the (still valid) planned
+        # entry is more honest here than a zero/negative distance.
+        risk_distance = plan.get("risk_distance") or abs(plan["entry_price"] - plan["sl_price"])
+
+    breakeven_price = risk_manager.compute_breakeven_price(entry_price, side)
+    return entry_price, breakeven_price, risk_distance
+
+
 class PositionManager:
     def __init__(self):
         self.positions = {}
@@ -143,16 +184,19 @@ class PositionManager:
     def register(self, plan, execution_result, trade_id=None):
         symbol = plan["symbol"]
         shadow = execution_result.get("shadow", True)
+        entry_price, breakeven_price, risk_distance = _resolve_real_entry(
+            plan, execution_result, plan["side"]
+        )
 
         position = {
             "symbol": symbol,
             "trade_id": trade_id,
             "side": plan["side"],
-            "entry_price": plan["entry_price"],
+            "entry_price": entry_price,
             "sl_price": plan["sl_price"],
             "tp1_price": plan["tp1_price"],
             "tp2_price": plan["tp2_price"],
-            "breakeven_price": plan["breakeven_price"],
+            "breakeven_price": breakeven_price,
             "quantity": plan["quantity"],
             "tp1_quantity": plan["tp1_quantity"],
             "tp2_quantity": plan["tp2_quantity"],
@@ -198,13 +242,13 @@ class PositionManager:
             # TRAILING_STOP_PROFIT_HIT outcome) - takes precedence over
             # early_breakeven_profit_locked in _breakeven_stop_outcome.
             "trailing_stop_locked_profit": False,
-            "mae_price": plan["entry_price"],
-            "mfe_price": plan["entry_price"],
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
             # Fixed at entry, never touched again - see
             # _mae_mfe_r_multiples for why this must never be re-derived
             # from position["sl_price"] later (that field legitimately
             # moves to the breakeven price once a trade is promoted).
-            "risk_distance": plan.get("risk_distance") or abs(plan["entry_price"] - plan["sl_price"]),
+            "risk_distance": risk_distance,
             # For resolve_break_confirmations() - was the structure break
             # that triggered this entry still holding once its candle
             # actually finished, or was it just a wick that snapped back
@@ -227,16 +271,19 @@ class PositionManager:
         attempted twice for the same position."""
         symbol = plan["symbol"]
         shadow = execution_result.get("shadow", True)
+        entry_price, breakeven_price, risk_distance = _resolve_real_entry(
+            plan, execution_result, plan["side"]
+        )
 
         position = {
             "symbol": symbol,
             "trade_id": trade_id,
             "side": plan["side"],
-            "entry_price": plan["entry_price"],
+            "entry_price": entry_price,
             "sl_price": plan["sl_price"],
             "tp1_price": plan["tp1_price"],
             "tp2_price": plan["tp2_price"],
-            "breakeven_price": plan["breakeven_price"],
+            "breakeven_price": breakeven_price,
             "quantity": plan["quantity"],
             "tp1_quantity": plan["tp1_quantity"],
             "tp2_quantity": plan["tp2_quantity"],
@@ -259,9 +306,9 @@ class PositionManager:
             "profit_protection_profit_locked": False,
             "profit_protection_peak_price": None,
             "trailing_stop_locked_profit": False,
-            "mae_price": plan["entry_price"],
-            "mfe_price": plan["entry_price"],
-            "risk_distance": plan.get("risk_distance") or abs(plan["entry_price"] - plan["sl_price"]),
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
+            "risk_distance": risk_distance,
             "structure_level": plan.get("structure_level"),
             "trigger_candle_open_time": plan.get("trigger_candle_open_time"),
             "break_confirmed_by_close": None,
@@ -996,17 +1043,20 @@ class PositionManager:
     def _execute_dca(self, position, candles=None):
         """config.DCA_ENABLED - price reached position["dca_price"]
         before TP1 ever filled. Adds position["dca_quantity"] at that
-        level (same "trust the planned price, don't complicate with a
-        separately-fetched real fill price" convention execution.
-        enter_trade already uses for the original entry - this codebase
-        has never queried a market order's real average fill price
-        anywhere), computes the blended entry / first-ever-real-SL /
-        single-TP via risk_manager.build_dca_plan, cancels the original
-        TP1+TP2, places the new single TP + the first real SL, and
-        transitions to DCA_ACTIVE. Mirrors _apply_pending_fill's "SL must
-        be atomic even when placed asynchronously" discipline: a failed
-        post-DCA SL placement closes the position at market immediately
-        rather than leave real (now-doubled) quantity unprotected.
+        level, computes the blended entry / first-ever-real-SL / single-
+        TP via risk_manager.build_dca_plan, cancels the original TP1+TP2,
+        places the new single TP + the first real SL, and transitions to
+        DCA_ACTIVE. Mirrors _apply_pending_fill's "SL must be atomic even
+        when placed asynchronously" discipline: a failed post-DCA SL
+        placement closes the position at market immediately rather than
+        leave real (now-doubled) quantity unprotected.
+
+        Live mode resolves the real average fill price for the DCA order
+        (exchange.resolve_market_fill_price - same real-fill-price fix as
+        the original entry, see _resolve_real_entry) and uses that instead
+        of the planned dca_price trigger for the blended-entry/post-DCA-SL
+        math - shadow mode has no real order to resolve, so it keeps
+        trusting the planned trigger price exactly as before.
 
         Returns a close-outcome string only if the post-DCA SL placement
         failed badly enough to force closing the position; otherwise
@@ -1019,10 +1069,14 @@ class PositionManager:
 
         if not shadow:
             try:
-                exchange.place_market_order(symbol, side, position["dca_quantity"])
+                dca_order = exchange.place_market_order(symbol, side, position["dca_quantity"])
             except Exception as exc:
                 log_error(f"{symbol} DCA order error: {exc}")
                 return None  # retry next poll - not worse off than before
+
+            dca_fill_price = exchange.resolve_market_fill_price(
+                symbol, dca_order, position["dca_price"]
+            )
 
         pools = (
             market_structure.find_liquidity_pools(market_structure.find_swing_points(candles))
