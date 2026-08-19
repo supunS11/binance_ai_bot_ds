@@ -252,6 +252,61 @@ class StructureBasedTargetTests(unittest.TestCase):
         self.assertEqual(tp2, 104)
 
 
+class NearestFavorableStructureRTests(unittest.TestCase):
+    """Informational-only field (see signal_journal.py's
+    nearest_favorable_sr_r comment) - unlike compute_targets/
+    _find_structure_target, this has NO minimum-room floor: it reports
+    whatever real pool is actually nearest, even one too close to ever
+    qualify as a TP itself."""
+
+    def test_reports_a_pool_too_close_to_ever_qualify_as_a_tp(self):
+        # Only 0.5R away - StructureBasedTargetTests's equivalent fixture
+        # (test_pool_too_close_to_clear_the_floor_is_ignored) shows this
+        # same pool gets ignored by compute_targets and falls back to a
+        # pure R-multiple TP1 instead - this function must still report it.
+        pools = [{"type": "BUY_SIDE", "price": 101}]
+
+        result = risk_manager.nearest_favorable_structure_r(pools, 100, "BUY", risk_distance=2)
+
+        self.assertAlmostEqual(result, 0.5)
+
+    def test_picks_the_nearest_pool_not_the_farther_one(self):
+        pools = [
+            {"type": "BUY_SIDE", "price": 103},  # 1.5R
+            {"type": "BUY_SIDE", "price": 110},  # 5R
+        ]
+
+        result = risk_manager.nearest_favorable_structure_r(pools, 100, "BUY", risk_distance=2)
+
+        self.assertAlmostEqual(result, 1.5)
+
+    def test_sell_side_mirrors_buy(self):
+        pools = [{"type": "SELL_SIDE", "price": 99}]
+
+        result = risk_manager.nearest_favorable_structure_r(pools, 100, "SELL", risk_distance=2)
+
+        self.assertAlmostEqual(result, 0.5)
+
+    def test_wrong_side_pool_type_is_ignored(self):
+        pools = [{"type": "SELL_SIDE", "price": 101}]
+
+        result = risk_manager.nearest_favorable_structure_r(pools, 100, "BUY", risk_distance=2)
+
+        self.assertIsNone(result)
+
+    def test_no_pools_returns_none(self):
+        result = risk_manager.nearest_favorable_structure_r(None, 100, "BUY", risk_distance=2)
+
+        self.assertIsNone(result)
+
+    def test_zero_risk_distance_returns_none(self):
+        pools = [{"type": "BUY_SIDE", "price": 101}]
+
+        result = risk_manager.nearest_favorable_structure_r(pools, 100, "BUY", risk_distance=0)
+
+        self.assertIsNone(result)
+
+
 class ComputeBreakevenPriceTests(unittest.TestCase):
     def test_buy_breakeven_is_slightly_above_entry(self):
         with patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
@@ -538,6 +593,32 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertEqual(plan["quantity"], 10.0)
         self.assertEqual(plan["tp1_quantity"], 5.0)
         self.assertEqual(plan["tp2_quantity"], 5.0)
+
+    def test_nearest_favorable_sr_r_is_threaded_through_from_the_signal_pools(self):
+        signal = dict(
+            self._signal(),
+            liquidity_pools=[{"type": "BUY_SIDE", "price": 101}],  # 0.5R - too close for TP1 itself
+        )
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["nearest_favorable_sr_r"], 0.5)
+        # TP1 itself still falls back to the pure R-multiple, unaffected -
+        # this field is purely diagnostic, never feeds target selection.
+        self.assertEqual(plan["tp1_price"], 102)
+
+    def test_nearest_favorable_sr_r_is_none_without_any_pools(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertIsNone(plan["nearest_favorable_sr_r"])
 
     def test_plan_is_unaffected_by_limit_entry_mode(self):
         # config.LIMIT_ENTRY_MODE_ENABLED only changes execution.py/

@@ -192,6 +192,17 @@ class NewDataSourceBucketTests(unittest.TestCase):
         self.assertEqual(ja._bucket_zone_retracement(0.85), ">=0.79 (deep)")
         self.assertEqual(ja._bucket_zone_retracement(None), "unknown")
 
+    def test_nearest_sr_r_buckets(self):
+        self.assertEqual(
+            ja._bucket_nearest_sr_r(0.3), "<0.5R (very close - likely caps the move early)"
+        )
+        self.assertEqual(ja._bucket_nearest_sr_r(0.7), "0.5-1R (inside TP1's own floor)")
+        self.assertEqual(ja._bucket_nearest_sr_r(1.5), "1-2R")
+        self.assertEqual(ja._bucket_nearest_sr_r(2.5), ">=2R (clear past TP1)")
+        self.assertEqual(
+            ja._bucket_nearest_sr_r(None), "unknown (no real pool in that direction)"
+        )
+
 
 class LoadTradesAndSummarizeTests(unittest.TestCase):
     def setUp(self):

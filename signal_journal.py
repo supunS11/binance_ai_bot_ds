@@ -26,7 +26,7 @@ JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
 FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
-    "structure_level", "entry_extension_r", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
+    "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
@@ -126,6 +126,18 @@ def append_signal(signal, plan):
         # that cohort from the rest, so this is the next real hypothesis
         # worth having evidence for.
         "entry_extension_r": plan.get("entry_extension_r"),
+        # Distance (in R) to the nearest REAL liquidity-pool/structure level
+        # in the trade's favorable direction, with no minimum-room floor -
+        # unlike tp1_price/tp2_price (drawn to a level that already clears
+        # TP1_R_MULTIPLE/TP2_R_MULTIPLE), this reports whatever's actually
+        # closest, even one too tight to ever become a TP. Added to test a
+        # gap the current target selection doesn't check: whether a closer
+        # support/resistance level sits in the way of TP1 and caps/reverses
+        # the move before it gets there (risk_manager.
+        # nearest_favorable_structure_r). Informational only for now - see
+        # config.OI_RISING_REJECT_ENABLED for the precedent of promoting a
+        # field like this to a real gate once evidence supports it.
+        "nearest_favorable_sr_r": plan.get("nearest_favorable_sr_r"),
         "signal_trigger": signal.get("signal_trigger"),
         "atr": signal.get("atr"),
         "ema_value": signal.get("ema_value"),

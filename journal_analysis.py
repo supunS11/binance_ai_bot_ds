@@ -225,6 +225,26 @@ def _bucket_extension_r(value):
     return ">=0.5R (should be rare - normally rejected outright)"
 
 
+def _bucket_nearest_sr_r(value):
+    """How close (in R) the nearest REAL structure level in the favorable
+    direction sits - see signal_journal.py's nearest_favorable_sr_r
+    comment. Bucketed against TP1's own R floor (TP1_R_MULTIPLE=1.0
+    default): anything below 1R is a level TP1 itself already runs past,
+    i.e. a potential obstacle in the way rather than the target itself."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown (no real pool in that direction)"
+
+    if value < 0.5:
+        return "<0.5R (very close - likely caps the move early)"
+    if value < 1.0:
+        return "0.5-1R (inside TP1's own floor)"
+    if value < 2.0:
+        return "1-2R"
+    return ">=2R (clear past TP1)"
+
+
 def _bucket_zone_retracement(value):
     """How deep into the range this entry's retracement actually was, in
     the same 0..1 measure OTE_RETRACEMENT_MIN/MAX are expressed in - the
@@ -469,6 +489,7 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "entry trigger", lambda t: t.get("signal_trigger", "unknown") or "unknown")
     lines += _breakdown_lines(resolved, "entry extension (chase distance from the level)", lambda t: _bucket_extension_r(t.get("entry_extension_r")))
     lines += _breakdown_lines(resolved, "zone retracement depth", lambda t: _bucket_zone_retracement(t.get("zone_retracement_pct")))
+    lines += _breakdown_lines(resolved, "nearest favorable S/R distance (informational)", lambda t: _bucket_nearest_sr_r(t.get("nearest_favorable_sr_r")))
     lines += _breakdown_lines(resolved, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")
     lines += _breakdown_lines(resolved, "EMA aligned (informational)", lambda t: t.get("ema_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "OI rising (informational)", lambda t: t.get("oi_rising", "unknown") or "False")

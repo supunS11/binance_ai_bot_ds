@@ -74,6 +74,34 @@ def _resolve_target(pools, entry_price, side, min_r_multiple, max_r_multiple, ri
     return entry_price + distance if side == "BUY" else entry_price - distance
 
 
+def nearest_favorable_structure_r(pools, entry_price, side, risk_distance):
+    """Distance (in R) to the closest real liquidity-pool level in the
+    trade's favorable direction - unlike _find_structure_target (which
+    only considers pools that already clear TP1_R_MULTIPLE/TP2_R_MULTIPLE
+    of room), this reports whatever real level is actually nearest, even
+    one too close to ever qualify as a TP itself.
+
+    Informational only, journaled by signal_journal.py so journal_analysis.py
+    can test a real gap this codebase's target selection doesn't otherwise
+    answer: TP1/TP2 are drawn TO a real structure level, but nothing checks
+    whether a CLOSER one sits in the way first and could cap or reverse the
+    move before that target is reached. Same "log it before gating on it"
+    rollout as ema_aligned/oi_rising originally used - see
+    config.OI_RISING_REJECT_ENABLED for what happens once evidence exists.
+
+    None if no real pool exists in that direction, or risk_distance isn't
+    usable (mirrors _find_structure_target's own None-on-failure shape)."""
+    if risk_distance <= 0:
+        return None
+
+    price = _find_structure_target(pools, entry_price, side, 0, None, risk_distance)
+
+    if price is None:
+        return None
+
+    return abs(price - entry_price) / risk_distance
+
+
 def _find_dca_level(pools, entry_price, side):
     """Nearest real liquidity-pool price in the ADVERSE direction from
     entry - the mirror image of _find_structure_target's favorable-side
@@ -531,6 +559,10 @@ def build_trade_plan(signal, balance):
     if tp1_price is None:
         return None, "TARGETS_UNAVAILABLE"
 
+    nearest_favorable_sr_r = nearest_favorable_structure_r(
+        signal.get("liquidity_pools"), entry_price, side, risk_distance
+    )
+
     size_multiplier = _confluence_size_multiplier(signal)
 
     if config.RISK_BASED_POSITION_SIZING_ENABLED:
@@ -591,6 +623,7 @@ def build_trade_plan(signal, balance):
         # non-None here: build_trade_plan already returned SL_UNAVAILABLE
         # above if structure_level/risk_distance weren't available.
         "entry_extension_r": extension_r,
+        "nearest_favorable_sr_r": nearest_favorable_sr_r,
         "dca_price": dca_price,
         "dca_quantity": dca_quantity,
         # Carried through so position_manager._execute_dca can recompute
