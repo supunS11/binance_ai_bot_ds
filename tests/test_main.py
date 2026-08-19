@@ -687,6 +687,61 @@ class LogHeartbeatRejectSummaryTests(unittest.TestCase):
 
         main._log_heartbeat(feed, ["BTCUSDT"], positions, Counter())
 
+    def test_oi_rising_gate_gets_its_own_dedicated_line(self):
+        # Real gap this was built for: OI_RISING sits behind AGAINST_HTF_
+        # BIAS/zone/OTE/order-block, so far fewer candidates ever reach it
+        # than reasons like NO_LIVE_STRUCTURE_BREAK - buried under 8 more
+        # frequent reasons, it would never appear in the top-8-only summary
+        # line above even though reject_counts tallied it correctly.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter({
+            "NO_LIVE_STRUCTURE_BREAK": 900, "AGAINST_HTF_BIAS": 800,
+            "MARKET_CHOPPY": 700, "NOT_IN_OTE": 600, "HTF_TREND_STALE": 500,
+            "NOT_IN_DISCOUNT": 400, "NOT_IN_PREMIUM": 300, "CVD_NOT_CONFIRMED": 200,
+            "OI_RISING": 3,
+        })
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, reject_counts)
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertNotIn("OI_RISING", logged.split("OI_RISING gate")[0])  # not in the top-8 line
+        self.assertIn("OI_RISING gate | blocked 3 since last heartbeat | 0 total since bot start", logged)
+
+    def test_oi_rising_line_shows_the_running_total_since_start(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts = Counter({"OI_RISING": 2})
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, reject_counts, oi_rising_block_total=15)
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertIn("OI_RISING gate | blocked 2 since last heartbeat | 15 total since bot start", logged)
+
+    def test_oi_rising_line_still_shows_a_quiet_window_against_a_nonzero_total(self):
+        # Nothing blocked THIS heartbeat, but the running total is real -
+        # must not go silent just because this particular window was quiet.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, Counter(), oi_rising_block_total=7)
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertIn("OI_RISING gate | blocked 0 since last heartbeat | 7 total since bot start", logged)
+
+    def test_no_oi_rising_line_when_nothing_has_ever_blocked(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions, Counter())
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertNotIn("OI_RISING gate", logged)
+
     def test_trigger_symbol_sample_is_included(self):
         feed = _FakeFeed()
         positions = _FakePositions()

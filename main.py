@@ -370,6 +370,7 @@ def _reject_summary_line(counts, symbols_by_reason, top_n=8):
 def _log_heartbeat(
     feed, symbols, positions, reject_counts=None, reject_symbols=None,
     reject_trigger_counts=None, reject_trigger_symbols=None,
+    oi_rising_block_total=None,
 ):
     log_info(
         f"Heartbeat | WATCHING={len(symbols)} | OPEN_POSITIONS={positions.open_count()} "
@@ -385,6 +386,29 @@ def _log_heartbeat(
         log_info(
             f"  REJECTED BY TRIGGER since last heartbeat | "
             f"{_reject_summary_line(reject_trigger_counts, reject_trigger_symbols)}"
+        )
+
+    # config.OI_RISING_REJECT_ENABLED - a dedicated, always-visible counter
+    # for this one gate specifically, requested after real doubt about how
+    # often it's actually firing: the REJECTED line above already tallies
+    # OI_RISING correctly (it's just signal_engine's normal reject reason),
+    # but _reject_summary_line only prints the top 8 reasons by count, and
+    # candidates never even reach this gate until AGAINST_HTF_BIAS/zone/OTE/
+    # order-block have already thinned the pool - in the real deployment
+    # this was built for, OI_RISING never once cracked the top 8 against
+    # reasons running in the hundreds, so its true count was unobservable
+    # from the log even though it was being tallied correctly the whole
+    # time. Read directly off reject_counts (not top-8-limited) BEFORE the
+    # caller clears it for the next window, so nothing is lost.
+    # oi_rising_block_total is a running total the caller never resets -
+    # "since bot start", not "since last heartbeat" - so a rare block isn't
+    # invisible just because it happened in a quiet window.
+    oi_rising_since_heartbeat = (reject_counts or {}).get("OI_RISING", 0)
+
+    if oi_rising_since_heartbeat or oi_rising_block_total:
+        log_info(
+            f"  OI_RISING gate | blocked {oi_rising_since_heartbeat} since last heartbeat | "
+            f"{oi_rising_block_total or 0} total since bot start"
         )
 
     for symbol in list(positions.positions.keys()):
@@ -498,6 +522,10 @@ def main():
     reject_symbols = {}
     reject_trigger_counts = Counter()
     reject_trigger_symbols = {}
+    # Never cleared (unlike reject_counts/reject_trigger_counts above) -
+    # see _log_heartbeat's own comment on oi_rising_block_total for why
+    # this gate specifically gets a running, never-truncated total.
+    oi_rising_block_total = 0
     stability = SignalStabilityTracker()
     # Balance barely changes tick-to-tick, so it's refreshed on the same
     # cadence as position polling rather than every eval tick - otherwise
@@ -525,9 +553,11 @@ def main():
                 )
 
             if tick % heartbeat_every == 0:
+                oi_rising_block_total += reject_counts.get("OI_RISING", 0)
                 _log_heartbeat(
                     feed, symbols, positions, reject_counts, reject_symbols,
                     reject_trigger_counts, reject_trigger_symbols,
+                    oi_rising_block_total=oi_rising_block_total,
                 )
                 reject_counts.clear()
                 reject_symbols.clear()
