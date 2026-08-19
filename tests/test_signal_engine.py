@@ -65,6 +65,7 @@ class SignalEngineTests(unittest.TestCase):
         fvg_retest_direction=None,
         fvg_retest_level=None,
         fvg_retest_open_time=0,
+        fvg_retest_index=0,
         divergence_direction=None,
         divergence_level=None,
         divergence_index=5,
@@ -72,6 +73,7 @@ class SignalEngineTests(unittest.TestCase):
         order_block_retest_direction=None,
         order_block_retest_level=None,
         order_block_retest_open_time=777,
+        order_block_retest_index=0,
         oi_divergence_direction=None,
         oi_divergence_level=None,
         oi_divergence_index=5,
@@ -104,7 +106,8 @@ class SignalEngineTests(unittest.TestCase):
         )
         fvg_retest = (
             {
-                "direction": fvg_retest_direction, "level": fvg_retest_level, "gap": {},
+                "direction": fvg_retest_direction, "level": fvg_retest_level,
+                "gap": {"index": fvg_retest_index},
                 "open_time": fvg_retest_open_time,
             }
             if fvg_retest_direction else None
@@ -119,6 +122,7 @@ class SignalEngineTests(unittest.TestCase):
         order_block_retest = (
             {
                 "direction": order_block_retest_direction, "level": order_block_retest_level,
+                "block": {"index": order_block_retest_index},
                 "open_time": order_block_retest_open_time,
             }
             if order_block_retest_direction else None
@@ -872,6 +876,118 @@ class SignalEngineTests(unittest.TestCase):
         result = self._run(ltf_analysis=analysis)
 
         self.assertEqual(result["trigger_candle_open_time"], 456)
+
+    # config.DCA_BREAKEVEN_CONFIRMATION_ENABLED's sibling investigation
+    # (2026-08-19) - how many candles old the underlying setup actually
+    # was at entry, distinct from trigger_candle_open_time above (that's
+    # the RETEST candle, always fresh; this is the setup being retested).
+    # signal_engine.evaluate() already computed this internally for each
+    # trigger's own age-gate check but never returned it - see
+    # signal_journal.py's setup_age_candles comment for why it's worth
+    # journaling now. _ltf_candles() always produces a single candle at
+    # index 0 (see test_choch_retest_ignored_when_event_too_old's own
+    # comment on this), so setup_age_candles = 0 - index for these tests -
+    # a negative index simulates an event/gap/block that formed before
+    # the start of this LTF buffer, the same trick that test already uses.
+
+    def test_setup_age_is_zero_for_structure_break(self):
+        result = self._run()
+
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        self.assertEqual(result["setup_age_candles"], 0)
+
+    def test_setup_age_is_zero_for_ema_pullback(self):
+        with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", True):
+            result = self._run(
+                sweep_direction=None,
+                ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+                ema_pullback_direction="BULLISH", ema_pullback_level=90,
+            )
+
+        self.assertEqual(result["signal_trigger"], "EMA_PULLBACK")
+        self.assertEqual(result["setup_age_candles"], 0)
+
+    def test_setup_age_is_none_for_liquidity_sweep(self):
+        # No formation index available for a liquidity pool - genuinely
+        # unknown, not "fresh".
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+                sweep_direction="BULLISH", sweep_level=89,
+            )
+
+        self.assertEqual(result["signal_trigger"], "LIQUIDITY_SWEEP")
+        self.assertIsNone(result["setup_age_candles"])
+
+    def test_setup_age_reflects_how_old_the_retested_fvg_actually_is(self):
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                sweep_direction=None,
+                ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+                fvg_retest_direction="BULLISH", fvg_retest_level=90, fvg_retest_index=-4,
+            )
+
+        self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
+        self.assertEqual(result["setup_age_candles"], 4)  # (1-1) - (-4)
+
+    def test_setup_age_reflects_how_old_the_retested_order_block_is(self):
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                sweep_direction=None,
+                ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+                order_block_retest_direction="BULLISH", order_block_retest_level=90,
+                order_block_retest_index=-7,
+            )
+
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+        self.assertEqual(result["setup_age_candles"], 7)
+
+    def test_setup_age_reflects_how_old_the_choch_event_is(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95, event_index=-6)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+        self.assertEqual(result["setup_age_candles"], 6)
+
+    def test_setup_age_reflects_how_old_the_cvd_divergence_swings_are(self):
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "SIGNAL_MIN_CVD_SCORE", 0.15):
+            result = self._run(
+                sweep_direction=None,
+                ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+                divergence_direction="BULLISH", divergence_level=90, divergence_index=-2,
+            )
+
+        self.assertEqual(result["signal_trigger"], "CVD_DIVERGENCE")
+        self.assertEqual(result["setup_age_candles"], 2)
+
+    def test_setup_age_reflects_how_old_the_oi_divergence_swings_are(self):
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                sweep_direction=None,
+                ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+                oi_divergence_direction="BULLISH", oi_divergence_level=90, oi_divergence_index=-9,
+            )
+
+        self.assertEqual(result["signal_trigger"], "OI_DIVERGENCE")
+        self.assertEqual(result["setup_age_candles"], 9)
+
+    def test_setup_age_is_none_for_liquidation_sweep_confirmed(self):
+        # LIQUIDITY_SWEEP outranks LIQUIDATION_SWEEP_CONFIRMED in the
+        # fixed-priority selection - disabled here so it doesn't win
+        # instead (same isolation existing tests already use).
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+                sweep_direction="BULLISH", sweep_level=89,
+                liquidation_confirmed_sweep_direction="BULLISH", liquidation_confirmed_sweep_level=89,
+            )
+
+        self.assertEqual(result["signal_trigger"], "LIQUIDATION_SWEEP_CONFIRMED")
+        self.assertIsNone(result["setup_age_candles"])
 
     def test_no_signal_when_below_the_liquidity_floor(self):
         with patch.object(config, "MIN_24H_QUOTE_VOLUME_USDT", 3_000_000):

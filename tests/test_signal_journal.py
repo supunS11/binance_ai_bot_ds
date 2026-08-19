@@ -129,6 +129,20 @@ class SignalJournalTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["nearest_favorable_sr_r"], "0.5")
 
+    def test_append_signal_writes_setup_age_candles_from_the_signal(self):
+        signal_journal.append_signal(_signal(setup_age_candles=6), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["setup_age_candles"], "6")
+
+    def test_append_signal_writes_zero_setup_age_candles(self):
+        # 0 is a real, meaningful value (STRUCTURE_BREAK/EMA_PULLBACK are
+        # always fresh) - must not be treated as falsy/blank.
+        signal_journal.append_signal(_signal(setup_age_candles=0), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["setup_age_candles"], "0")
+
     def test_append_signal_writes_zone_retracement_pct(self):
         signal_journal.append_signal(_signal(zone_retracement_pct=0.74), _plan())
         rows = self._read_rows()

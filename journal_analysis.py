@@ -245,6 +245,27 @@ def _bucket_nearest_sr_r(value):
     return ">=2R (clear past TP1)"
 
 
+def _bucket_setup_age(value):
+    """How many candles old the underlying setup (CHoCH/FVG/order block/
+    divergence) was at entry - see signal_journal.py's setup_age_candles
+    comment. 0 always means STRUCTURE_BREAK/EMA_PULLBACK (fresh by
+    construction); LIQUIDITY_SWEEP/LIQUIDATION_SWEEP_CONFIRMED report
+    "unknown" (no formation index available for a liquidity pool) rather
+    than a misleading 0."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown (no formation index available for this trigger)"
+
+    if value <= 0:
+        return "0 (fresh - STRUCTURE_BREAK/EMA_PULLBACK)"
+    if value <= 3:
+        return "1-3 candles old"
+    if value <= 8:
+        return "4-8 candles old"
+    return ">8 candles old"
+
+
 def _bucket_zone_retracement(value):
     """How deep into the range this entry's retracement actually was, in
     the same 0..1 measure OTE_RETRACEMENT_MIN/MAX are expressed in - the
@@ -490,6 +511,7 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "entry extension (chase distance from the level)", lambda t: _bucket_extension_r(t.get("entry_extension_r")))
     lines += _breakdown_lines(resolved, "zone retracement depth", lambda t: _bucket_zone_retracement(t.get("zone_retracement_pct")))
     lines += _breakdown_lines(resolved, "nearest favorable S/R distance (informational)", lambda t: _bucket_nearest_sr_r(t.get("nearest_favorable_sr_r")))
+    lines += _breakdown_lines(resolved, "setup age at entry (candles since the underlying CHoCH/FVG/block/divergence)", lambda t: _bucket_setup_age(t.get("setup_age_candles")))
     lines += _breakdown_lines(resolved, "sweep confluence", lambda t: t.get("sweep_confluence", "unknown") or "False")
     lines += _breakdown_lines(resolved, "EMA aligned (informational)", lambda t: t.get("ema_aligned", "unknown") or "False")
     lines += _breakdown_lines(resolved, "OI rising (informational)", lambda t: t.get("oi_rising", "unknown") or "False")

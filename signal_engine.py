@@ -229,6 +229,9 @@ def evaluate(
             "direction": live_break["direction"],
             "structure_level": live_break.get("level"),
             "trigger_candle_open_time": live_break.get("open_time"),
+            # Fresh by construction - reacts to the level breaking right
+            # now, not a retest of something already formed.
+            "setup_age_candles": 0,
         })
 
     if config.OB_FVG_RETEST_TRIGGER_ENABLED and fvg_retest is not None:
@@ -241,6 +244,13 @@ def evaluate(
             # ltf_candles[-1], which may be a different, still-forming
             # candle by now.
             "trigger_candle_open_time": fvg_retest.get("open_time"),
+            # How many candles old the FVG being retested actually is -
+            # distinct from trigger_candle_open_time above (that's the
+            # RETEST candle, always fresh; this is the gap's own
+            # formation, which OB_FVG_RETEST_MAX_AGE_CANDLES already caps
+            # but was never journaled - see signal_journal.py's
+            # setup_age_candles comment for why this was built.
+            "setup_age_candles": (len(ltf_candles) - 1) - fvg_retest["gap"]["index"],
         })
 
     if config.LIQUIDITY_SWEEP_TRIGGER_ENABLED and sweep is not None:
@@ -254,6 +264,12 @@ def evaluate(
             # whether it's a real value or None (e.g. if detect_sweep ever
             # runs with require_closed_candle=False).
             "trigger_candle_open_time": sweep.get("open_time"),
+            # None, not 0 - the swept pool (market_structure.
+            # find_liquidity_pools) carries no formation index/timestamp
+            # of its own to measure age against, unlike find_fvg_retest's
+            # gap or find_order_block_retest's block below. Genuinely
+            # unknown, not "fresh".
+            "setup_age_candles": None,
         })
 
     if (
@@ -277,6 +293,13 @@ def evaluate(
                 else ltf_analysis["last_swing_high"]
             ),
             "trigger_candle_open_time": None,
+            # Same expression the age-gate check just above already
+            # computes to enforce CHOCH_TRIGGER_MAX_AGE_CANDLES - never
+            # journaled before now (see signal_journal.py's
+            # setup_age_candles comment). CHOCH_RETEST is a retest of an
+            # already-confirmed reversal, so unlike STRUCTURE_BREAK/
+            # EMA_PULLBACK this is almost never 0.
+            "setup_age_candles": len(ltf_candles) - 1 - ltf_analysis["last_event"]["index"],
         })
 
     if (
@@ -298,6 +321,7 @@ def evaluate(
             # swing price (its own low/high) - trivially true almost
             # every time, a meaningless "confirmation".
             "trigger_candle_open_time": None,
+            "setup_age_candles": len(ltf_candles) - 1 - divergence["index"],
         })
 
     if config.ORDER_BLOCK_RETEST_TRIGGER_ENABLED and order_block_retest is not None:
@@ -311,6 +335,9 @@ def evaluate(
             # find_order_block_retest itself (ORDER_BLOCK_RETEST_MAX_AGE_
             # CANDLES), not repeated here.
             "trigger_candle_open_time": order_block_retest.get("open_time"),
+            # Same shape as OB_FVG_RETEST's gap age above - how old the
+            # order block being retested actually is.
+            "setup_age_candles": (len(ltf_candles) - 1) - order_block_retest["block"]["index"],
         })
 
     if (
@@ -327,6 +354,7 @@ def evaluate(
             # this is the OLD swing candle's open_time, not a candle being
             # entered on right now.
             "trigger_candle_open_time": None,
+            "setup_age_candles": len(ltf_candles) - 1 - oi_divergence_result["index"],
         })
 
     if (
@@ -341,6 +369,9 @@ def evaluate(
             # sweep is a copy of the same close-confirmed sweep dict, just
             # additionally gated on real liquidation flow.
             "trigger_candle_open_time": liquidation_confirmed_sweep.get("open_time"),
+            # None, not 0 - same reasoning as LIQUIDITY_SWEEP above (the
+            # swept pool carries no formation index of its own).
+            "setup_age_candles": None,
         })
 
     if config.EMA_PULLBACK_TRIGGER_ENABLED and ema_pullback is not None:
@@ -352,6 +383,10 @@ def evaluate(
             # require_closed_candle behavior) - same shape as
             # LIQUIDITY_SWEEP/OB_FVG_RETEST/ORDER_BLOCK_RETEST above.
             "trigger_candle_open_time": ema_pullback.get("open_time"),
+            # Fresh by construction, same as STRUCTURE_BREAK - a same-
+            # candle wick-to-EMA-and-reclaim pattern, not a retest of an
+            # old zone.
+            "setup_age_candles": 0,
         })
 
     if not candidates:
@@ -692,6 +727,7 @@ def evaluate(
             # values once a direction's pipeline has actually passed.
             "structure_level": None,
             "trigger_candle_open_time": None,
+            "setup_age_candles": None,
             "signal_trigger": None,
             "quote_volume_usdt": quote_volume_usdt,
             "order_block": order_block,
@@ -812,6 +848,7 @@ def evaluate(
     result = dict(winner_result)
     result["structure_level"] = winner_candidate["structure_level"]
     result["trigger_candle_open_time"] = winner_candidate["trigger_candle_open_time"]
+    result["setup_age_candles"] = winner_candidate["setup_age_candles"]
     result["signal_trigger"] = winner_candidate["signal_trigger"]
     return result
 

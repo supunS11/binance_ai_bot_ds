@@ -26,7 +26,7 @@ JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
 FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
-    "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
+    "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_aligned", "htf_trend", "premium_discount_zone",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising", "liquidation_notional_net",
@@ -138,6 +138,18 @@ def append_signal(signal, plan):
         # config.OI_RISING_REJECT_ENABLED for the precedent of promoting a
         # field like this to a real gate once evidence supports it.
         "nearest_favorable_sr_r": plan.get("nearest_favorable_sr_r"),
+        # How many candles old the underlying setup (CHoCH/FVG/order
+        # block/divergence) actually was at entry - distinct from
+        # entry_extension_r (that's price distance from the level, not
+        # time). STRUCTURE_BREAK/EMA_PULLBACK are always 0 (react to the
+        # live candle); the retest/divergence triggers can be genuinely
+        # old, up to their own *_MAX_AGE_CANDLES/*_LOOKBACK cap - never
+        # journaled before now (signal_engine.evaluate() computed it
+        # internally for the age-gate checks but discarded it). Built
+        # specifically to test whether a stale setup at entry correlates
+        # with worse outcomes - the real, previously-unanswerable half of
+        # the "entries feel late" complaint (2026-08-19).
+        "setup_age_candles": signal.get("setup_age_candles"),
         "signal_trigger": signal.get("signal_trigger"),
         "atr": signal.get("atr"),
         "ema_value": signal.get("ema_value"),

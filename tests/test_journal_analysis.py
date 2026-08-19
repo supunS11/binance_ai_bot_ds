@@ -192,6 +192,18 @@ class NewDataSourceBucketTests(unittest.TestCase):
         self.assertEqual(ja._bucket_zone_retracement(0.85), ">=0.79 (deep)")
         self.assertEqual(ja._bucket_zone_retracement(None), "unknown")
 
+    def test_setup_age_buckets(self):
+        self.assertEqual(
+            ja._bucket_setup_age(0), "0 (fresh - STRUCTURE_BREAK/EMA_PULLBACK)"
+        )
+        self.assertEqual(ja._bucket_setup_age(2), "1-3 candles old")
+        self.assertEqual(ja._bucket_setup_age(6), "4-8 candles old")
+        self.assertEqual(ja._bucket_setup_age(12), ">8 candles old")
+        self.assertEqual(
+            ja._bucket_setup_age(None),
+            "unknown (no formation index available for this trigger)",
+        )
+
     def test_nearest_sr_r_buckets(self):
         self.assertEqual(
             ja._bucket_nearest_sr_r(0.3), "<0.5R (very close - likely caps the move early)"
