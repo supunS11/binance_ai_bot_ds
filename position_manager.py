@@ -344,6 +344,11 @@ class PositionManager:
         entry_price, breakeven_price, risk_distance = _resolve_real_entry(
             plan, execution_result, plan["side"]
         )
+        # config.TP_STATIC_ROI_ENABLED - a single-tp position has tp_price/
+        # tp_order_id instead of the tp1/tp2 pair (both None in that plan
+        # shape - see risk_manager.build_trade_plan). Every DCA_PENDING
+        # call site that reads these fields branches on this flag.
+        single_tp = bool(plan.get("single_tp"))
 
         position = {
             "symbol": symbol,
@@ -353,6 +358,8 @@ class PositionManager:
             "sl_price": plan["sl_price"],
             "tp1_price": plan["tp1_price"],
             "tp2_price": plan["tp2_price"],
+            "tp_price": plan.get("tp_price"),
+            "single_tp": single_tp,
             "breakeven_price": breakeven_price,
             "quantity": plan["quantity"],
             "tp1_quantity": plan["tp1_quantity"],
@@ -364,6 +371,10 @@ class PositionManager:
             ),
             "tp2_order_id": (
                 exchange._accepted_order_id(execution_result.get("tp2_order"))
+                if not shadow else None
+            ),
+            "tp_order_id": (
+                exchange._accepted_order_id(execution_result.get("tp_order"))
                 if not shadow else None
             ),
             "stage": DCA_PENDING,
@@ -649,6 +660,8 @@ class PositionManager:
             "sl_price": risk_manager._apply_min_stop_distance(entry_price, entry_price, side),
             "tp1_price": _trigger_price(tp1_order),
             "tp2_price": _trigger_price(tp2_order),
+            "tp_price": None,
+            "single_tp": False,
             "breakeven_price": risk_manager.compute_breakeven_price(entry_price, side),
             "quantity": quantity,
             "tp1_quantity": tp1_quantity,
@@ -656,6 +669,7 @@ class PositionManager:
             "sl_order_id": None,
             "tp1_order_id": exchange._accepted_order_id(tp1_order),
             "tp2_order_id": exchange._accepted_order_id(tp2_order),
+            "tp_order_id": None,
             "stage": DCA_PENDING,
             "shadow": False,
             "opened_at": time.time(),
@@ -671,6 +685,76 @@ class PositionManager:
             # No original stop survives a restart to measure this from -
             # None (unknown) is honest, same policy the plain-adopt path
             # below already follows for a reconciled BREAKEVEN_ACTIVE.
+            "risk_distance": None,
+            "structure_level": None,
+            "trigger_candle_open_time": None,
+            "break_confirmed_by_close": None,
+            "dca_price": dca_price,
+            "dca_quantity": round(quantity * max(float(config.DCA_SIZE_MULTIPLIER), 0), 8),
+            "dca_applied": False,
+            "atr": atr,
+        }
+
+    @staticmethod
+    def _recover_dca_pending_single_tp_position(symbol, side, entry_price, quantity, tp_order, feed):
+        """config.TP_STATIC_ROI_ENABLED equivalent of
+        _recover_dca_pending_position above - a real position with
+        exactly ONE full-position TP resting and no SL at all, under
+        config.DCA_ENABLED, is the single-TP DCA_PENDING shape (see
+        risk_manager.build_trade_plan/register_dca_pending): no other
+        stage in this codebase produces "one close_position=True TP,
+        nothing else, no SL" while DCA_ENABLED is on. Same dca_price
+        honesty policy as its dual-TP sibling - recomputed fresh from
+        current structure/ATR, not recoverable from the restart itself.
+        Returns None (caller falls back to the generic reconciliation
+        path) when no candle history is available to compute it from."""
+        candles = feed.candles.get(symbol) if feed is not None else []
+
+        if not candles:
+            return None
+
+        pools = market_structure.find_liquidity_pools(market_structure.find_swing_points(candles))
+        atr = market_structure.average_true_range(candles)
+        dca_price = risk_manager.compute_dca_price(entry_price, side, pools, atr=atr)
+
+        if dca_price is None or dca_price <= 0:
+            return None
+
+        def _trigger_price(order):
+            return _safe_float(order.get("triggerPrice") or order.get("stopPrice"))
+
+        return {
+            "symbol": symbol,
+            "trade_id": f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "side": side,
+            "entry_price": entry_price,
+            # Reference-only, never a real resting order in this stage -
+            # same convention register_dca_pending's own sl_price follows.
+            "sl_price": risk_manager._apply_min_stop_distance(entry_price, entry_price, side),
+            "tp1_price": None,
+            "tp2_price": None,
+            "tp_price": _trigger_price(tp_order),
+            "single_tp": True,
+            "breakeven_price": risk_manager.compute_breakeven_price(entry_price, side),
+            "quantity": quantity,
+            "tp1_quantity": None,
+            "tp2_quantity": None,
+            "sl_order_id": None,
+            "tp1_order_id": None,
+            "tp2_order_id": None,
+            "tp_order_id": exchange._accepted_order_id(tp_order),
+            "stage": DCA_PENDING,
+            "shadow": False,
+            "opened_at": time.time(),
+            "confluence_ratio": None,
+            "early_breakeven_applied": False,
+            "early_breakeven_profit_locked": False,
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
+            "profit_protection_peak_price": None,
+            "trailing_stop_locked_profit": False,
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
             "risk_distance": None,
             "structure_level": None,
             "trigger_candle_open_time": None,
@@ -710,10 +794,17 @@ class PositionManager:
             "side": side,
             "entry_price": entry_price,
             "sl_price": sl_price,
+            "tp1_price": None,
+            "tp2_price": None,
             "tp_price": tp_price,
+            "single_tp": True,
             "breakeven_price": risk_manager.compute_breakeven_price(entry_price, side),
             "quantity": quantity,
+            "tp1_quantity": None,
+            "tp2_quantity": None,
             "sl_order_id": exchange._accepted_order_id(sl_order),
+            "tp1_order_id": None,
+            "tp2_order_id": None,
             "tp_order_id": exchange._accepted_order_id(tp_order) if tp_order else None,
             "stage": DCA_ACTIVE,
             "shadow": False,
@@ -794,6 +885,26 @@ class PositionManager:
                     f"entry={entry_price} stage=DCA_PENDING (no SL by design) "
                     f"dca_price={recovered['dca_price']} tp1={recovered['tp1_price']} "
                     f"tp2={recovered['tp2_price']}"
+                )
+                return
+
+        # config.TP_STATIC_ROI_ENABLED - the single-TP DCA_PENDING shape:
+        # exactly one full-position TP resting (tp2_order, per this
+        # function's own close_position=True/False split above), no
+        # partial TP1, no SL. Checked after the dual-TP case above (whose
+        # own `tp1_order and tp2_order` condition is mutually exclusive
+        # with `not tp1_order`) so order between them doesn't matter.
+        if sl_price is None and config.DCA_ENABLED and not tp1_order and tp2_order:
+            recovered = self._recover_dca_pending_single_tp_position(
+                symbol, side, entry_price, quantity, tp2_order, feed
+            )
+
+            if recovered is not None:
+                self.positions[symbol] = recovered
+                log_info(
+                    f"{symbol} adopted existing open position | side={side} "
+                    f"entry={entry_price} stage=DCA_PENDING (no SL by design, single TP) "
+                    f"dca_price={recovered['dca_price']} tp={recovered['tp_price']}"
                 )
                 return
 
@@ -1534,6 +1645,12 @@ class PositionManager:
         # breakeven check actually runs at least once (distinct from
         # False, "ran and wasn't confirmed") - see _dca_breakeven_confirmation.
         position["dca_breakeven_direction_confirmed"] = None
+        # config.TP_STATIC_ROI_ENABLED - DCA_ACTIVE is always single-TP
+        # shaped regardless of what this position was in DCA_PENDING (TP1/
+        # TP2 were just cancelled above either way) - not read by any
+        # DCA_ACTIVE code path (those key off stage directly), set here
+        # only for cross-stage consistency.
+        position["single_tp"] = True
         position["stage"] = DCA_ACTIVE
         log_info(
             f"{symbol}{' [SHADOW]' if shadow else ''} DCA fired | "
@@ -1570,6 +1687,15 @@ class PositionManager:
         # DCA_ENABLED is True (every position starts in DCA_PENDING, not
         # TP1_PENDING) this could never arm at all, silently.
         if position["stage"] not in (TP1_PENDING, DCA_PENDING):
+            return False
+
+        # config.TP_STATIC_ROI_ENABLED - a single-TP DCA_PENDING position
+        # is deliberately kept simple: no partial TP1, no early-arm
+        # mechanisms layered on top, just the DCA-vs-single-TP race. Early
+        # breakeven/profit protection promote toward BREAKEVEN_ACTIVE, a
+        # stage built around the tp1-filled/tp2-still-open shape - not a
+        # fit for a position that has neither.
+        if position.get("single_tp"):
             return False
 
         return abs(position["entry_price"] - position["sl_price"]) > 0
@@ -1629,6 +1755,11 @@ class PositionManager:
         # config.DCA_ENABLED - see the identical note in
         # _is_early_breakeven_candidate.
         if position["stage"] not in (TP1_PENDING, DCA_PENDING):
+            return False
+
+        # config.TP_STATIC_ROI_ENABLED - see the identical note in
+        # _is_early_breakeven_candidate.
+        if position.get("single_tp"):
             return False
 
         return position.get("tp1_price") is not None
@@ -1857,7 +1988,16 @@ class PositionManager:
         if not position or position["shadow"]:
             return None
 
-        self._ensure_protection_orders(position)
+        # config.TP_STATIC_ROI_ENABLED - the only case where this can now
+        # return a real outcome: a single-TP DCA_PENDING position whose
+        # missing TP order can't be placed because price already passed
+        # it, closed at market immediately (see _market_close_static_tp).
+        # Every other path through _ensure_protection_orders still
+        # implicitly returns None, same as before this existed.
+        protection_outcome = self._ensure_protection_orders(position)
+
+        if protection_outcome is not None:
+            return protection_outcome
 
         # One shared mark-price fetch, reused for MAE/MFE tracking and
         # both early-promotion checks below - no reason to pay for extra
@@ -1895,6 +2035,18 @@ class PositionManager:
             if self._try_early_promotions(
                 position, current_price, candles, profit_protection_candidate, early_breakeven_candidate,
             ):
+                return None
+
+            # config.TP_STATIC_ROI_ENABLED - one full-position TP instead
+            # of TP1(partial)+TP2(remainder): a fill closes the WHOLE
+            # position at once, no promotion, no tp2 to wait on.
+            if position.get("single_tp"):
+                tp_status = self._status_or_missing(symbol, position["tp_order_id"])
+
+                if tp_status == "FINISHED":
+                    exchange.cancel_all_open_orders(symbol)
+                    return self._close(symbol, "STATIC_TP_HIT")
+
                 return None
 
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
@@ -2181,7 +2333,43 @@ class PositionManager:
                     except Exception as exc:
                         log_warning(f"{symbol} post-DCA TP recovery attempt failed: {exc}")
 
-            return
+            return None
+
+        if position["stage"] == DCA_PENDING and position.get("single_tp"):
+            # config.TP_STATIC_ROI_ENABLED - same single-TP self-heal
+            # shape as DCA_ACTIVE above, just for the pre-DCA stage. No
+            # SL to self-heal here either (see this function's own
+            # docstring) - a DCA_PENDING position's SL doesn't exist yet
+            # by design, same as always.
+            if not position.get("tp_order_id"):
+                existing = self._find_open_order(symbol, "TAKE_PROFIT_MARKET", close_position=True)
+
+                if existing:
+                    position["tp_order_id"] = exchange._accepted_order_id(existing)
+                    log_info(f"{symbol} TP order tracking re-synced from exchange")
+                else:
+                    try:
+                        order = exchange.place_take_profit_full(symbol, side, position["tp_price"])
+                        position["tp_order_id"] = exchange._accepted_order_id(order)
+
+                        if position["tp_order_id"]:
+                            log_info(f"{symbol} TP order recovered")
+                    except Exception as exc:
+                        if "-2021" in str(exc):
+                            # Price has already passed the (only) TP level
+                            # entirely - unlike TP1's -2021 fallback below
+                            # (partial close + promote), there's nothing
+                            # left to promote once the WHOLE position
+                            # closes, so this ends the trade outright.
+                            log_warning(
+                                f"{symbol} TP level already passed by price - "
+                                "closing at market instead"
+                            )
+                            return self._market_close_static_tp(position)
+
+                        log_warning(f"{symbol} TP recovery attempt failed: {exc}")
+
+            return None
 
         if position["stage"] in (TP1_PENDING, DCA_PENDING) and not position["tp1_order_id"]:
             # Check the exchange for a real TP1-shaped order before
@@ -2271,6 +2459,30 @@ class PositionManager:
 
         log_info(f"{symbol} TP1 quantity closed at market (price already past TP1)")
         self._promote_to_breakeven_on_tp1_fill(position)
+
+    def _market_close_static_tp(self, position):
+        """config.TP_STATIC_ROI_ENABLED equivalent of _market_close_tp1,
+        called only from _ensure_protection_orders's -2021 fallback for a
+        single-TP DCA_PENDING position. Unlike TP1's partial close +
+        promotion, this closes the WHOLE position at market and ends the
+        trade outright as a real win (STATIC_TP_HIT) - there is nothing
+        left to promote once a single, full-position TP accounts for
+        everything. Returns the close outcome string so the caller
+        (_ensure_protection_orders, and poll_live above it) can propagate
+        it and stop processing this tick, or None if the market-close
+        itself failed (left for the next poll to retry)."""
+        symbol = position["symbol"]
+        side = position["side"]
+
+        try:
+            exchange.close_position_market(symbol, side, position["quantity"])
+        except Exception as exc:
+            log_error(f"{symbol} static TP market-close-instead error: {exc}")
+            return None
+
+        exchange.cancel_all_open_orders(symbol)
+        log_info(f"{symbol} static TP quantity closed at market (price already past target)")
+        return self._close(symbol, "STATIC_TP_HIT")
 
     def _try_early_promotions_shadow(self, position, latest_candle, candles):
         """Shadow-mode counterpart to _try_early_promotions - shared by
@@ -2383,6 +2595,21 @@ class PositionManager:
                     return self._execute_dca(position, candles=candles)
 
             if self._try_early_promotions_shadow(position, latest_candle, candles):
+                return None
+
+            # config.TP_STATIC_ROI_ENABLED - one full-position TP instead
+            # of TP1(partial)+TP2(remainder): a touch closes the WHOLE
+            # position at once, no promotion.
+            if position.get("single_tp"):
+                hit_tp = (
+                    high >= position["tp_price"]
+                    if side == "BUY"
+                    else low <= position["tp_price"]
+                )
+
+                if hit_tp:
+                    return self._close(symbol, "SHADOW_STATIC_TP_HIT")
+
                 return None
 
             hit_tp1 = (

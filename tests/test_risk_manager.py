@@ -593,6 +593,63 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertEqual(plan["quantity"], 10.0)
         self.assertEqual(plan["tp1_quantity"], 5.0)
         self.assertEqual(plan["tp2_quantity"], 5.0)
+        self.assertIsNone(plan["tp_price"])
+        self.assertFalse(plan["single_tp"])
+
+    def test_static_roi_mode_produces_a_single_full_close_tp(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "TP_TARGET_ROI_PCT", 40), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertTrue(plan["single_tp"])
+        self.assertAlmostEqual(plan["tp_price"], 104.0)  # 40% ROI / 10x leverage = 4% price move
+        self.assertIsNone(plan["tp1_price"])
+        self.assertIsNone(plan["tp2_price"])
+        self.assertIsNone(plan["tp1_quantity"])
+        self.assertIsNone(plan["tp2_quantity"])
+        self.assertEqual(plan["quantity"], 10.0)  # full quantity, no TP1_CLOSE_PCT split
+
+    def test_static_roi_mode_mirrors_for_sell(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "TP_TARGET_ROI_PCT", 40), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(
+                self._signal(side="SELL", entry_price=100, structure_level=102), balance=1000,
+            )
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["tp_price"], 96.0)
+
+    def test_static_roi_mode_ignores_tp1_close_pct(self):
+        # A 100% TP1_CLOSE_PCT would normally make the split invalid
+        # (TP_SPLIT_INVALID) - static ROI mode doesn't compute a split at
+        # all, so this must still succeed.
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "TP_TARGET_ROI_PCT", 40), \
+             patch.object(config, "TP1_CLOSE_PCT", 100), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+
+    def test_static_roi_mode_unavailable_rejects_the_plan(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "TP_TARGET_ROI_PCT", 40), \
+             patch.object(config, "LEVERAGE", 0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "TARGETS_UNAVAILABLE")
 
     def test_nearest_favorable_sr_r_is_threaded_through_from_the_signal_pools(self):
         signal = dict(

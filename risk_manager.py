@@ -585,12 +585,31 @@ def build_trade_plan(signal, balance):
     if _stop_roi_too_high(risk_distance, entry_price):
         return None, "SL_ROI_TOO_HIGH"
 
-    tp1_price, tp2_price = compute_targets(
-        entry_price, sl_price, side, pools=signal.get("liquidity_pools")
-    )
+    # config.TP_STATIC_ROI_ENABLED - operator-requested alternative to the
+    # TP1(partial)+TP2(remainder) ladder below: ONE fixed ROI% target that
+    # closes the whole position at once, computed the same way DCA_TP_
+    # STATIC_ROI_ENABLED's post-DCA target already is (price_at_roi_pct).
+    # Skips compute_targets/TP1_CLOSE_PCT entirely - there is no partial
+    # close or breakeven-on-TP1-fill step in this mode, so tp1_price/
+    # tp2_price/tp1_quantity/tp2_quantity are deliberately left None
+    # rather than populated with values nothing will use.
+    single_tp = bool(config.TP_STATIC_ROI_ENABLED)
 
-    if tp1_price is None:
-        return None, "TARGETS_UNAVAILABLE"
+    if single_tp:
+        tp_price = price_at_roi_pct(entry_price, side, config.TP_TARGET_ROI_PCT)
+
+        if tp_price is None:
+            return None, "TARGETS_UNAVAILABLE"
+
+        tp1_price = tp2_price = None
+    else:
+        tp_price = None
+        tp1_price, tp2_price = compute_targets(
+            entry_price, sl_price, side, pools=signal.get("liquidity_pools")
+        )
+
+        if tp1_price is None:
+            return None, "TARGETS_UNAVAILABLE"
 
     nearest_favorable_sr_r = nearest_favorable_structure_r(
         signal.get("liquidity_pools"), entry_price, side, risk_distance
@@ -612,12 +631,15 @@ def build_trade_plan(signal, balance):
     if quantity <= 0:
         return None, "POSITION_SIZE_ZERO"
 
-    tp1_close_pct = min(max(float(config.TP1_CLOSE_PCT), 0), 100)
-    tp1_quantity = round(quantity * tp1_close_pct / 100, 8)
-    tp2_quantity = round(quantity - tp1_quantity, 8)
+    if single_tp:
+        tp1_quantity = tp2_quantity = None
+    else:
+        tp1_close_pct = min(max(float(config.TP1_CLOSE_PCT), 0), 100)
+        tp1_quantity = round(quantity * tp1_close_pct / 100, 8)
+        tp2_quantity = round(quantity - tp1_quantity, 8)
 
-    if tp1_quantity <= 0 or tp2_quantity <= 0:
-        return None, "TP_SPLIT_INVALID"
+        if tp1_quantity <= 0 or tp2_quantity <= 0:
+            return None, "TP_SPLIT_INVALID"
 
     # config.DCA_ENABLED - the level that triggers this project's single
     # DCA if price moves against the position before TP1, computed once
@@ -642,6 +664,12 @@ def build_trade_plan(signal, balance):
         "sl_price": sl_price,
         "tp1_price": tp1_price,
         "tp2_price": tp2_price,
+        # config.TP_STATIC_ROI_ENABLED - the single-TP shape used instead
+        # of tp1_price/tp2_price/tp1_quantity/tp2_quantity above (all None
+        # in that case). See position_manager.register_dca_pending for
+        # where this actually branches into a differently-shaped position.
+        "tp_price": tp_price,
+        "single_tp": single_tp,
         "breakeven_price": compute_breakeven_price(entry_price, side),
         "quantity": quantity,
         "tp1_quantity": tp1_quantity,

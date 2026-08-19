@@ -134,22 +134,36 @@ def enter_trade_dca_pending(plan):
     register the result via positions.register_dca_pending(...), not
     positions.register(...). See config.py's DCA section for the full
     rationale and the real risk being accepted during this window - not
-    something this function tries to mitigate on its own."""
+    something this function tries to mitigate on its own.
+
+    config.TP_STATIC_ROI_ENABLED - plan["single_tp"] routes to ONE
+    full-position take-profit (plan["tp_price"]) instead of TP1(partial)+
+    TP2(remainder) - see risk_manager.build_trade_plan's own comment.
+    Still no SL either way; the DCA-or-TP race is otherwise unchanged."""
     symbol = plan["symbol"]
     side = plan["side"]
+    single_tp = plan.get("single_tp")
 
     if config.EXECUTION_MODE != "LIVE":
-        log_info(
-            f"[SHADOW] {symbol} would enter {side} qty={plan['quantity']} "
-            f"entry~={plan['entry_price']} (NO SL - dca_price={plan['dca_price']}) "
-            f"TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
-        )
+        if single_tp:
+            log_info(
+                f"[SHADOW] {symbol} would enter {side} qty={plan['quantity']} "
+                f"entry~={plan['entry_price']} (NO SL - dca_price={plan['dca_price']}) "
+                f"TP={plan['tp_price']}"
+            )
+        else:
+            log_info(
+                f"[SHADOW] {symbol} would enter {side} qty={plan['quantity']} "
+                f"entry~={plan['entry_price']} (NO SL - dca_price={plan['dca_price']}) "
+                f"TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
+            )
         return {
             "ok": True,
             "shadow": True,
             "entry_order": None,
             "tp1_order": None,
             "tp2_order": None,
+            "tp_order": None,
         }
 
     # Same abort-before-any-order-attempt discipline as enter_trade.
@@ -166,10 +180,34 @@ def enter_trade_dca_pending(plan):
 
     real_entry_price = exchange.resolve_market_fill_price(symbol, entry_order, plan["entry_price"])
 
-    # TP1/TP2 are best-effort, same as enter_trade - a missing TP here is
-    # a degraded outcome (the trade still resolves via DCA-or-TP1 either
-    # way), not a naked-position risk on its own, so it doesn't trigger
-    # the emergency-close path enter_trade's SL step does.
+    # TP (single, or TP1/TP2) is best-effort, same as enter_trade - a
+    # missing TP here is a degraded outcome (the trade still resolves via
+    # DCA-or-TP1/TP either way), not a naked-position risk on its own, so
+    # it doesn't trigger the emergency-close path enter_trade's SL step
+    # does.
+    if single_tp:
+        tp_order = None
+
+        try:
+            tp_order = exchange.place_take_profit_full(symbol, side, plan["tp_price"])
+        except Exception as exc:
+            log_warning(f"{symbol} TP placement failed: {exc}")
+
+        log_info(
+            f"{symbol} entered {side} qty={plan['quantity']} | NO SL (DCA pending) "
+            f"dca_price={plan['dca_price']} TP={plan['tp_price']}"
+        )
+
+        return {
+            "ok": True,
+            "shadow": False,
+            "entry_order": entry_order,
+            "tp1_order": None,
+            "tp2_order": None,
+            "tp_order": tp_order,
+            "real_entry_price": real_entry_price,
+        }
+
     tp1_order = None
     tp2_order = None
 
@@ -196,6 +234,7 @@ def enter_trade_dca_pending(plan):
         "entry_order": entry_order,
         "tp1_order": tp1_order,
         "tp2_order": tp2_order,
+        "tp_order": None,
         "real_entry_price": real_entry_price,
     }
 

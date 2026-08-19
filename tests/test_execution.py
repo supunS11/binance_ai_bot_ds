@@ -251,6 +251,13 @@ def _dca_plan():
     return dict(_plan(), dca_price=96)
 
 
+def _dca_single_tp_plan():
+    return dict(
+        _plan(), dca_price=96, single_tp=True, tp_price=104,
+        tp1_price=None, tp2_price=None, tp1_quantity=None, tp2_quantity=None,
+    )
+
+
 class EnterTradeDcaPendingShadowModeTests(unittest.TestCase):
     def test_shadow_mode_places_no_real_orders(self):
         with patch.object(config, "EXECUTION_MODE", "SHADOW"), \
@@ -326,6 +333,50 @@ class EnterTradeDcaPendingLiveModeTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIsNone(result["tp1_order"])
+
+
+class EnterTradeDcaPendingSingleTpTests(unittest.TestCase):
+    """config.TP_STATIC_ROI_ENABLED - plan["single_tp"] routes to ONE
+    full-position TP order instead of TP1(partial)+TP2(remainder)."""
+
+    def test_shadow_mode_places_no_real_orders(self):
+        with patch.object(config, "EXECUTION_MODE", "SHADOW"), \
+             patch.object(exchange, "place_market_order") as market_order:
+            result = execution.enter_trade_dca_pending(_dca_single_tp_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["shadow"])
+        market_order.assert_not_called()
+
+    def test_live_mode_places_entry_then_a_single_tp_but_never_tp1_or_sl(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}) as market_order, \
+             patch.object(exchange, "place_stop_loss") as stop_loss, \
+             patch.object(exchange, "place_take_profit_partial") as tp1, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp_full:
+            result = execution.enter_trade_dca_pending(_dca_single_tp_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["shadow"])
+        market_order.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+        tp_full.assert_called_once_with("BTCUSDT", "BUY", 104)
+        tp1.assert_not_called()
+        stop_loss.assert_not_called()
+        self.assertIsNone(result["tp1_order"])
+        self.assertIsNone(result["tp2_order"])
+        self.assertEqual(result["tp_order"], {"algoId": 4})
+        self.assertEqual(result["real_entry_price"], 100.0)
+
+    def test_tp_placement_failure_does_not_abort_the_trade(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}), \
+             patch.object(exchange, "place_take_profit_full", side_effect=RuntimeError("rejected")):
+            result = execution.enter_trade_dca_pending(_dca_single_tp_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["tp_order"])
 
 
 if __name__ == "__main__":

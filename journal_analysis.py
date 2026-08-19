@@ -77,6 +77,12 @@ WIN_OUTCOMES = {
     # position, same category as TP2_HIT above just for the single-TP
     # lifecycle that replaces TP1+TP2 once a DCA has fired.
     "DCA_TP_HIT", "SHADOW_DCA_TP_HIT",
+    # config.TP_STATIC_ROI_ENABLED - a single, full-position TP fill for a
+    # DCA_PENDING position that never needed to DCA (see position_manager.
+    # poll_live/poll_shadow's DCA_PENDING single_tp branch) - a genuine
+    # win, same category as TP2_HIT/DCA_TP_HIT above, just for this
+    # narrower pre-DCA single-TP lifecycle.
+    "STATIC_TP_HIT", "SHADOW_STATIC_TP_HIT",
 }
 
 

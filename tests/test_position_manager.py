@@ -512,6 +512,14 @@ class ReconcileOnStartupTests(unittest.TestCase):
             {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "104", "algoId": "tp2_1"},
         ]
 
+    def _single_tp_dca_shape_open_orders(self):
+        # config.TP_STATIC_ROI_ENABLED shape - exactly ONE full-position
+        # TP resting, no partial, no SL. See
+        # _recover_dca_pending_single_tp_position.
+        return [
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "106", "algoId": "tp_solo"},
+        ]
+
     class _FakeCandleStore:
         def __init__(self, candles):
             self._candles = candles
@@ -617,6 +625,48 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["stage"], TP1_PENDING)
         place_sl.assert_called_once()
 
+    def test_single_tp_dca_pending_shape_with_feed_recovers_dca_pending_stage(self):
+        manager = PositionManager()
+        feed = self._FakeFeed(["candle"])
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._single_tp_dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.5), \
+             patch.object(risk_manager, "compute_dca_price", return_value=96.0) as compute_dca, \
+             patch.object(exchange, "place_stop_loss") as place_sl:
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        self.assertTrue(position["single_tp"])
+        self.assertEqual(position["dca_price"], 96.0)
+        self.assertIsNone(position["sl_order_id"])
+        self.assertFalse(position["dca_applied"])
+        self.assertEqual(position["tp_price"], 106.0)
+        self.assertEqual(position["tp_order_id"], "tp_solo")
+        self.assertIsNone(position["tp1_price"])
+        self.assertIsNone(position["tp2_price"])
+        self.assertIsNone(position["risk_distance"])  # honest - no recoverable original stop
+        place_sl.assert_not_called()  # no emergency stop - the DCA mechanism survived instead
+        compute_dca.assert_called_once_with(100.0, "BUY", [], atr=0.5)
+
+    def test_single_tp_dca_pending_recovery_with_no_candles_falls_back_to_emergency_stop(self):
+        manager = PositionManager()
+        feed = self._FakeFeed([])  # feed present but empty history
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._single_tp_dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "emergency_sl"}) as place_sl:
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        place_sl.assert_called_once()
+        self.assertEqual(position["sl_order_id"], "emergency_sl")
+
     def _dca_active_open_orders(self, sl_tag="dcaSL1787000000000", tp_tag="dcaTP1787000000000"):
         # Same shape a genuine post-DCA position always has: one real
         # full-position SL, one real full-position TP, no partial TP -
@@ -650,8 +700,12 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertTrue(position["dca_applied"])
         self.assertFalse(position["dca_breakeven_applied"])
         self.assertIsNone(position["risk_distance"])  # honest - no original stop survives a restart
-        self.assertNotIn("tp1_price", position)  # DCA_ACTIVE has no TP1/TP2 concept
-        self.assertNotIn("tp2_price", position)
+        # DCA_ACTIVE has no TP1/TP2 concept - the keys exist (every
+        # position dict shape does, config.TP_STATIC_ROI_ENABLED needs
+        # this consistency) but are always None here.
+        self.assertIsNone(position["tp1_price"])
+        self.assertIsNone(position["tp2_price"])
+        self.assertTrue(position["single_tp"])
 
     def test_same_shape_without_the_tag_is_not_treated_as_dca_active(self):
         # An ordinary post-TP1 BREAKEVEN_ACTIVE position (SL already
@@ -928,6 +982,17 @@ class EarlyBreakevenEligibilityTests(unittest.TestCase):
                 self._position(stage=DCA_PENDING)
             ))
 
+    def test_single_tp_dca_pending_is_never_a_candidate(self):
+        # config.TP_STATIC_ROI_ENABLED - deliberately kept simple: no
+        # early-arm mechanisms layered on a single-TP DCA_PENDING
+        # position, just the DCA-vs-single-TP race.
+        manager = PositionManager()
+
+        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
+            self.assertFalse(manager._is_early_breakeven_candidate(
+                self._position(stage=DCA_PENDING, single_tp=True)
+            ))
+
     def test_zero_risk_distance_is_not_a_candidate(self):
         manager = PositionManager()
 
@@ -1006,6 +1071,18 @@ class ProfitProtectionEligibilityTests(unittest.TestCase):
 
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
             self.assertTrue(manager._is_profit_protection_candidate(self._position()))
+
+    def test_single_tp_dca_pending_is_never_a_candidate(self):
+        # config.TP_STATIC_ROI_ENABLED - see the identical note in
+        # EarlyBreakevenEligibilityTests. Checked explicitly (not just
+        # relying on tp1_price being None for this shape) so this stays
+        # true even if that ever changes.
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+            self.assertFalse(manager._is_profit_protection_candidate(
+                self._position(stage=DCA_PENDING, single_tp=True, tp1_price=None, tp_price=106)
+            ))
 
     def test_dca_pending_is_also_a_candidate(self):
         # See EarlyBreakevenEligibilityTests.test_dca_pending_is_also_a_
@@ -3240,6 +3317,18 @@ def _dca_plan(side="BUY"):
     return plan
 
 
+def _dca_single_tp_plan(side="BUY"):
+    # config.TP_STATIC_ROI_ENABLED shape - tp1/tp2 fields None, tp_price/
+    # single_tp set instead (mirrors risk_manager.build_trade_plan's own
+    # single_tp branch).
+    plan = _dca_plan(side)
+    plan.update({
+        "tp1_price": None, "tp2_price": None, "tp1_quantity": None, "tp2_quantity": None,
+        "tp_price": 106 if side == "BUY" else 94, "single_tp": True,
+    })
+    return plan
+
+
 _DCA_RESULT_PLAN = {
     "entry_price": 98.0, "sl_price": 94.0, "tp_price": 106.0,
     "quantity": 2.0, "risk_distance": 4.0,
@@ -3298,6 +3387,32 @@ class RegisterDcaPendingTests(unittest.TestCase):
         self.assertEqual(position["entry_price"], 100)
         self.assertEqual(position["breakeven_price"], 100.02)
         self.assertEqual(position["risk_distance"], 2.0)
+
+    def test_dual_tp_plan_is_not_single_tp(self):
+        manager = PositionManager()
+        position = manager.register_dca_pending(_dca_plan(), {"shadow": True})
+
+        self.assertFalse(position["single_tp"])
+        self.assertIsNone(position["tp_price"])
+        self.assertIsNone(position["tp_order_id"])
+
+    def test_single_tp_plan_builds_the_single_tp_shape(self):
+        manager = PositionManager()
+        execution_result = {"shadow": False, "tp_order": {"algoId": "tp_solo"}}
+        position = manager.register_dca_pending(_dca_single_tp_plan(), execution_result)
+
+        self.assertTrue(position["single_tp"])
+        self.assertEqual(position["tp_price"], 106)
+        self.assertEqual(position["tp_order_id"], "tp_solo")
+        self.assertIsNone(position["tp1_price"])
+        self.assertIsNone(position["tp2_price"])
+        # execution_result never carries "tp1_order"/"tp2_order" keys in
+        # single_tp mode - _accepted_order_id(None) returns "" (its own
+        # established behavior, not a None), same as any other missing order.
+        self.assertFalse(position["tp1_order_id"])
+        self.assertFalse(position["tp2_order_id"])
+        self.assertIsNone(position["sl_order_id"])
+        self.assertEqual(position["stage"], DCA_PENDING)
 
 
 class IsDcaCandidateTests(unittest.TestCase):
@@ -3585,6 +3700,39 @@ class PollShadowDcaPendingTests(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
 
+    def _manager_with_single_tp_dca_pending(self):
+        manager = PositionManager()
+        manager.register_dca_pending(_dca_single_tp_plan(), {"shadow": True})
+        return manager
+
+    def test_single_tp_touch_closes_as_shadow_static_tp_hit(self):
+        manager = self._manager_with_single_tp_dca_pending()
+        candle = _candle(high=107, low=99)  # clears tp_price=106
+
+        outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertEqual(outcome, "SHADOW_STATIC_TP_HIT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_single_tp_not_touched_stays_open(self):
+        manager = self._manager_with_single_tp_dca_pending()
+        candle = _candle(high=103, low=99)  # clears neither tp_price=106 nor dca_price=96
+
+        outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+
+    def test_single_tp_dca_still_fires_when_dca_price_reached_first(self):
+        manager = self._manager_with_single_tp_dca_pending()
+        candle = _candle(high=100, low=95)  # touches dca_price=96, never reaches tp_price=106
+
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
     def test_profit_protection_can_promote_a_dca_pending_position_before_tp1_or_dca(self):
         # The actual fix, exercised end to end: a DCA-pending position
         # that moves favorably enough gets promoted to BREAKEVEN_ACTIVE
@@ -3615,9 +3763,17 @@ class PollShadowDcaActiveTests(unittest.TestCase):
         # (this fixture's breakeven_price is left at register_dca_pending's
         # pre-DCA value, not recomputed for entry=98, so it would otherwise
         # arm unexpectedly). DcaBreakevenTests below covers it directly.
-        patcher = patch.object(config, "DCA_BREAKEVEN_ENABLED", False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # config.DCA_TP_STATIC_ROI_ENABLED - same isolation, same reasoning
+        # (PollLiveDcaBreakevenConfirmationTests's own note on this) - this
+        # fixture's tp_price=106.0 is deliberately fixed, not left to
+        # self-heal onto whatever the live ROI target happens to compute.
+        for name, value in (
+            ("DCA_BREAKEVEN_ENABLED", False),
+            ("DCA_TP_STATIC_ROI_ENABLED", False),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _manager_with_dca_active(self):
         manager = PositionManager()
@@ -4003,6 +4159,148 @@ class PollLiveDcaPendingTests(unittest.TestCase):
         self.assertEqual(outcome, "TP2_HIT_DIRECT")
         cancel_all.assert_called_once_with("BTCUSDT")
 
+    def _manager_with_single_tp_dca_pending(self):
+        manager = PositionManager()
+        execution_result = {"shadow": False, "tp_order": {"algoId": "tp_solo"}}
+        manager.register_dca_pending(_dca_single_tp_plan(), execution_result)
+        return manager
+
+    def test_single_tp_finished_closes_as_static_tp_hit(self):
+        manager = self._manager_with_single_tp_dca_pending()
+
+        with patch.object(exchange, "get_mark_price", return_value=101.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="FINISHED"), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "STATIC_TP_HIT")
+        cancel_all.assert_called_once_with("BTCUSDT")
+
+    def test_single_tp_not_finished_stays_open(self):
+        manager = self._manager_with_single_tp_dca_pending()
+
+        with patch.object(exchange, "get_mark_price", return_value=101.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+    def test_single_tp_dca_still_fires_normally(self):
+        manager = self._manager_with_single_tp_dca_pending()
+
+        with patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+
+class EnsureProtectionOrdersSingleTpDcaPendingTests(unittest.TestCase):
+    """config.TP_STATIC_ROI_ENABLED - self-heal for a single-TP DCA_PENDING
+    position's missing tp_order_id, mirroring the existing TP1/TP2 self-
+    heal tests' shape."""
+
+    def _manager_with_single_tp_dca_pending(self, tp_order_id=None):
+        manager = PositionManager()
+        execution_result = {"shadow": False, "tp_order": {"algoId": "tp_solo"} if tp_order_id else None}
+        manager.register_dca_pending(_dca_single_tp_plan(), execution_result)
+        manager.positions["BTCUSDT"]["tp_order_id"] = tp_order_id
+        return manager
+
+    def test_missing_tp_is_resynced_from_a_real_exchange_order(self):
+        manager = self._manager_with_single_tp_dca_pending(tp_order_id=None)
+        real_tp = {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "algoId": "real_tp"}
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[real_tp]), \
+             patch.object(exchange, "place_take_profit_full") as place:
+            outcome = manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["tp_order_id"], "real_tp")
+        place.assert_not_called()
+
+    def test_missing_tp_with_none_on_exchange_places_a_new_one(self):
+        manager = self._manager_with_single_tp_dca_pending(tp_order_id=None)
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_recovered"}) as place:
+            outcome = manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["tp_order_id"], "tp_recovered")
+        place.assert_called_once_with("BTCUSDT", "BUY", 106)
+
+    def test_present_tp_order_id_is_a_noop(self):
+        manager = self._manager_with_single_tp_dca_pending(tp_order_id="tp_solo")
+
+        with patch.object(exchange, "get_open_algo_orders") as get_open, \
+             patch.object(exchange, "place_take_profit_full") as place:
+            outcome = manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+        get_open.assert_not_called()
+        place.assert_not_called()
+
+    def test_minus_2021_closes_the_whole_position_as_a_win(self):
+        # Unlike TP1's -2021 fallback (_market_close_tp1: partial close +
+        # promote), there's nothing left to promote once the single TP
+        # accounts for the whole position - must close outright as
+        # STATIC_TP_HIT, never a loss-side outcome.
+        manager = self._manager_with_single_tp_dca_pending(tp_order_id=None)
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(
+                 exchange, "place_take_profit_full",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close, \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome = manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        self.assertEqual(outcome, "STATIC_TP_HIT")
+        market_close.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+        cancel_all.assert_called_once_with("BTCUSDT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_market_close_failure_leaves_it_for_the_next_poll(self):
+        manager = self._manager_with_single_tp_dca_pending(tp_order_id=None)
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(
+                 exchange, "place_take_profit_full",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market", side_effect=RuntimeError("boom")):
+            outcome = manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+    def test_poll_live_propagates_the_ensure_protection_orders_outcome(self):
+        # Full integration: poll_live must return the outcome from
+        # _ensure_protection_orders instead of continuing to process a
+        # position that already closed this same tick.
+        manager = self._manager_with_single_tp_dca_pending(tp_order_id=None)
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(
+                 exchange, "place_take_profit_full",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market"), \
+             patch.object(exchange, "cancel_all_open_orders"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "STATIC_TP_HIT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
 
 class PollLiveDcaActiveTests(unittest.TestCase):
     def setUp(self):
@@ -4012,10 +4310,13 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         # these SL/TP-status tests stay isolated and don't need to mock
         # exchange.get_mark_price. DcaActiveProfitProtectionTests/
         # DcaBreakevenTests below cover each directly.
+        # config.DCA_TP_STATIC_ROI_ENABLED - same isolation, same
+        # reasoning (PollShadowDcaActiveTests's own note on this).
         for name, value in (
             ("MAE_TRACKING_ENABLED", False),
             ("PROFIT_PROTECTION_ENABLED", False),
             ("DCA_BREAKEVEN_ENABLED", False),
+            ("DCA_TP_STATIC_ROI_ENABLED", False),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -4489,10 +4790,16 @@ class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
     additionally lets a confirmed verdict skip the move."""
 
     def setUp(self):
+        # config.DCA_TP_STATIC_ROI_ENABLED - isolated off here too (see
+        # PollShadowDcaActiveTests's own note) - these tests are about the
+        # breakeven-confirmation mechanism, not the TP target, and must
+        # not have the fixture's fixed tp_price self-heal out from under
+        # them mid-test.
         for name, value in (
             ("MAE_TRACKING_ENABLED", False),
             ("PROFIT_PROTECTION_ENABLED", False),
             ("DCA_BREAKEVEN_ENABLED", True),
+            ("DCA_TP_STATIC_ROI_ENABLED", False),
             ("HTF_TREND_FRESHNESS_ENABLED", True),
             ("EFFICIENCY_RATIO_GATE_ENABLED", True),
             ("SIGNAL_MIN_CVD_SCORE", 0.15),

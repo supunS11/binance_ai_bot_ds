@@ -253,9 +253,15 @@ def _evaluate_symbol(
     plan["structure_level"] = result.get("structure_level")
     plan["trigger_candle_open_time"] = result.get("trigger_candle_open_time")
 
+    # config.TP_STATIC_ROI_ENABLED - see position_manager's heartbeat log
+    # comment for why single-TP plans need their own display.
+    tp_note = (
+        f"TP={plan['tp_price']}" if plan.get("single_tp")
+        else f"TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
+    )
     log_info(
         f"{symbol} SIGNAL {result['signal']} | entry~={plan['entry_price']} "
-        f"SL={plan['sl_price']} TP1={plan['tp1_price']} TP2={plan['tp2_price']} | "
+        f"SL={plan['sl_price']} {tp_note} | "
         f"cvd={result.get('cvd_score')} sweep={result.get('sweep_confluence')} "
         f"htf_trend={result.get('htf_trend')}"
     )
@@ -433,10 +439,18 @@ def _log_heartbeat(
             f" filled={position['filled_quantity']}"
             if position["stage"] == PENDING_LIMIT_FILL else ""
         )
+        # config.TP_STATIC_ROI_ENABLED/DCA_TP_STATIC_ROI_ENABLED - a
+        # single-TP position (DCA_ACTIVE always, or a static-ROI
+        # DCA_PENDING one) has tp_price, not tp1_price/tp2_price (both
+        # None in that shape - see risk_manager.build_trade_plan/
+        # position_manager.register_dca_pending).
+        tp_note = (
+            f"tp={position['tp_price']}" if position.get("single_tp")
+            else f"tp1={position['tp1_price']} tp2={position['tp2_price']}"
+        )
         log_info(
             f"  OPEN {symbol} {position['side']} stage={position['stage']}{filled_note} "
-            f"entry={position['entry_price']} sl={position['sl_price']} "
-            f"tp1={position['tp1_price']} tp2={position['tp2_price']}"
+            f"entry={position['entry_price']} sl={position['sl_price']} {tp_note}"
         )
 
 

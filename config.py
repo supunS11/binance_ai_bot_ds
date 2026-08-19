@@ -878,6 +878,22 @@ TP2_R_MULTIPLE = env_float("TP2_R_MULTIPLE", 4.0)
 # fallback is used instead of the distant pool.
 TP1_MAX_R_MULTIPLE = env_float("TP1_MAX_R_MULTIPLE", 6.0)
 TP2_MAX_R_MULTIPLE = env_float("TP2_MAX_R_MULTIPLE", 10.0)
+# Operator-requested alternative to the TP1(partial)+TP2(remainder) ladder
+# above (2026-08-19, no evidence yet either way): ONE fixed ROI% target
+# (at LEVERAGE) that closes the WHOLE position at once - no partial TP1
+# close, no TP1_CLOSE_PCT, no breakeven promotion on TP1 fill (there's
+# nothing left to promote once the single TP closes everything). Applies
+# to a DCA_PENDING position before DCA ever fires - see risk_manager.
+# build_trade_plan/position_manager.register_dca_pending. Reuses the same
+# price_at_roi_pct helper DCA_TP_STATIC_ROI_ENABLED already uses for the
+# POST-DCA target - this is the pre-DCA equivalent. Default False - same
+# "new mechanism earns a live default only after real data" rule every
+# other unvalidated mechanism this project ships follows.
+TP_STATIC_ROI_ENABLED = env_bool("TP_STATIC_ROI_ENABLED", "False")
+# Leveraged ROI%, same units as DCA_TP_TARGET_ROI_PCT/
+# PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT elsewhere in this file.
+# Starting value, not calibrated against real trade outcomes yet.
+TP_TARGET_ROI_PCT = env_float("TP_TARGET_ROI_PCT", 40)
 MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = env_bool(
     "MOVE_SL_TO_BREAKEVEN_AFTER_TP1", "True"
 )
