@@ -1108,6 +1108,37 @@ DCA_STRUCTURE_STOP_ATR_BUFFER = env_float("DCA_STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # behind EARLY_BREAKEVEN_ENABLED's default in this project, just applied
 # to the post-DCA stage instead of the pre-DCA one.
 DCA_BREAKEVEN_ENABLED = env_bool("DCA_BREAKEVEN_ENABLED", "True")
+# Real gap in the gap-closer above: DCA_BREAKEVEN_ENABLED moves the stop to
+# breakeven unconditionally the instant price reaches it, even when the
+# broader trend/order-flow picture still strongly favors the position -
+# turning what could have run to the real (wide) post-DCA target into a
+# guaranteed scratch. This makes that conditional: re-runs the trend/order-
+# flow-health subset of evaluate()'s own entry gates (AGAINST_HTF_BIAS,
+# HTF_TREND_STALE, CVD confirmation, MARKET_CHOPPY - see signal_engine.
+# direction_still_confirmed for exactly what's checked and why the entry-
+# timing-specific gates, zone/OTE/order block, are deliberately excluded)
+# against the position's OWN side. Two separate flags, not one, for a
+# deliberate two-phase rollout (2026-08-19, zero trades have ever used
+# this): this flag alone only COMPUTES and JOURNALS the confirmation
+# verdict (signal_journal.py's dca_breakeven_direction_confirmed) - the
+# real breakeven move still happens exactly as it does today underneath,
+# unconditionally. Only once DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED is
+# ALSO on does a confirmed verdict actually withhold the move. Default
+# False - unlike OI_RISING_REJECT_ENABLED (reject-only, safe to ship live
+# immediately), this feature can WITHHOLD a protective SL move if wrong,
+# which increases risk rather than reduces it - it earns a live default
+# only after real evidence, same as every other unvalidated mechanism.
+DCA_BREAKEVEN_CONFIRMATION_ENABLED = env_bool("DCA_BREAKEVEN_CONFIRMATION_ENABLED", "False")
+# The actual behavior-changing switch - see DCA_BREAKEVEN_CONFIRMATION_
+# ENABLED's comment above. Requires that flag ALSO on to do anything;
+# left independently toggleable so the informational phase can run for as
+# long as needed without this ever being touched. Fails safe on its own
+# terms too: while price sits at/above breakeven the check re-runs every
+# poll tick (not just once) - the instant confirmation fails, the stop
+# moves to breakeven immediately, same protection as today, never later.
+DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED = env_bool(
+    "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", "False"
+)
 
 # =========================
 # EXECUTION

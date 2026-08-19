@@ -814,3 +814,101 @@ def evaluate(
     result["trigger_candle_open_time"] = winner_candidate["trigger_candle_open_time"]
     result["signal_trigger"] = winner_candidate["signal_trigger"]
     return result
+
+
+def direction_still_confirmed(side, htf_candles, ltf_candles, cvd_snapshot, current_price):
+    """For a position ALREADY OPEN (not a fresh entry candidate) - built
+    for config.DCA_BREAKEVEN_CONFIRMATION_ENABLED, deciding whether to
+    withhold a protective SL move because the trade's original thesis
+    still looks intact. Reuses the trend/order-flow-HEALTH subset of
+    evaluate()'s own gates (AGAINST_HTF_BIAS, HTF_TREND_STALE, CVD
+    confirmation, MARKET_CHOPPY) against the position's own side.
+
+    Deliberately excludes the entry-TIMING gates (zone/OTE/order block/
+    live-break) - those answer "is NOW a good moment to open a NEW
+    position", not "does an already-open one's thesis still hold". Reusing
+    them here would reject almost every real recovery: price has
+    typically already moved out of discount/premium by the time it's
+    recovered to breakeven, which would just reproduce today's
+    unconditional breakeven move instead of adding anything.
+
+    Fails safe in the OPPOSITE direction from evaluate()'s own gates:
+    those never block a signal over an absent/optional field (informational
+    absence isn't evidence against a trade). Here, absent/unavailable data
+    for a required check counts as NOT confirmed - this function decides
+    whether to leave a position LESS protected, so an inconclusive read
+    must never look like a green light.
+
+    HTF trend agreement and CVD confirmation are always required (neither
+    has a disable flag in evaluate() either - both are unconditional
+    there). HTF_TREND_STALE/MARKET_CHOPPY are only required when their own
+    entry-gate flag (HTF_TREND_FRESHNESS_ENABLED/EFFICIENCY_RATIO_GATE_
+    ENABLED) is on - if the team doesn't trust a signal enough to gate
+    entries on it, it shouldn't gate this decision either. That leaves at
+    least 2 checks always required, so `confirmed` can never be vacuously
+    True from every optional check being switched off.
+
+    Returns (confirmed: bool, detail: dict) - detail carries every
+    individual check's verdict/raw value for journaling (signal_journal.py's
+    dca_breakeven_direction_confirmed field), same diagnostic spirit as
+    _reject's own reason strings."""
+    detail = {
+        "htf_trend_agrees": None, "htf_trend_stale_agrees": None,
+        "cvd_confirmed": None, "market_not_choppy": None,
+    }
+
+    if not htf_candles or not ltf_candles:
+        return False, detail
+
+    htf_structure = market_structure.structure_state(htf_candles)
+
+    if not htf_structure.get("available"):
+        return False, detail
+
+    detail["htf_trend"] = htf_structure.get("trend")
+    htf_side = _BULLISH_TO_SIDE.get(htf_structure.get("trend"))
+    detail["htf_trend_agrees"] = htf_side == side
+    checks = [detail["htf_trend_agrees"]]
+
+    if config.HTF_TREND_FRESHNESS_ENABLED:
+        htf_trend_ema = market_structure.exponential_moving_average(
+            htf_candles, period=config.HTF_TREND_EMA_PERIOD
+        )
+
+        if htf_trend_ema is None:
+            detail["htf_trend_stale_agrees"] = False
+        else:
+            detail["htf_trend_ema"] = htf_trend_ema
+            detail["htf_trend_stale_agrees"] = (
+                current_price >= htf_trend_ema if side == "BUY" else current_price <= htf_trend_ema
+            )
+
+        checks.append(detail["htf_trend_stale_agrees"])
+
+    cvd_snapshot_ = cvd_snapshot or {}
+    cvd_score = cvd_snapshot_.get("cvd_score") if cvd_snapshot_.get("available") else None
+
+    if cvd_score is None:
+        detail["cvd_confirmed"] = False
+    else:
+        min_cvd = config.SIGNAL_MIN_CVD_SCORE
+        detail["cvd_score"] = cvd_score
+        detail["cvd_confirmed"] = cvd_score >= min_cvd if side == "BUY" else cvd_score <= -min_cvd
+
+    checks.append(detail["cvd_confirmed"])
+
+    if config.EFFICIENCY_RATIO_GATE_ENABLED:
+        ltf_analysis = market_structure.analyze(ltf_candles)
+        efficiency_ratio = (
+            ltf_analysis.get("efficiency_ratio") if ltf_analysis.get("available") else None
+        )
+
+        if efficiency_ratio is None:
+            detail["market_not_choppy"] = False
+        else:
+            detail["efficiency_ratio"] = efficiency_ratio
+            detail["market_not_choppy"] = efficiency_ratio >= config.EFFICIENCY_RATIO_CHOP_THRESHOLD
+
+        checks.append(detail["market_not_choppy"])
+
+    return all(checks), detail

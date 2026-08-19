@@ -18,6 +18,7 @@ import config
 import exchange
 import market_structure
 import risk_manager
+import signal_engine
 import signal_journal
 from logger import log_error, log_info, log_warning
 
@@ -741,6 +742,7 @@ class PositionManager:
             "break_confirmed_by_close": None,
             "dca_applied": True,
             "dca_breakeven_applied": False,
+            "dca_breakeven_direction_confirmed": None,
             "atr": None,
         }
 
@@ -946,6 +948,7 @@ class PositionManager:
                 early_breakeven_applied=position.get("early_breakeven_applied", False),
                 break_confirmed_by_close=position.get("break_confirmed_by_close"),
                 dca_applied=position.get("dca_applied", False),
+                dca_breakeven_direction_confirmed=position.get("dca_breakeven_direction_confirmed"),
             )
 
         return outcome
@@ -1380,6 +1383,10 @@ class PositionManager:
         # fires always comes from DCA_PENDING, never an already-promoted
         # position).
         position["dca_breakeven_applied"] = False
+        # config.DCA_BREAKEVEN_CONFIRMATION_ENABLED - None until the
+        # breakeven check actually runs at least once (distinct from
+        # False, "ran and wasn't confirmed") - see _dca_breakeven_confirmation.
+        position["dca_breakeven_direction_confirmed"] = None
         position["stage"] = DCA_ACTIVE
         log_info(
             f"{symbol}{' [SHADOW]' if shadow else ''} DCA fired | "
@@ -1528,6 +1535,31 @@ class PositionManager:
         return current_price >= breakeven if side == "BUY" else current_price <= breakeven
 
     @staticmethod
+    def _dca_breakeven_confirmation(position, htf_candles, ltf_candles, cvd_snapshot, current_price):
+        """config.DCA_BREAKEVEN_CONFIRMATION_ENABLED / ..._WITHHOLD_ENABLED
+        - see signal_engine.direction_still_confirmed for what's actually
+        checked. Always returns (withhold, confirmed, detail) so callers
+        can journal confirmed/detail unconditionally without a None check
+        of their own - confirmed/detail are only ever None when the
+        master flag itself is off (the feature has never run at all, a
+        real distinction from "ran and found it not confirmed").
+
+        `withhold` is the one bit that actually changes behavior, kept
+        separate from `confirmed` on purpose: the two-phase rollout this
+        was built for runs with confirmed/detail journaled for a while
+        before DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED is ever flipped
+        on, so a caller must never infer "withhold" just because
+        `confirmed` came back True."""
+        if not config.DCA_BREAKEVEN_CONFIRMATION_ENABLED:
+            return False, None, None
+
+        confirmed, detail = signal_engine.direction_still_confirmed(
+            position["side"], htf_candles, ltf_candles, cvd_snapshot, current_price
+        )
+        withhold = confirmed and config.DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED
+        return withhold, confirmed, detail
+
+    @staticmethod
     def _profit_protection_lock_price(position, target_price=None):
         """The ARM trigger price only - see risk_manager.
         compute_profit_protection_lock_price. Once armed, the stop no
@@ -1664,12 +1696,15 @@ class PositionManager:
 
         return False
 
-    def poll_live(self, symbol, candles=None):
+    def poll_live(self, symbol, candles=None, htf_candles=None, cvd_snapshot=None):
         """Returns an outcome string if the position closed this call,
         otherwise None. `candles` (LTF history for the symbol) is only
         used by config.STRUCTURE_STOP_MANAGEMENT_ENABLED's structure-aware
         early-breakeven lock and post-TP1 trailing stop - both are no-ops
-        when it's not supplied."""
+        when it's not supplied. `htf_candles`/`cvd_snapshot` are only used
+        by config.DCA_BREAKEVEN_CONFIRMATION_ENABLED (see
+        _dca_breakeven_confirmation) - also a no-op without them, same
+        convention."""
         position = self.positions.get(symbol)
 
         if not position or position["shadow"]:
@@ -1770,6 +1805,17 @@ class PositionManager:
                 dca_breakeven_candidate
                 and self._dca_breakeven_price_reached(position, current_price)
             ):
+                withhold, confirmed, detail = self._dca_breakeven_confirmation(
+                    position, htf_candles, candles, cvd_snapshot, current_price
+                )
+                position["dca_breakeven_direction_confirmed"] = confirmed
+
+                if withhold:
+                    log_info(
+                        f"{symbol} DCA breakeven withheld - direction still confirmed | {detail}"
+                    )
+                    return None
+
                 outcome, replaced = self._replace_sl_order(
                     position, position["breakeven_price"], "DCA breakeven (price reached)",
                 )
@@ -2111,7 +2157,7 @@ class PositionManager:
 
         return False
 
-    def poll_shadow(self, symbol, latest_candle, candles=None):
+    def poll_shadow(self, symbol, latest_candle, candles=None, htf_candles=None, cvd_snapshot=None):
         """Simulates the same TP1 -> breakeven -> TP2/SL sequence against
         live price action. When both the stop and a target fall inside the
         same candle's range, the SL side is assumed to have been touched
@@ -2119,7 +2165,9 @@ class PositionManager:
         don't overstate win rate; it is not a substitute for real fills.
         `candles` (LTF history) is only used by config.STRUCTURE_STOP_MANAGEMENT_ENABLED's
         structure-aware early-breakeven lock and post-TP1 trailing - both
-        are no-ops when it's not supplied."""
+        are no-ops when it's not supplied. `htf_candles`/`cvd_snapshot` -
+        see poll_live's own docstring, same DCA_BREAKEVEN_CONFIRMATION_
+        ENABLED no-op convention."""
         position = self.positions.get(symbol)
 
         if not position or not position["shadow"] or not latest_candle:
@@ -2236,6 +2284,18 @@ class PositionManager:
                 self._is_dca_breakeven_candidate(position)
                 and self._dca_breakeven_price_reached(position, latest_candle["close"])
             ):
+                withhold, confirmed, detail = self._dca_breakeven_confirmation(
+                    position, htf_candles, candles, cvd_snapshot, latest_candle["close"]
+                )
+                position["dca_breakeven_direction_confirmed"] = confirmed
+
+                if withhold:
+                    log_info(
+                        f"{symbol} [SHADOW] DCA breakeven withheld - direction still "
+                        f"confirmed | {detail}"
+                    )
+                    return None
+
                 position["dca_breakeven_applied"] = True
                 position["sl_price"] = position["breakeven_price"]
                 log_info(

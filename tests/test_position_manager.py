@@ -3810,6 +3810,130 @@ class PollShadowDcaActiveTests(unittest.TestCase):
         self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 94.0)  # untouched
 
 
+class PollShadowDcaBreakevenConfirmationTests(unittest.TestCase):
+    """Shadow-mode mirror of PollLiveDcaBreakevenConfirmationTests - same
+    two-phase config.DCA_BREAKEVEN_CONFIRMATION_ENABLED / ..._WITHHOLD_
+    ENABLED rollout, simulated instead of hitting real exchange calls."""
+
+    def setUp(self):
+        for name, value in (
+            ("DCA_BREAKEVEN_ENABLED", True),
+            ("PROFIT_PROTECTION_ENABLED", False),
+            ("HTF_TREND_FRESHNESS_ENABLED", True),
+            ("EFFICIENCY_RATIO_GATE_ENABLED", True),
+            ("SIGNAL_MIN_CVD_SCORE", 0.15),
+            ("EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _manager_with_dca_active(self):
+        manager = PositionManager()
+        manager.register_dca_pending(_dca_plan(), {"shadow": True})
+        position = manager.positions["BTCUSDT"]
+        position.update({
+            "stage": DCA_ACTIVE, "entry_price": 98.0, "sl_price": 94.0,
+            "tp_price": 106.0, "quantity": 2.0, "dca_applied": True,
+            "dca_breakeven_applied": False, "dca_breakeven_direction_confirmed": None,
+            "breakeven_price": 98.02,
+        })
+        return manager
+
+    def _confirming_structure_mocks(self):
+        return (
+            patch.object(
+                market_structure, "structure_state",
+                return_value={"available": True, "trend": "BULLISH"},
+            ),
+            patch.object(market_structure, "exponential_moving_average", return_value=95.0),
+            patch.object(
+                market_structure, "analyze",
+                return_value={"available": True, "efficiency_ratio": 0.5},
+            ),
+        )
+
+    def test_master_flag_off_behaves_as_before(self):
+        manager = self._manager_with_dca_active()
+        candle = _candle(high=98.5, low=97.5, close=98.02)
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", False):
+            outcome = manager.poll_shadow(
+                "BTCUSDT", candle, candles=["ltf"], htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertEqual(position["sl_price"], 98.02)
+        self.assertIsNone(position["dca_breakeven_direction_confirmed"])
+
+    def test_confirmed_but_withhold_disabled_still_applies_breakeven(self):
+        s1, s2, s3 = self._confirming_structure_mocks()
+        manager = self._manager_with_dca_active()
+        candle = _candle(high=98.5, low=97.5, close=98.02)
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", False), \
+             s1, s2, s3:
+            outcome = manager.poll_shadow(
+                "BTCUSDT", candle, candles=["ltf"], htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertTrue(position["dca_breakeven_direction_confirmed"])
+        self.assertEqual(position["sl_price"], 98.02)
+
+    def test_confirmed_and_withhold_enabled_skips_the_move(self):
+        s1, s2, s3 = self._confirming_structure_mocks()
+        manager = self._manager_with_dca_active()
+        candle = _candle(high=98.5, low=97.5, close=98.02)
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", True), \
+             s1, s2, s3:
+            outcome = manager.poll_shadow(
+                "BTCUSDT", candle, candles=["ltf"], htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["dca_breakeven_applied"])
+        self.assertTrue(position["dca_breakeven_direction_confirmed"])
+        self.assertEqual(position["sl_price"], 94.0)  # unchanged - real (wide) SL untouched
+
+    def test_not_confirmed_and_withhold_enabled_applies_breakeven_normally(self):
+        manager = self._manager_with_dca_active()
+        candle = _candle(high=98.5, low=97.5, close=98.02)
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "trend": "BEARISH"},
+             ), \
+             patch.object(market_structure, "exponential_moving_average", return_value=95.0), \
+             patch.object(
+                 market_structure, "analyze",
+                 return_value={"available": True, "efficiency_ratio": 0.5},
+             ):
+            outcome = manager.poll_shadow(
+                "BTCUSDT", candle, candles=["ltf"], htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertFalse(position["dca_breakeven_direction_confirmed"])
+        self.assertEqual(position["sl_price"], 98.02)
+
+
 class PollLiveDcaPendingTests(unittest.TestCase):
     def setUp(self):
         # See PollShadowDcaPendingTests.setUp - same isolation, same
@@ -4162,6 +4286,190 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         self.assertEqual(outcome, "DCA_SL_HIT")
         market_close.assert_called_once()
         self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+
+class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
+    """config.DCA_BREAKEVEN_CONFIRMATION_ENABLED / ..._WITHHOLD_ENABLED -
+    two-phase rollout: the master flag alone only computes+journals the
+    verdict onto the position (the breakeven move still applies
+    unconditionally underneath, byte-identical to today); WITHHOLD
+    additionally lets a confirmed verdict skip the move."""
+
+    def setUp(self):
+        for name, value in (
+            ("MAE_TRACKING_ENABLED", False),
+            ("PROFIT_PROTECTION_ENABLED", False),
+            ("DCA_BREAKEVEN_ENABLED", True),
+            ("HTF_TREND_FRESHNESS_ENABLED", True),
+            ("EFFICIENCY_RATIO_GATE_ENABLED", True),
+            ("SIGNAL_MIN_CVD_SCORE", 0.15),
+            ("EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _manager_with_dca_active(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        position = manager.positions["BTCUSDT"]
+        position.update({
+            "stage": DCA_ACTIVE, "sl_order_id": "sl_new", "tp_order_id": "tp_new",
+            "entry_price": 98.0, "sl_price": 94.0, "tp_price": 106.0, "quantity": 2.0,
+            "dca_applied": True, "dca_breakeven_applied": False,
+            "dca_breakeven_direction_confirmed": None, "breakeven_price": 98.02,
+        })
+        return manager
+
+    def _confirming_structure_mocks(self):
+        # BUY side: BULLISH HTF trend, EMA below current price, efficiency
+        # above the chop threshold - all 4 checks pass (cvd_snapshot is
+        # supplied per-test via poll_live's own kwarg, not mocked here).
+        return (
+            patch.object(
+                market_structure, "structure_state",
+                return_value={"available": True, "trend": "BULLISH"},
+            ),
+            patch.object(market_structure, "exponential_moving_average", return_value=95.0),
+            patch.object(
+                market_structure, "analyze",
+                return_value={"available": True, "efficiency_ratio": 0.5},
+            ),
+        )
+
+    def test_master_flag_off_ignores_htf_and_cvd_and_behaves_as_before(self):
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", False), \
+             patch.object(exchange, "get_mark_price", return_value=98.02), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}):
+            outcome = manager.poll_live(
+                "BTCUSDT", htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertIsNone(position["dca_breakeven_direction_confirmed"])
+
+    def test_confirmed_but_withhold_disabled_still_applies_breakeven(self):
+        s1, s2, s3 = self._confirming_structure_mocks()
+
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", False), \
+             s1, s2, s3, \
+             patch.object(exchange, "get_mark_price", return_value=98.02), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
+            outcome = manager.poll_live(
+                "BTCUSDT", candles=["ltf"], htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertTrue(position["dca_breakeven_direction_confirmed"])
+        cancel.assert_called_once_with("BTCUSDT", "sl_new")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 98.02)
+
+    def test_confirmed_and_withhold_enabled_skips_the_move(self):
+        s1, s2, s3 = self._confirming_structure_mocks()
+
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", True), \
+             s1, s2, s3, \
+             patch.object(exchange, "get_mark_price", return_value=98.02), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "place_stop_loss") as new_sl, \
+             patch.object(exchange, "cancel_algo_order") as cancel:
+            outcome = manager.poll_live(
+                "BTCUSDT", candles=["ltf"], htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["dca_breakeven_applied"])
+        self.assertTrue(position["dca_breakeven_direction_confirmed"])
+        self.assertEqual(position["sl_price"], 94.0)  # unchanged - real (wide) SL untouched
+        new_sl.assert_not_called()
+        cancel.assert_not_called()
+
+    def test_not_confirmed_and_withhold_enabled_applies_breakeven_normally(self):
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", True), \
+             patch.object(
+                 market_structure, "structure_state",
+                 return_value={"available": True, "trend": "BEARISH"},  # disagrees with BUY
+             ), \
+             patch.object(market_structure, "exponential_moving_average", return_value=95.0), \
+             patch.object(
+                 market_structure, "analyze",
+                 return_value={"available": True, "efficiency_ratio": 0.5},
+             ), \
+             patch.object(exchange, "get_mark_price", return_value=98.02), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
+            outcome = manager.poll_live(
+                "BTCUSDT", candles=["ltf"], htf_candles=["htf"],
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertFalse(position["dca_breakeven_direction_confirmed"])
+        cancel.assert_called_once_with("BTCUSDT", "sl_new")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 98.02)
+
+    def test_missing_htf_candles_fails_safe_and_applies_breakeven(self):
+        # No htf_candles supplied (e.g. a symbol main.py's feed doesn't
+        # have HTF history for yet) - direction_still_confirmed's own
+        # fail-safe kicks in, same real-world effect as "not confirmed".
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=98.02), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
+            outcome = manager.poll_live(
+                "BTCUSDT", candles=["ltf"], htf_candles=None,
+                cvd_snapshot={"available": True, "cvd_score": 0.5},
+            )
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
+        self.assertFalse(position["dca_breakeven_direction_confirmed"])
+        cancel.assert_called_once_with("BTCUSDT", "sl_new")
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 98.02)
 
 
 if __name__ == "__main__":

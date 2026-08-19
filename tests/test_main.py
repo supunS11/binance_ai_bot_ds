@@ -936,7 +936,10 @@ class PollPositionsDispatchTests(unittest.TestCase):
 
         main._poll_positions(feed, positions)
 
-        positions.poll_live.assert_called_once_with("BTCUSDT", candles=feed.candles.get("BTCUSDT"))
+        positions.poll_live.assert_called_once_with(
+            "BTCUSDT", candles=feed.candles.get("BTCUSDT"),
+            htf_candles=feed.htf_candles.get("BTCUSDT"), cvd_snapshot=feed.cvd.snapshot("BTCUSDT"),
+        )
         positions.poll_pending_entry.assert_not_called()
         positions.poll_shadow_pending_entry.assert_not_called()
 

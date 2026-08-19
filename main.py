@@ -332,11 +332,27 @@ def _poll_positions(feed, positions):
 
             continue
 
+        # htf_candles/cvd_snapshot: cheap in-memory reads off the same
+        # feed _evaluate_symbol already uses every eval tick (no new REST
+        # calls) - only actually consumed by config.DCA_BREAKEVEN_
+        # CONFIRMATION_ENABLED's check (see PositionManager.
+        # _dca_breakeven_confirmation), a no-op for every other stage.
+        # Fetched unconditionally rather than gated on position["stage"]
+        # here, same convention as candles= above.
+        htf_candles = feed.htf_candles.get(symbol)
+        cvd_snapshot = feed.cvd.snapshot(symbol)
+
         if position["shadow"]:
             latest_candle = feed.candles.latest(symbol)
-            positions.poll_shadow(symbol, latest_candle, candles=feed.candles.get(symbol))
+            positions.poll_shadow(
+                symbol, latest_candle, candles=feed.candles.get(symbol),
+                htf_candles=htf_candles, cvd_snapshot=cvd_snapshot,
+            )
         else:
-            positions.poll_live(symbol, candles=feed.candles.get(symbol))
+            positions.poll_live(
+                symbol, candles=feed.candles.get(symbol),
+                htf_candles=htf_candles, cvd_snapshot=cvd_snapshot,
+            )
 
     # Full-fidelity snapshot for the next restart - see position_manager.
     # STATE_PATH's own comment for why this beats reconstructing from bare

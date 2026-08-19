@@ -154,6 +154,33 @@ class SignalJournalTests(unittest.TestCase):
         rows = self._read_rows()
         self.assertEqual(rows[1]["early_breakeven_applied"], "")
 
+    def test_append_outcome_writes_dca_breakeven_direction_confirmed(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome(
+            "BTCUSDT", "DCA_TP_HIT", trade_id, dca_breakeven_direction_confirmed=True,
+        )
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["dca_breakeven_direction_confirmed"], "True")
+
+    def test_append_outcome_leaves_dca_breakeven_direction_confirmed_blank_when_not_given(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome("BTCUSDT", "DCA_SL_HIT", trade_id)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["dca_breakeven_direction_confirmed"], "")
+
+    def test_append_outcome_writes_false_dca_breakeven_direction_confirmed(self):
+        # False is a real, meaningful verdict (the check ran and failed) -
+        # must not be treated the same as "never ran" (None/blank).
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome(
+            "BTCUSDT", "DCA_SL_HIT", trade_id, dca_breakeven_direction_confirmed=False,
+        )
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["dca_breakeven_direction_confirmed"], "False")
+
     def test_append_outcome_writes_break_confirmed_by_close(self):
         trade_id = signal_journal.append_signal(_signal(), _plan())
         signal_journal.append_outcome("BTCUSDT", "SL_HIT", trade_id, break_confirmed_by_close=False)

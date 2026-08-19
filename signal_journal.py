@@ -35,7 +35,7 @@ FIELDNAMES = [
     "long_short_favorable", "confluence_score", "confluence_total",
     "confluence_ratio", "quote_volume_usdt", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
     "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
-    "break_confirmed_by_close", "dca_applied", "outcome",
+    "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed", "outcome",
 ]
 
 
@@ -179,6 +179,7 @@ def append_signal(signal, plan):
 def append_outcome(
     symbol, outcome, trade_id=None, mae_r_multiple=None, mfe_r_multiple=None,
     early_breakeven_applied=None, break_confirmed_by_close=None, dca_applied=None,
+    dca_breakeven_direction_confirmed=None,
 ):
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
@@ -203,5 +204,16 @@ def append_outcome(
     # never-DCA'd outcomes directly, once enough of each accumulate.
     if dca_applied is not None:
         row["dca_applied"] = dca_applied
+
+    # config.DCA_BREAKEVEN_CONFIRMATION_ENABLED - was the trend/order-flow
+    # picture still strongly confirmed the moment a DCA_ACTIVE position
+    # reached breakeven? None (blank) means the check never ran at all
+    # (either it never reached breakeven, or the master flag was off);
+    # True/False means it ran. Lets journal_analysis.py eventually compare
+    # outcomes where this was True (would-be-withheld) against the same
+    # position's real outcome, before DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_
+    # ENABLED is ever turned on for real.
+    if dca_breakeven_direction_confirmed is not None:
+        row["dca_breakeven_direction_confirmed"] = dca_breakeven_direction_confirmed
 
     _append_row(row)

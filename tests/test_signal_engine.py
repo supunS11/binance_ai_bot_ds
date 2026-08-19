@@ -2140,5 +2140,124 @@ class LongShortFavorableTests(unittest.TestCase):
             self.assertFalse(signal_engine.long_short_favorable("SELL", 0.4))
 
 
+class DirectionStillConfirmedTests(unittest.TestCase):
+    """config.DCA_BREAKEVEN_CONFIRMATION_ENABLED - the trend/order-flow-
+    health subset of evaluate()'s own gates, reused against an ALREADY
+    OPEN position's side. Deliberately fails safe (missing/unavailable
+    data for a required check = NOT confirmed), the opposite convention
+    from evaluate()'s own gates."""
+
+    def _run(
+        self, side="BUY", htf_trend="BULLISH", htf_trend_ema=95.0, current_price=100.0,
+        cvd_score=0.5, efficiency_ratio=0.5, htf_available=True, ltf_available=True,
+        cvd_available=True, htf_freshness_enabled=True, efficiency_gate_enabled=True,
+        min_cvd=0.15, chop_threshold=0.3,
+    ):
+        htf_structure = {"available": htf_available, "trend": htf_trend}
+        ltf_analysis = {"available": ltf_available, "efficiency_ratio": efficiency_ratio}
+        cvd_snapshot = {"available": cvd_available, "cvd_score": cvd_score}
+
+        with patch.object(market_structure, "structure_state", return_value=htf_structure), \
+             patch.object(market_structure, "exponential_moving_average", return_value=htf_trend_ema), \
+             patch.object(market_structure, "analyze", return_value=ltf_analysis), \
+             patch.object(config, "HTF_TREND_FRESHNESS_ENABLED", htf_freshness_enabled), \
+             patch.object(config, "EFFICIENCY_RATIO_GATE_ENABLED", efficiency_gate_enabled), \
+             patch.object(config, "SIGNAL_MIN_CVD_SCORE", min_cvd), \
+             patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", chop_threshold):
+            return signal_engine.direction_still_confirmed(
+                side, ["htf_candle"], ["ltf_candle"], cvd_snapshot, current_price
+            )
+
+    def test_all_checks_passing_confirms(self):
+        confirmed, detail = self._run()
+
+        self.assertTrue(confirmed)
+        self.assertTrue(detail["htf_trend_agrees"])
+        self.assertTrue(detail["htf_trend_stale_agrees"])
+        self.assertTrue(detail["cvd_confirmed"])
+        self.assertTrue(detail["market_not_choppy"])
+
+    def test_htf_trend_disagreeing_fails(self):
+        confirmed, detail = self._run(htf_trend="BEARISH")
+
+        self.assertFalse(confirmed)
+        self.assertFalse(detail["htf_trend_agrees"])
+
+    def test_htf_structure_unavailable_fails_safe(self):
+        confirmed, detail = self._run(htf_available=False)
+
+        self.assertFalse(confirmed)
+        self.assertIsNone(detail["htf_trend_agrees"])
+
+    def test_htf_trend_stale_disagreeing_fails(self):
+        # BUY, but current_price already back below the HTF trend EMA.
+        confirmed, detail = self._run(current_price=90.0, htf_trend_ema=95.0)
+
+        self.assertFalse(confirmed)
+        self.assertFalse(detail["htf_trend_stale_agrees"])
+
+    def test_htf_trend_stale_check_skipped_when_freshness_disabled(self):
+        confirmed, detail = self._run(
+            current_price=90.0, htf_trend_ema=95.0, htf_freshness_enabled=False,
+        )
+
+        self.assertTrue(confirmed)
+        self.assertIsNone(detail["htf_trend_stale_agrees"])
+
+    def test_missing_htf_trend_ema_fails_safe_when_freshness_enabled(self):
+        confirmed, detail = self._run(htf_trend_ema=None)
+
+        self.assertFalse(confirmed)
+        self.assertFalse(detail["htf_trend_stale_agrees"])
+
+    def test_cvd_below_threshold_fails(self):
+        confirmed, detail = self._run(cvd_score=0.05, min_cvd=0.15)
+
+        self.assertFalse(confirmed)
+        self.assertFalse(detail["cvd_confirmed"])
+
+    def test_cvd_unavailable_fails_safe(self):
+        confirmed, detail = self._run(cvd_available=False)
+
+        self.assertFalse(confirmed)
+        self.assertFalse(detail["cvd_confirmed"])
+
+    def test_choppy_market_fails(self):
+        confirmed, detail = self._run(efficiency_ratio=0.1, chop_threshold=0.3)
+
+        self.assertFalse(confirmed)
+        self.assertFalse(detail["market_not_choppy"])
+
+    def test_choppy_check_skipped_when_gate_disabled(self):
+        confirmed, detail = self._run(
+            efficiency_ratio=0.1, chop_threshold=0.3, efficiency_gate_enabled=False,
+        )
+
+        self.assertTrue(confirmed)
+        self.assertIsNone(detail["market_not_choppy"])
+
+    def test_sell_side_mirrors_buy_for_all_checks(self):
+        confirmed, _ = self._run(
+            side="SELL", htf_trend="BEARISH", current_price=90.0, htf_trend_ema=95.0,
+            cvd_score=-0.5, min_cvd=0.15,
+        )
+
+        self.assertTrue(confirmed)
+
+    def test_missing_htf_candles_fails_safe(self):
+        confirmed, detail = signal_engine.direction_still_confirmed(
+            "BUY", None, ["ltf_candle"], {"available": True, "cvd_score": 0.5}, 100.0
+        )
+
+        self.assertFalse(confirmed)
+
+    def test_missing_ltf_candles_fails_safe(self):
+        confirmed, detail = signal_engine.direction_still_confirmed(
+            "BUY", ["htf_candle"], None, {"available": True, "cvd_score": 0.5}, 100.0
+        )
+
+        self.assertFalse(confirmed)
+
+
 if __name__ == "__main__":
     unittest.main()
