@@ -4288,6 +4288,199 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         self.assertFalse(manager.has_open_position("BTCUSDT"))
 
 
+class ReplaceDcaTpOrderTests(unittest.TestCase):
+    def _manager_with_dca_active(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        position = manager.positions["BTCUSDT"]
+        position.update({
+            "stage": DCA_ACTIVE, "sl_order_id": "sl_new", "tp_order_id": "tp_old",
+            "entry_price": 98.0, "sl_price": 94.0, "tp_price": 106.0, "quantity": 2.0,
+            "dca_applied": True,
+        })
+        return manager
+
+    def test_success_replaces_tp_order(self):
+        manager = self._manager_with_dca_active()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}) as place:
+            outcome = manager._replace_dca_tp_order(manager.positions["BTCUSDT"], 110.0)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["tp_order_id"], "tp_new")
+        self.assertEqual(position["tp_price"], 110.0)
+        cancel.assert_called_once_with("BTCUSDT", "tp_old")
+        args, kwargs = place.call_args
+        self.assertEqual(args[:3], ("BTCUSDT", "BUY", 110.0))
+        self.assertTrue(kwargs["client_algo_id"].startswith("dcaTP"))
+
+    def test_uses_the_real_exchange_order_not_a_stale_local_id(self):
+        manager = self._manager_with_dca_active()
+        real_tp = {"type": "TAKE_PROFIT_MARKET", "closePosition": True, "algoId": "real_tp_on_exchange"}
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[real_tp]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}):
+            manager._replace_dca_tp_order(manager.positions["BTCUSDT"], 110.0)
+
+        cancel.assert_called_once_with("BTCUSDT", "real_tp_on_exchange")
+
+    def test_ground_truth_check_fails_retries_without_replacing(self):
+        manager = self._manager_with_dca_active()
+
+        with patch.object(exchange, "_fetch_open_position_detail", side_effect=RuntimeError("timeout")), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_take_profit_full") as place:
+            outcome = manager._replace_dca_tp_order(manager.positions["BTCUSDT"], 110.0)
+
+        self.assertIsNone(outcome)
+        cancel.assert_not_called()
+        place.assert_not_called()
+
+    def test_already_closed_leaves_it_for_the_next_poll(self):
+        manager = self._manager_with_dca_active()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value=None):
+            outcome = manager._replace_dca_tp_order(manager.positions["BTCUSDT"], 110.0)
+
+        self.assertIsNone(outcome)
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
+    def test_minus_2021_closes_as_a_real_win_not_a_loss(self):
+        # Unlike _replace_sl_order's -2021 handling (which defaults to a
+        # LOSS-side outcome), the new target already being behind price is
+        # GOOD news on the TP side - must close as DCA_TP_HIT, not
+        # DCA_SL_HIT/BREAKEVEN_TRIGGER_MARKET_CLOSE.
+        manager = self._manager_with_dca_active()
+
+        with patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(
+                 exchange, "place_take_profit_full",
+                 side_effect=Exception("APIError(code=-2021): Order would immediately trigger."),
+             ), \
+             patch.object(exchange, "close_position_market") as market_close, \
+             patch.object(exchange, "cancel_all_open_orders"):
+            outcome = manager._replace_dca_tp_order(manager.positions["BTCUSDT"], 110.0)
+
+        self.assertEqual(outcome, "DCA_TP_HIT")
+        market_close.assert_called_once()
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+
+class MigrateDcaTargetIfNeededTests(unittest.TestCase):
+    """config.DCA_TP_STATIC_ROI_ENABLED - lets an ALREADY-open DCA_ACTIVE
+    position pick up a live config change instead of running out whatever
+    target was computed once at DCA-fire time forever."""
+
+    def _manager_with_dca_active(self, shadow=False):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": shadow,
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        position = manager.positions["BTCUSDT"]
+        position.update({
+            "stage": DCA_ACTIVE, "shadow": shadow, "sl_order_id": "sl_new", "tp_order_id": "tp_old",
+            "entry_price": 100.0, "sl_price": 94.0, "tp_price": 106.0, "quantity": 2.0,
+            "dca_applied": True,
+        })
+        return manager
+
+    def test_flag_off_is_a_noop(self):
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", False), \
+             patch.object(exchange, "place_take_profit_full") as place:
+            outcome = manager._migrate_dca_target_if_needed(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["tp_price"], 106.0)
+        place.assert_not_called()
+
+    def test_non_dca_active_stage_is_a_noop(self):
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["stage"] = "TP1_PENDING"
+
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10):
+            outcome = manager._migrate_dca_target_if_needed(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+
+    def test_already_matching_target_is_a_noop(self):
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["tp_price"] = 105.0  # already the static-ROI target
+
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "place_take_profit_full") as place:
+            outcome = manager._migrate_dca_target_if_needed(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+        place.assert_not_called()
+
+    def test_live_position_gets_replaced_via_exchange(self):
+        manager = self._manager_with_dca_active()
+
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}):
+            outcome = manager._migrate_dca_target_if_needed(manager.positions["BTCUSDT"])
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(position["tp_price"], 105.0)  # 100 * (1 + 0.5/10)
+        cancel.assert_called_once_with("BTCUSDT", "tp_old")
+
+    def test_shadow_position_updates_tp_price_directly_without_exchange_calls(self):
+        manager = self._manager_with_dca_active(shadow=True)
+
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "place_take_profit_full") as place:
+            outcome = manager._migrate_dca_target_if_needed(
+                manager.positions["BTCUSDT"], current_price=101.0,
+            )
+
+        self.assertIsNone(outcome)
+        self.assertAlmostEqual(manager.positions["BTCUSDT"]["tp_price"], 105.0)
+        place.assert_not_called()
+
+    def test_shadow_position_closes_immediately_if_price_already_passed_the_new_target(self):
+        manager = self._manager_with_dca_active(shadow=True)
+
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10):
+            outcome = manager._migrate_dca_target_if_needed(
+                manager.positions["BTCUSDT"], current_price=106.0,  # already past the new 105 target
+            )
+
+        self.assertEqual(outcome, "SHADOW_DCA_TP_HIT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+
 class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
     """config.DCA_BREAKEVEN_CONFIRMATION_ENABLED / ..._WITHHOLD_ENABLED -
     two-phase rollout: the master flag alone only computes+journals the

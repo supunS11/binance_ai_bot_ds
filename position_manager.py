@@ -1229,6 +1229,153 @@ class PositionManager:
             log_error(f"{symbol} market-close-remainder error: {exc}")
             return None
 
+    def _close_dca_remainder_as_tp_hit(self, position):
+        """The TP-side mirror of _close_remainder_at_market's -2021
+        handling - used only by _replace_dca_tp_order, when the new
+        static-ROI target has already been reached/passed by the time the
+        replacement order was attempted. Unlike _close_remainder_at_market
+        (whose default assumes an SL-side close), this is unambiguously a
+        real win - price already cleared the profit target - so it always
+        closes as DCA_TP_HIT, never guessed from profit-lock flags."""
+        symbol = position["symbol"]
+
+        try:
+            live_position = exchange._fetch_open_position_detail(symbol)
+        except Exception as exc:
+            log_error(f"{symbol} market-close position check error: {exc}")
+            return None
+
+        if live_position is None:
+            exchange.cancel_all_open_orders(symbol)
+            return self._close(symbol, "DCA_TP_HIT")
+
+        try:
+            exchange.close_position_market(
+                symbol, position["side"], live_position["quantity"]
+            )
+            exchange.cancel_all_open_orders(symbol)
+            return self._close(symbol, "DCA_TP_HIT")
+
+        except Exception as exc:
+            log_error(f"{symbol} market-close-remainder error: {exc}")
+            return None
+
+    def _replace_dca_tp_order(self, position, target_price):
+        """Ground-truth cancel/replace of the resting DCA_ACTIVE TP order -
+        same atomic-replace discipline as _replace_sl_order, mirrored for
+        the TP side. Built for _migrate_dca_target_if_needed (config.
+        DCA_TP_STATIC_ROI_ENABLED) - only ever called live (shadow
+        positions never have a real order to replace, see
+        _migrate_dca_target_if_needed's own shadow branch).
+
+        Returns an outcome string if the position closed as a side effect
+        of this call (already gone, or the new target was already reached
+        by price - see _close_dca_remainder_as_tp_hit), else None. Never
+        touches position["stage"] or anything else - purely a target-price
+        update."""
+        symbol = position["symbol"]
+
+        try:
+            live_position = exchange._fetch_open_position_detail(symbol)
+        except Exception as exc:
+            log_warning(f"{symbol} position-state check failed, retrying next poll: {exc}")
+            return None
+
+        if live_position is None:
+            log_warning(
+                f"{symbol} position already closed by the time a DCA TP "
+                f"replacement was attempted - leaving it for the next "
+                f"poll's own status check to resolve"
+            )
+            return None
+
+        try:
+            existing_tp = self._find_open_order(symbol, "TAKE_PROFIT_MARKET", close_position=True)
+
+            if existing_tp:
+                exchange.cancel_algo_order(symbol, exchange._accepted_order_id(existing_tp))
+            elif position.get("tp_order_id"):
+                exchange.cancel_algo_order(symbol, position["tp_order_id"])
+
+            new_tp_order = exchange.place_take_profit_full(
+                symbol, position["side"], target_price,
+                client_algo_id=f"{_DCA_TP_CLIENT_ALGO_ID_PREFIX}{int(time.time() * 1000)}",
+            )
+            position["tp_order_id"] = exchange._accepted_order_id(new_tp_order)
+            position["tp_price"] = target_price
+            log_info(f"{symbol} DCA TP migrated to static ROI target | TP moved to {target_price}")
+            return None
+
+        except Exception as exc:
+            if "-2021" in str(exc):
+                # The new target is already behind current price - Binance
+                # refuses to place a take-profit that would fire instantly.
+                # Unlike the SL-side equivalent, this is GOOD news (price
+                # already reached the target) - close immediately as a
+                # real win rather than leaving the position running on a
+                # stale target and retrying the same failing order.
+                log_warning(
+                    f"{symbol} new DCA TP target already reached by price - "
+                    f"closing remainder at market as a win (attempted "
+                    f"target={target_price})"
+                )
+                return self._close_dca_remainder_as_tp_hit(position)
+
+            log_error(f"{symbol} DCA TP replacement error: {exc}")
+            return None
+
+    def _migrate_dca_target_if_needed(self, position, current_price=None):
+        """config.DCA_TP_STATIC_ROI_ENABLED - a DCA_ACTIVE position's
+        tp_price is normally set once, at the moment DCA fires (risk_
+        manager.compute_dca_target), and never touched again. This lets
+        an ALREADY-open DCA_ACTIVE position pick up a live config change
+        instead of running out its original target forever - real
+        operator need (2026-08-19): flipping DCA_TP_STATIC_ROI_ENABLED,
+        or editing DCA_TP_TARGET_ROI_PCT, should apply to positions
+        already in flight, not just future DCA fires.
+
+        Self-healing and idempotent: recomputes the CURRENT target every
+        call and only replaces anything when it actually differs from
+        position["tp_price"] - a no-op once a position is already on the
+        right target (the same entry_price/side/ROI% always produce the
+        exact same float, so nothing thrashes tick to tick).
+
+        No-op entirely when DCA_TP_STATIC_ROI_ENABLED is off - the
+        structure/R-multiple target's own inputs (pools) aren't available
+        in poll_live/poll_shadow, so that path is only ever set at
+        DCA-fire time, same as always.
+
+        `current_price` (shadow only - poll_live goes through the real
+        exchange's own -2021 rejection instead) lets a shadow position
+        close immediately as a win if the new target was already passed,
+        the same real-world effect _replace_dca_tp_order's -2021 handling
+        produces live."""
+        if not config.DCA_TP_STATIC_ROI_ENABLED or position["stage"] != DCA_ACTIVE:
+            return None
+
+        target = risk_manager.price_at_roi_pct(
+            position["entry_price"], position["side"], config.DCA_TP_TARGET_ROI_PCT
+        )
+
+        if target is None or target == position.get("tp_price"):
+            return None
+
+        if not position["shadow"]:
+            return self._replace_dca_tp_order(position, target)
+
+        side = position["side"]
+
+        if current_price is not None and (
+            current_price >= target if side == "BUY" else current_price <= target
+        ):
+            return self._close(position["symbol"], "SHADOW_DCA_TP_HIT")
+
+        position["tp_price"] = target
+        log_info(
+            f"{position['symbol']} [SHADOW] DCA TP migrated to static ROI target | TP -> {target}"
+        )
+        return None
+
     @staticmethod
     def _is_dca_candidate(position):
         """Cheap, no-network pre-check for config.DCA_ENABLED - only fetch
@@ -1764,6 +1911,20 @@ class PositionManager:
             return None
 
         if position["stage"] == DCA_ACTIVE:
+            # config.DCA_TP_STATIC_ROI_ENABLED - self-heals an ALREADY-open
+            # DCA_ACTIVE position onto the current config's target instead
+            # of running out whatever was computed once at DCA-fire time
+            # forever (real operator need, 2026-08-19: flipping this flag,
+            # or editing DCA_TP_TARGET_ROI_PCT, should apply to positions
+            # already in flight too). Checked first, before profit
+            # protection below, so target_price=position["tp_price"]
+            # everywhere else in this branch already reflects the
+            # migrated value this same tick.
+            outcome = self._migrate_dca_target_if_needed(position)
+
+            if outcome is not None:
+                return outcome
+
             # config.PROFIT_PROTECTION_ENABLED - a fresh arm step, unlike
             # BREAKEVEN_ACTIVE below (which only ever TRAILS an already-
             # armed lock carried over from TP1_PENDING) - see
@@ -2242,6 +2403,17 @@ class PositionManager:
             return None
 
         if position["stage"] == DCA_ACTIVE:
+            # config.DCA_TP_STATIC_ROI_ENABLED - see poll_live's identical
+            # migration check for the full reasoning. Checked first here
+            # too, so hit_tp below already reads the migrated tp_price
+            # this same tick.
+            migrate_outcome = self._migrate_dca_target_if_needed(
+                position, current_price=latest_candle["close"]
+            )
+
+            if migrate_outcome is not None:
+                return migrate_outcome
+
             hit_sl = low <= position["sl_price"] if side == "BUY" else high >= position["sl_price"]
 
             if hit_sl:

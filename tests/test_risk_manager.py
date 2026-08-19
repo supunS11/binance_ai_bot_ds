@@ -1078,6 +1078,11 @@ class ComputeDcaSlPriceTests(unittest.TestCase):
 
 
 class ComputeDcaTargetTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_uses_dca_r_multiples_not_tp2s(self):
         with patch.object(config, "DCA_TP_R_MULTIPLE", 3.0), \
              patch.object(config, "DCA_TP_MAX_R_MULTIPLE", 6.0), \
@@ -1098,6 +1103,70 @@ class ComputeDcaTargetTests(unittest.TestCase):
             target = risk_manager.compute_dca_target(100, 95, "BUY", pools=pools)
 
         self.assertEqual(target, 112)
+
+    def test_static_roi_mode_ignores_pools_and_sl_price_entirely(self):
+        # A pool sits right at the entry price itself (would normally be
+        # rejected by _find_structure_target's own min-room floor anyway)
+        # - static ROI mode must not even look at it, or at sl_price.
+        pools = [{"type": "BUY_SIDE", "price": 100.01}]
+
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10):
+            target = risk_manager.compute_dca_target(100, sl_price=None, side="BUY", pools=pools)
+
+        # 50% ROI at 10x leverage -> 5% price move -> 105.
+        self.assertAlmostEqual(target, 105.0)
+
+    def test_static_roi_mode_mirrors_for_sell(self):
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10):
+            target = risk_manager.compute_dca_target(100, sl_price=None, side="SELL", pools=None)
+
+        self.assertAlmostEqual(target, 95.0)
+
+
+class PriceAtRoiPctTests(unittest.TestCase):
+    def test_buy_target_scales_with_roi_and_leverage(self):
+        with patch.object(config, "LEVERAGE", 10):
+            price = risk_manager.price_at_roi_pct(100, "BUY", 50)
+
+        self.assertAlmostEqual(price, 105.0)  # 50% ROI / 10x leverage = 5% price move
+
+    def test_sell_target_mirrors_buy(self):
+        with patch.object(config, "LEVERAGE", 10):
+            price = risk_manager.price_at_roi_pct(100, "SELL", 50)
+
+        self.assertAlmostEqual(price, 95.0)
+
+    def test_higher_leverage_needs_a_smaller_price_move_for_the_same_roi(self):
+        with patch.object(config, "LEVERAGE", 20):
+            price = risk_manager.price_at_roi_pct(100, "BUY", 50)
+
+        self.assertAlmostEqual(price, 102.5)  # 50% / 20x = 2.5% price move
+
+    def test_zero_roi_returns_entry_price_unchanged(self):
+        with patch.object(config, "LEVERAGE", 10):
+            price = risk_manager.price_at_roi_pct(100, "BUY", 0)
+
+        self.assertAlmostEqual(price, 100.0)
+
+    def test_negative_roi_is_clamped_to_zero(self):
+        with patch.object(config, "LEVERAGE", 10):
+            price = risk_manager.price_at_roi_pct(100, "BUY", -20)
+
+        self.assertAlmostEqual(price, 100.0)
+
+    def test_zero_entry_price_returns_none(self):
+        price = risk_manager.price_at_roi_pct(0, "BUY", 50)
+        self.assertIsNone(price)
+
+    def test_zero_leverage_returns_none(self):
+        with patch.object(config, "LEVERAGE", 0):
+            price = risk_manager.price_at_roi_pct(100, "BUY", 50)
+
+        self.assertIsNone(price)
 
 
 class BuildDcaPlanTests(unittest.TestCase):
@@ -1150,6 +1219,22 @@ class BuildDcaPlanTests(unittest.TestCase):
         self.assertAlmostEqual(
             plan["risk_distance"], abs(plan["entry_price"] - plan["sl_price"])
         )
+
+    def test_static_roi_mode_still_places_a_real_structure_sl(self):
+        # config.DCA_TP_STATIC_ROI_ENABLED only changes the TP - the first
+        # real SL this position ever gets is still structure-anchored,
+        # same as always.
+        with patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "DCA_TP_TARGET_ROI_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10):
+            plan = risk_manager.build_dca_plan(
+                original_entry_price=100, original_quantity=1.0,
+                dca_fill_price=90, dca_quantity=1.0, side="BUY", pools=[], atr=1,
+            )
+
+        self.assertAlmostEqual(plan["entry_price"], 95.0)
+        self.assertLess(plan["sl_price"], plan["entry_price"])  # unaffected, still structure-based
+        self.assertAlmostEqual(plan["tp_price"], 99.75)  # 95 * (1 + 0.5/10)
 
 
 class BuildTradePlanDcaFieldsTests(unittest.TestCase):

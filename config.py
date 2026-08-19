@@ -1088,6 +1088,20 @@ DCA_SIZE_MULTIPLIER = env_float("DCA_SIZE_MULTIPLIER", 1.0)
 # DCA_SL_HIT trades exist to check against real outcomes.
 DCA_TP_R_MULTIPLE = env_float("DCA_TP_R_MULTIPLE", 1.0)
 DCA_TP_MAX_R_MULTIPLE = env_float("DCA_TP_MAX_R_MULTIPLE", 2.5)
+# Operator-requested alternative to the real-liquidity/R-multiple target
+# above (2026-08-19, no evidence yet either way): a fixed ROI% target
+# (at LEVERAGE) computed directly from the blended post-DCA entry price -
+# "static" in that once DCA fires, this target depends only on the fill
+# price and this one number, not structure/pools/risk_distance at all.
+# See risk_manager.compute_dca_target/_price_at_roi_pct. Default False -
+# same "new mechanism earns a live default only after real data" rule
+# every other unvalidated mechanism this project ships follows.
+DCA_TP_STATIC_ROI_ENABLED = env_bool("DCA_TP_STATIC_ROI_ENABLED", "False")
+# Leveraged ROI%, same units as PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT
+# elsewhere in this file - e.g. 50 means the position's unrealized ROI (at
+# LEVERAGE) reaches 50% of margin. Starting value, not calibrated against
+# real DCA_TP_HIT/DCA_SL_HIT outcomes yet.
+DCA_TP_TARGET_ROI_PCT = env_float("DCA_TP_TARGET_ROI_PCT", 50)
 # ATR buffer beyond the structure level used for the first-ever real SL,
 # placed once DCA fires - mirrors STRUCTURE_STOP_ATR_BUFFER's own role for
 # the (unused, pre-DCA) original stop calculation.

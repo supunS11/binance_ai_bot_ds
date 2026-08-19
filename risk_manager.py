@@ -176,12 +176,45 @@ def compute_dca_sl_price(dca_fill_price, side, pools, atr=0):
     return _apply_min_stop_distance(sl_price, dca_fill_price, side, atr=atr)
 
 
+def price_at_roi_pct(entry_price, side, roi_pct):
+    """Price at which unrealized ROI (at LEVERAGE) equals roi_pct% of
+    margin - same underlying relationship _roi_pct/_price_at_tp1_roi_
+    fraction already use elsewhere (profit protection), but against an
+    ABSOLUTE target instead of a fraction of TP1's own ROI. Built for
+    config.DCA_TP_STATIC_ROI_ENABLED - see compute_dca_target. None if
+    entry_price/LEVERAGE aren't usable, same as its sibling."""
+    if entry_price <= 0:
+        return None
+
+    leverage = max(float(config.LEVERAGE), 0)
+
+    if leverage <= 0:
+        return None
+
+    distance = (max(float(roi_pct), 0) / 100) / leverage * entry_price
+    return entry_price + distance if side == "BUY" else entry_price - distance
+
+
 def compute_dca_target(new_entry_price, sl_price, side, pools):
     """The single post-DCA take-profit target that replaces TP1+TP2 once
-    a DCA has fired - same real-liquidity-first, R-multiple-floor
-    fallback shape as compute_targets (config.DCA_TP_R_MULTIPLE/
-    DCA_TP_MAX_R_MULTIPLE instead of TP1/TP2's own multiples), scaled
-    against the NEW (post-DCA) risk distance."""
+    a DCA has fired.
+
+    config.DCA_TP_STATIC_ROI_ENABLED - operator-requested alternative
+    (2026-08-19, no evidence yet either way - default False, same "new
+    mechanism earns a live default only after real data" convention as
+    DCA_BREAKEVEN_CONFIRMATION_ENABLED): a fixed ROI% target
+    (config.DCA_TP_TARGET_ROI_PCT) computed directly from the blended
+    post-DCA entry price, completely independent of structure/liquidity
+    pools or the R-multiple floor/cap below - "static" in the sense that
+    once a DCA fires, this target is fully determined by the fill price
+    and a config number alone, nothing else. Off (default): unchanged
+    real-liquidity-first, R-multiple-floor fallback shape compute_targets
+    already uses (config.DCA_TP_R_MULTIPLE/DCA_TP_MAX_R_MULTIPLE instead
+    of TP1/TP2's own multiples), scaled against the NEW (post-DCA) risk
+    distance."""
+    if config.DCA_TP_STATIC_ROI_ENABLED:
+        return price_at_roi_pct(new_entry_price, side, config.DCA_TP_TARGET_ROI_PCT)
+
     risk_distance = abs(new_entry_price - sl_price)
 
     if risk_distance <= 0:
