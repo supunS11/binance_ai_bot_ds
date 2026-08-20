@@ -834,6 +834,10 @@ class PositionManager:
             "dca_applied": True,
             "dca_breakeven_applied": False,
             "dca_breakeven_direction_confirmed": None,
+            # config.DCA_PRESSURE_CHECK_ENABLED - no record of what the
+            # check found (if it even ran) survives a restart, same
+            # honesty policy as dca_breakeven_direction_confirmed above.
+            "dca_pressure_confirmed": None,
             "atr": None,
         }
 
@@ -1060,6 +1064,7 @@ class PositionManager:
                 break_confirmed_by_close=position.get("break_confirmed_by_close"),
                 dca_applied=position.get("dca_applied", False),
                 dca_breakeven_direction_confirmed=position.get("dca_breakeven_direction_confirmed"),
+                dca_pressure_confirmed=position.get("dca_pressure_confirmed"),
             )
 
         return outcome
@@ -1512,7 +1517,7 @@ class PositionManager:
         dca_price = position["dca_price"]
         return current_price <= dca_price if side == "BUY" else current_price >= dca_price
 
-    def _execute_dca(self, position, candles=None):
+    def _execute_dca(self, position, candles=None, htf_candles=None, cvd_snapshot=None, current_price=None):
         """config.DCA_ENABLED - price reached position["dca_price"]
         before TP1 ever filled. Adds position["dca_quantity"] at that
         level, computes the blended entry / first-ever-real-SL / single-
@@ -1530,6 +1535,12 @@ class PositionManager:
         math - shadow mode has no real order to resolve, so it keeps
         trusting the planned trigger price exactly as before.
 
+        config.DCA_PRESSURE_CHECK_ENABLED - `htf_candles`/`cvd_snapshot`/
+        `current_price` (see config.py's comment for what this checks and
+        why it adjusts size/stop rather than delaying the fire itself) are
+        only used when that flag is on; a no-op without it, same
+        convention as every other optional-data parameter in this class.
+
         Returns a close-outcome string only if the post-DCA SL placement
         failed badly enough to force closing the position; otherwise
         None (including the ordinary case where DCA succeeded and the
@@ -1538,10 +1549,31 @@ class PositionManager:
         side = position["side"]
         shadow = position["shadow"]
         dca_fill_price = position["dca_price"]
+        dca_quantity = position["dca_quantity"]
+        buffer_atr_multiple = None
+        pressure_confirmed = None
+        pressure_detail = None
+
+        if config.DCA_PRESSURE_CHECK_ENABLED:
+            pressure_confirmed, pressure_detail = signal_engine.direction_still_confirmed(
+                side, htf_candles, candles, cvd_snapshot, current_price
+            )
+
+            if not pressure_confirmed:
+                dca_quantity = round(
+                    position["quantity"] * max(float(config.DCA_PRESSURE_SIZE_MULTIPLIER), 0), 8
+                )
+                buffer_atr_multiple = max(float(config.DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER), 0)
+                log_info(
+                    f"{symbol}{' [SHADOW]' if shadow else ''} DCA pressure check: not "
+                    f"confirmed - reduced size ({dca_quantity}) and tighter stop | {pressure_detail}"
+                )
+
+        position["dca_pressure_confirmed"] = pressure_confirmed
 
         if not shadow:
             try:
-                dca_order = exchange.place_market_order(symbol, side, position["dca_quantity"])
+                dca_order = exchange.place_market_order(symbol, side, dca_quantity)
             except Exception as exc:
                 log_error(f"{symbol} DCA order error: {exc}")
                 return None  # retry next poll - not worse off than before
@@ -1556,8 +1588,8 @@ class PositionManager:
         )
         plan = risk_manager.build_dca_plan(
             position["entry_price"], position["quantity"],
-            dca_fill_price, position["dca_quantity"], side, pools,
-            atr=position.get("atr"),
+            dca_fill_price, dca_quantity, side, pools,
+            atr=position.get("atr"), buffer_atr_multiple=buffer_atr_multiple,
         )
 
         if plan is None:
@@ -1981,8 +2013,8 @@ class PositionManager:
         early-breakeven lock and post-TP1 trailing stop - both are no-ops
         when it's not supplied. `htf_candles`/`cvd_snapshot` are only used
         by config.DCA_BREAKEVEN_CONFIRMATION_ENABLED (see
-        _dca_breakeven_confirmation) - also a no-op without them, same
-        convention."""
+        _dca_breakeven_confirmation) and config.DCA_PRESSURE_CHECK_ENABLED
+        (see _execute_dca) - also a no-op without them, same convention."""
         position = self.positions.get(symbol)
 
         if not position or position["shadow"]:
@@ -2030,7 +2062,10 @@ class PositionManager:
             # here since both are mark-price-threshold checks rather than
             # real order-fill status.
             if dca_candidate and self._dca_price_reached(position, current_price):
-                return self._execute_dca(position, candles=candles)
+                return self._execute_dca(
+                    position, candles=candles, htf_candles=htf_candles,
+                    cvd_snapshot=cvd_snapshot, current_price=current_price,
+                )
 
             if self._try_early_promotions(
                 position, current_price, candles, profit_protection_candidate, early_breakeven_candidate,
@@ -2540,7 +2575,7 @@ class PositionManager:
         structure-aware early-breakeven lock and post-TP1 trailing - both
         are no-ops when it's not supplied. `htf_candles`/`cvd_snapshot` -
         see poll_live's own docstring, same DCA_BREAKEVEN_CONFIRMATION_
-        ENABLED no-op convention."""
+        ENABLED/DCA_PRESSURE_CHECK_ENABLED no-op convention."""
         position = self.positions.get(symbol)
 
         if not position or not position["shadow"] or not latest_candle:
@@ -2592,7 +2627,10 @@ class PositionManager:
                 touched_dca = low <= dca_price if side == "BUY" else high >= dca_price
 
                 if touched_dca:
-                    return self._execute_dca(position, candles=candles)
+                    return self._execute_dca(
+                        position, candles=candles, htf_candles=htf_candles,
+                        cvd_snapshot=cvd_snapshot, current_price=latest_candle["close"],
+                    )
 
             if self._try_early_promotions_shadow(position, latest_candle, candles):
                 return None

@@ -9,6 +9,7 @@ import config
 import exchange
 import market_structure
 import risk_manager
+import signal_engine
 from position_manager import (
     BREAKEVEN_ACTIVE, DCA_ACTIVE, DCA_PENDING, PENDING_LIMIT_FILL, TP1_PENDING,
     PositionManager, _more_favorable, _order_type, _structure_stop_candidate,
@@ -706,6 +707,9 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertIsNone(position["tp1_price"])
         self.assertIsNone(position["tp2_price"])
         self.assertTrue(position["single_tp"])
+        # config.DCA_PRESSURE_CHECK_ENABLED - no record of the check
+        # survives a restart, same honesty policy as risk_distance above.
+        self.assertIsNone(position["dca_pressure_confirmed"])
 
     def test_same_shape_without_the_tag_is_not_treated_as_dca_active(self):
         # An ordinary post-TP1 BREAKEVEN_ACTIVE position (SL already
@@ -876,6 +880,27 @@ class RegisterTests(unittest.TestCase):
 
         _, kwargs = append_outcome.call_args
         self.assertEqual(kwargs["early_breakeven_applied"], True)
+
+    def test_close_reports_dca_pressure_confirmed_when_the_check_ran(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True}, trade_id="BTCUSDT_123456")
+        manager.positions["BTCUSDT"]["dca_pressure_confirmed"] = False
+
+        with patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            manager._close("BTCUSDT", "SHADOW_SL_HIT")
+
+        _, kwargs = append_outcome.call_args
+        self.assertEqual(kwargs["dca_pressure_confirmed"], False)
+
+    def test_close_reports_dca_pressure_confirmed_as_none_when_it_never_ran(self):
+        manager = PositionManager()
+        manager.register(_plan(), {"shadow": True}, trade_id="BTCUSDT_123456")
+
+        with patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            manager._close("BTCUSDT", "SHADOW_SL_HIT")
+
+        _, kwargs = append_outcome.call_args
+        self.assertIsNone(kwargs["dca_pressure_confirmed"])
 
     def test_live_registration_extracts_order_ids(self):
         manager = PositionManager()
@@ -3561,7 +3586,8 @@ class ExecuteDcaLiveTests(unittest.TestCase):
         # The real fill price (96, from avgPrice) - not the planned
         # dca_price trigger - is what gets passed into build_dca_plan.
         build_plan.assert_called_once_with(
-            original_entry, original_quantity, 96.0, 1.0, "BUY", None, atr=original_atr,
+            original_entry, original_quantity, 96.0, 1.0, "BUY", None,
+            atr=original_atr, buffer_atr_multiple=None,
         )
         self.assertEqual(cancel.call_count, 2)  # old TP1 + old TP2
         # Both the price/side args AND the clientAlgoId tag (see
@@ -3632,6 +3658,98 @@ class ExecuteDcaLiveTests(unittest.TestCase):
         build_plan.assert_not_called()
 
 
+class ExecuteDcaPressureCheckTests(unittest.TestCase):
+    """config.DCA_PRESSURE_CHECK_ENABLED - at the instant DCA fires,
+    reuses signal_engine.direction_still_confirmed (against the
+    position's own side) to decide whether this fire commits the normal
+    DCA_SIZE_MULTIPLIER/DCA_STRUCTURE_STOP_ATR_BUFFER (confirmed - order
+    flow still favors the original side) or a reduced size at a tighter
+    stop (not confirmed - order flow has turned against it too). Never
+    delays the fire itself - see config.py's comment for why."""
+
+    def setUp(self):
+        for name, value in (
+            ("DCA_PRESSURE_SIZE_MULTIPLIER", 0.5),
+            ("DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER", 0.25),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _manager_with_dca_pending(self):
+        manager = PositionManager()
+        manager.register_dca_pending(_dca_plan(), {"shadow": True})
+        return manager
+
+    def test_master_flag_off_never_calls_the_confirmation_check(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", False), \
+             patch.object(signal_engine, "direction_still_confirmed") as confirmed_check, \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            manager._execute_dca(position)
+
+        confirmed_check.assert_not_called()
+        self.assertIsNone(position["dca_pressure_confirmed"])
+        build_plan.assert_called_once_with(
+            100, 1.0, 96, 1.0, "BUY", None, atr=1.0, buffer_atr_multiple=None,
+        )
+
+    def test_confirmed_keeps_the_full_size_and_normal_buffer(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            manager._execute_dca(position, htf_candles=["htf"], cvd_snapshot={}, current_price=96)
+
+        self.assertTrue(position["dca_pressure_confirmed"])
+        build_plan.assert_called_once_with(
+            100, 1.0, 96, 1.0, "BUY", None, atr=1.0, buffer_atr_multiple=None,
+        )
+
+    def test_not_confirmed_reduces_size_and_tightens_the_buffer(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(False, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            manager._execute_dca(position, htf_candles=["htf"], cvd_snapshot={}, current_price=96)
+
+        self.assertFalse(position["dca_pressure_confirmed"])
+        # position["quantity"] (1.0) * DCA_PRESSURE_SIZE_MULTIPLIER (0.5),
+        # not the plan's own dca_quantity (also 1.0 here, but a different
+        # source - see config.py's comment on why these differ).
+        build_plan.assert_called_once_with(
+            100, 1.0, 96, 0.5, "BUY", None, atr=1.0, buffer_atr_multiple=0.25,
+        )
+
+    def test_not_confirmed_uses_the_reduced_quantity_for_the_real_dca_order(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(False, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}) as market_order, \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}):
+            manager._execute_dca(position, htf_candles=["htf"], cvd_snapshot={}, current_price=96)
+
+        market_order.assert_called_once_with("BTCUSDT", "BUY", 0.5)  # reduced, not the plan's 1.0
+
+
 class PollShadowDcaPendingTests(unittest.TestCase):
     def setUp(self):
         # PROFIT_PROTECTION_ENABLED/EARLY_BREAKEVEN_ENABLED now correctly
@@ -3662,6 +3780,21 @@ class PollShadowDcaPendingTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_dca_fire_passes_htf_candles_cvd_snapshot_and_candle_close_through(self):
+        # config.DCA_PRESSURE_CHECK_ENABLED - shadow mode has no real mark
+        # price, so it uses the candle's own close, same convention
+        # _dca_breakeven_confirmation's shadow call site already uses.
+        manager = self._manager_with_dca_pending()
+        candle = _candle(high=100, low=95, close=97)  # touches dca_price=96
+        cvd_snapshot = {"available": True, "cvd_score": 0.5}
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})) as confirmed_check:
+            manager.poll_shadow("BTCUSDT", candle, htf_candles=["htf"], cvd_snapshot=cvd_snapshot)
+
+        confirmed_check.assert_called_once_with("BUY", ["htf"], None, cvd_snapshot, 97)
 
     def test_tp1_fires_when_dca_price_not_reached(self):
         # Real profit lock now, not flat breakeven - same 100.6 math as
@@ -4127,6 +4260,26 @@ class PollLiveDcaPendingTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_dca_fire_passes_htf_candles_cvd_snapshot_and_current_price_through(self):
+        # config.DCA_PRESSURE_CHECK_ENABLED - poll_live must forward the
+        # same htf_candles/cvd_snapshot/current_price it already has this
+        # tick into _execute_dca rather than an extra fetch.
+        manager = self._manager_with_dca_pending()
+        cvd_snapshot = {"available": True, "cvd_score": 0.5}
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})) as confirmed_check:
+            manager.poll_live("BTCUSDT", htf_candles=["htf"], cvd_snapshot=cvd_snapshot)
+
+        confirmed_check.assert_called_once_with("BUY", ["htf"], None, cvd_snapshot, 95.0)
 
     def test_tp1_finished_promotes_normally_without_dca(self):
         manager = self._manager_with_dca_pending()

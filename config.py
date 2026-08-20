@@ -1122,6 +1122,53 @@ DCA_TP_TARGET_ROI_PCT = env_float("DCA_TP_TARGET_ROI_PCT", 50)
 # placed once DCA fires - mirrors STRUCTURE_STOP_ATR_BUFFER's own role for
 # the (unused, pre-DCA) original stop calculation.
 DCA_STRUCTURE_STOP_ATR_BUFFER = env_float("DCA_STRUCTURE_STOP_ATR_BUFFER", 0.5)
+# Operator request (2026-08-20, motivated by a real trade - LITUSDT,
+# 2026-08-19: DCA fired while price was still running hard in the
+# adverse direction with zero sign of turning, then hit its post-DCA SL
+# ~2 minutes later): "avoid triggering DCA until buy/sell pressure turns
+# in the right direction... otherwise there's no point doing DCA."
+#
+# Real constraint this project's whole no-SL-before-DCA design imposes:
+# DCA_PENDING has NO resting stop at all until DCA fires - delaying the
+# fire itself would leave the position naked for LONGER, precisely while
+# price is already past the level that currently triggers protection.
+# That's a worse trade than the one being complained about, not a
+# better one - so this does NOT delay when DCA fires. DCA still executes
+# the instant dca_price is touched, exactly as before; the first real SL
+# still arrives on schedule every time.
+#
+# Instead this checks signal_engine.direction_still_confirmed (the same
+# HTF-trend/CVD/efficiency-ratio primitive DCA_BREAKEVEN_CONFIRMATION_
+# ENABLED already reuses, here against the position's OWN side) at the
+# instant DCA fires, and uses the read to size the RESPONSE rather than
+# the timing: confirmed (order flow still favors the original side
+# despite the adverse price move - looks like a pullback, not a genuine
+# reversal) keeps today's unchanged behavior (DCA_SIZE_MULTIPLIER,
+# DCA_STRUCTURE_STOP_ATR_BUFFER). Not confirmed (order flow has turned
+# against the original side too - the adverse move looks real, not
+# noise) commits LESS size (DCA_PRESSURE_SIZE_MULTIPLIER) at a TIGHTER
+# stop (DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER) instead - smaller loss if
+# wrong again, same protection timing either way.
+#
+# Can only ever make a DCA fire MORE conservative than today, never less
+# (the confirmed branch is identical to current behavior) - unlike
+# DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED, this can't leave a
+# position less protected than it already is. Still defaults False: new,
+# untested logic touching real order sizing/placement, no DCA_TP_HIT/
+# DCA_SL_HIT evidence yet on whether the confirmed/not-confirmed split
+# actually discriminates real outcomes - same "earns a live default only
+# after real data" rule as every other unvalidated mechanism here.
+DCA_PRESSURE_CHECK_ENABLED = env_bool("DCA_PRESSURE_CHECK_ENABLED", "False")
+# Applied instead of DCA_SIZE_MULTIPLIER for this one fire when the
+# pressure check above comes back NOT confirmed. 0.5 = half the usual
+# DCA size - a starting, uncalibrated value, not derived from evidence.
+DCA_PRESSURE_SIZE_MULTIPLIER = env_float("DCA_PRESSURE_SIZE_MULTIPLIER", 0.5)
+# Applied instead of DCA_STRUCTURE_STOP_ATR_BUFFER for this one fire
+# under the same not-confirmed condition - a smaller buffer beyond the
+# post-DCA structure level, same "less room, smaller loss if wrong
+# again" reasoning as the size cut above. Starting value (half of
+# DCA_STRUCTURE_STOP_ATR_BUFFER's own 0.5 default), not calibrated.
+DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER = env_float("DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER", 0.25)
 # Real gap found live (2026-08-17, operator observation): a DCA_ACTIVE
 # position's only two protection mechanisms are PROFIT_PROTECTION_ENABLED
 # (needs PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 of the way to the single,

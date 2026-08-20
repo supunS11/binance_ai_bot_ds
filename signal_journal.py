@@ -35,7 +35,8 @@ FIELDNAMES = [
     "long_short_favorable", "confluence_score", "confluence_total",
     "confluence_ratio", "quote_volume_usdt", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
     "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
-    "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed", "outcome",
+    "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed",
+    "dca_pressure_confirmed", "outcome",
 ]
 
 
@@ -191,7 +192,7 @@ def append_signal(signal, plan):
 def append_outcome(
     symbol, outcome, trade_id=None, mae_r_multiple=None, mfe_r_multiple=None,
     early_breakeven_applied=None, break_confirmed_by_close=None, dca_applied=None,
-    dca_breakeven_direction_confirmed=None,
+    dca_breakeven_direction_confirmed=None, dca_pressure_confirmed=None,
 ):
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
@@ -227,5 +228,14 @@ def append_outcome(
     # ENABLED is ever turned on for real.
     if dca_breakeven_direction_confirmed is not None:
         row["dca_breakeven_direction_confirmed"] = dca_breakeven_direction_confirmed
+
+    # config.DCA_PRESSURE_CHECK_ENABLED - was order flow still confirmed
+    # in the position's own favor at the instant DCA actually fired? None
+    # (blank) means either the trade never DCA'd or the master flag was
+    # off; True/False means the check ran. Lets journal_analysis.py
+    # eventually compare not-confirmed (reduced-size/tighter-stop) fires
+    # against confirmed (unchanged) ones once enough of each exist.
+    if dca_pressure_confirmed is not None:
+        row["dca_pressure_confirmed"] = dca_pressure_confirmed
 
     _append_row(row)

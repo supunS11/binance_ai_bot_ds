@@ -564,10 +564,20 @@ class BuildTradePlanTests(unittest.TestCase):
         self.extension_patcher.start()
         self.sl_roi_patcher = patch.object(config, "MAX_SL_ROI_PCT", 0)
         self.sl_roi_patcher.start()
+        # config.TP_STATIC_ROI_ENABLED - these tests predate the single-TP
+        # feature and assert the ordinary tp1_price/tp2_price split; pinned
+        # off here so a real .env flip to True (the operator's own live
+        # setting) can't silently switch this whole class onto the
+        # single-tp_price shape out from under them. The static-roi tests
+        # further down turn it back on locally, same pattern already used
+        # for MAX_ENTRY_EXTENSION_R/MAX_SL_ROI_PCT above.
+        self.static_roi_patcher = patch.object(config, "TP_STATIC_ROI_ENABLED", False)
+        self.static_roi_patcher.start()
 
     def tearDown(self):
         self.extension_patcher.stop()
         self.sl_roi_patcher.stop()
+        self.static_roi_patcher.stop()
 
     def _signal(self, side="BUY", entry_price=100, structure_level=98, atr=1):
         return {
@@ -1133,6 +1143,25 @@ class ComputeDcaSlPriceTests(unittest.TestCase):
 
         self.assertEqual(sl, 91.0)  # 95 - 2*2 (fallback), no buffer
 
+    def test_buffer_atr_multiple_override_replaces_the_config_default(self):
+        # config.DCA_PRESSURE_CHECK_ENABLED - a not-confirmed DCA fire
+        # passes a tighter buffer_atr_multiple explicitly; it must win
+        # over config.DCA_STRUCTURE_STOP_ATR_BUFFER, not add to it.
+        pools = [{"type": "SELL_SIDE", "price": 90}]
+
+        with patch.object(config, "DCA_STRUCTURE_STOP_ATR_BUFFER", 0.5):
+            sl = risk_manager.compute_dca_sl_price(95, "BUY", pools, atr=2, buffer_atr_multiple=0.25)
+
+        self.assertEqual(sl, 89.5)  # 90 - (2 * 0.25), not the config's 0.5
+
+    def test_buffer_atr_multiple_none_falls_back_to_config_default(self):
+        pools = [{"type": "SELL_SIDE", "price": 90}]
+
+        with patch.object(config, "DCA_STRUCTURE_STOP_ATR_BUFFER", 0.5):
+            sl = risk_manager.compute_dca_sl_price(95, "BUY", pools, atr=2, buffer_atr_multiple=None)
+
+        self.assertEqual(sl, 89.0)  # unchanged from the plain default-buffer test above
+
 
 class ComputeDcaTargetTests(unittest.TestCase):
     def setUp(self):
@@ -1292,6 +1321,25 @@ class BuildDcaPlanTests(unittest.TestCase):
         self.assertAlmostEqual(plan["entry_price"], 95.0)
         self.assertLess(plan["sl_price"], plan["entry_price"])  # unaffected, still structure-based
         self.assertAlmostEqual(plan["tp_price"], 99.75)  # 95 * (1 + 0.5/10)
+
+    def test_buffer_atr_multiple_override_passes_through_to_the_sl(self):
+        # config.DCA_PRESSURE_CHECK_ENABLED - position_manager._execute_dca
+        # passes a tighter buffer_atr_multiple for a not-confirmed fire;
+        # build_dca_plan must forward it to compute_dca_sl_price rather
+        # than always using config.DCA_STRUCTURE_STOP_ATR_BUFFER.
+        with patch.object(config, "DCA_STRUCTURE_STOP_ATR_BUFFER", 2.0):
+            wide_plan = risk_manager.build_dca_plan(
+                original_entry_price=100, original_quantity=1.0,
+                dca_fill_price=90, dca_quantity=1.0, side="BUY", pools=[], atr=1,
+            )
+            tight_plan = risk_manager.build_dca_plan(
+                original_entry_price=100, original_quantity=1.0,
+                dca_fill_price=90, dca_quantity=1.0, side="BUY", pools=[], atr=1,
+                buffer_atr_multiple=0.25,
+            )
+
+        self.assertLess(wide_plan["sl_price"], tight_plan["sl_price"])
+        self.assertGreater(wide_plan["risk_distance"], tight_plan["risk_distance"])
 
 
 class BuildTradePlanDcaFieldsTests(unittest.TestCase):

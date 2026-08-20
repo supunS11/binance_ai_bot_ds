@@ -159,19 +159,27 @@ def compute_dca_price(entry_price, side, pools, atr=0):
     return _apply_min_stop_distance(level, entry_price, side, atr=atr)
 
 
-def compute_dca_sl_price(dca_fill_price, side, pools, atr=0):
+def compute_dca_sl_price(dca_fill_price, side, pools, atr=0, buffer_atr_multiple=None):
     """The first real SL this position ever gets, placed the moment DCA
     fires - anchored to the next real structure level BEYOND the DCA fill
     itself (one level further in the adverse direction than dca_price
     was from the original entry), same ATR-buffer/min-distance shape
-    compute_stop_loss uses for the ordinary (here, never-placed) stop."""
+    compute_stop_loss uses for the ordinary (here, never-placed) stop.
+
+    `buffer_atr_multiple` overrides config.DCA_STRUCTURE_STOP_ATR_BUFFER
+    when given - config.DCA_PRESSURE_CHECK_ENABLED passes
+    DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER here for a DCA firing while order
+    flow still looks unconfirmed, in place of the normal buffer."""
     level = _find_dca_level(pools, dca_fill_price, side)
 
     if level is None:
         distance = _dca_fallback_distance(atr)
         level = dca_fill_price - distance if side == "BUY" else dca_fill_price + distance
 
-    buffer = float(atr or 0) * max(float(config.DCA_STRUCTURE_STOP_ATR_BUFFER), 0)
+    buffer_multiple = (
+        config.DCA_STRUCTURE_STOP_ATR_BUFFER if buffer_atr_multiple is None else buffer_atr_multiple
+    )
+    buffer = float(atr or 0) * max(float(buffer_multiple), 0)
     sl_price = level - buffer if side == "BUY" else level + buffer
     return _apply_min_stop_distance(sl_price, dca_fill_price, side, atr=atr)
 
@@ -225,7 +233,10 @@ def compute_dca_target(new_entry_price, sl_price, side, pools):
     return _resolve_target(pools, new_entry_price, side, tp_min, tp_max, risk_distance)
 
 
-def build_dca_plan(original_entry_price, original_quantity, dca_fill_price, dca_quantity, side, pools, atr=0):
+def build_dca_plan(
+    original_entry_price, original_quantity, dca_fill_price, dca_quantity, side, pools,
+    atr=0, buffer_atr_multiple=None,
+):
     """Everything position_manager._execute_dca needs once a real DCA
     fill is confirmed: the blended entry price (quantity-weighted average
     of the two fills - the real average cost basis regardless of
@@ -233,7 +244,9 @@ def build_dca_plan(original_entry_price, original_quantity, dca_fill_price, dca_
     the single TP that replaces TP1+TP2. Returns None if any leg can't be
     computed (mirrors build_trade_plan's own None-on-failure shape) -
     callers must treat that as "DCA fill happened but can't be protected
-    yet, retry or escalate", never as "skip protection"."""
+    yet, retry or escalate", never as "skip protection".
+
+    `buffer_atr_multiple` - see compute_dca_sl_price."""
     total_quantity = original_quantity + dca_quantity
 
     if total_quantity <= 0:
@@ -243,7 +256,9 @@ def build_dca_plan(original_entry_price, original_quantity, dca_fill_price, dca_
         original_entry_price * original_quantity + dca_fill_price * dca_quantity
     ) / total_quantity
 
-    sl_price = compute_dca_sl_price(dca_fill_price, side, pools, atr=atr)
+    sl_price = compute_dca_sl_price(
+        dca_fill_price, side, pools, atr=atr, buffer_atr_multiple=buffer_atr_multiple
+    )
 
     if sl_price is None or sl_price <= 0:
         return None
