@@ -38,13 +38,25 @@ LOSS_OUTCOMES = {
     # as LIMIT_FILL_SL_PLACEMENT_FAILED above, just for the DCA path
     # (position_manager._execute_dca).
     "DCA_SL_HIT", "SHADOW_DCA_SL_HIT", "DCA_SL_PLACEMENT_FAILED",
+    # config.RETRACEMENT_ENTRY_ENABLED - the retracement (or its market
+    # fallback) filled, but SL placement then failed and the filled
+    # quantity was emergency-closed at market (position_manager.
+    # _finalize_retracement_entry) - same "emergency exit, counted as a
+    # loss rather than left unclassified" treatment as LIMIT_FILL_SL_
+    # PLACEMENT_FAILED/DCA_SL_PLACEMENT_FAILED above.
+    "RETRACEMENT_SL_PLACEMENT_FAILED",
 }
 # LIMIT_INVALIDATED_UNFILLED/LIMIT_EXPIRED_UNFILLED (config.LIMIT_ENTRY_MODE_ENABLED)
-# are deliberately NOT in any of the three sets below - a limit entry that
-# never filled has zero real P&L, so it falls through to classify()'s
-# UNKNOWN rather than pollute WIN/LOSS/BREAKEVEN stats. They still count
-# in `resolved` (outcome is non-empty) so fill-rate can be measured via
-# the outcome breakdown even though they're not a win/loss/breakeven.
+# and RETRACEMENT_INVALIDATED_UNFILLED/SHADOW_RETRACEMENT_INVALIDATED_UNFILLED
+# (config.RETRACEMENT_ENTRY_ENABLED) are deliberately NOT in any of the
+# three sets below - an entry that never filled has zero real P&L, so it
+# falls through to classify()'s UNKNOWN rather than pollute WIN/LOSS/
+# BREAKEVEN stats. They still count in `resolved` (outcome is non-empty)
+# so fill-rate can be measured via the outcome breakdown even though
+# they're not a win/loss/breakeven. RETRACEMENT_ENTRY_ENABLED's own market
+# fallback means these can ONLY happen via a genuine pre-fill invalidation
+# (price already reached the stop before the limit ever touched) - never
+# a plain unfilled expiry, unlike the LIMIT_ENTRY_MODE_ENABLED pair.
 BREAKEVEN_OUTCOMES = {
     "BREAKEVEN_STOP_HIT", "SHADOW_BREAKEVEN_STOP_HIT",
     "BREAKEVEN_TRIGGER_MARKET_CLOSE",

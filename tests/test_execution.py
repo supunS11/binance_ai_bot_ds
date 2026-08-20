@@ -247,6 +247,66 @@ class EnterTradeLimitLiveModeTests(unittest.TestCase):
         self.assertIn("boom", result["error"])
 
 
+class EnterTradeRetracementShadowModeTests(unittest.TestCase):
+    def test_shadow_mode_places_no_real_orders(self):
+        with patch.object(config, "EXECUTION_MODE", "SHADOW"), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            result = execution.enter_trade_retracement(_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["shadow"])
+        self.assertIsNone(result["entry_order"])
+        self.assertAlmostEqual(result["retracement_price"], 99.8)  # 100 - 0.1*(100-98)
+        limit_order.assert_not_called()
+
+
+class EnterTradeRetracementLiveModeTests(unittest.TestCase):
+    """config.RETRACEMENT_ENTRY_ENABLED - structurally identical to
+    enter_trade_limit's LIVE path (nothing is filled yet, no SL/TP1/TP2
+    here - position_manager.poll_retracement_pending resolves the fill
+    or its bounded market fallback later), just resting at a computed
+    retracement price instead of the raw plan["entry_price"]."""
+
+    def test_live_mode_places_only_the_retracement_limit_order(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}) as limit_order, \
+             patch.object(exchange, "place_stop_loss") as stop_loss, \
+             patch.object(exchange, "place_take_profit_partial") as tp1, \
+             patch.object(exchange, "place_take_profit_full") as tp2:
+            result = execution.enter_trade_retracement(_plan())
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["shadow"])
+        self.assertIsNotNone(result["entry_order"])
+        self.assertAlmostEqual(result["retracement_price"], 99.8)
+        limit_order.assert_called_once_with("BTCUSDT", "BUY", 1.0, 99.8)
+        stop_loss.assert_not_called()
+        tp1.assert_not_called()
+        tp2.assert_not_called()
+
+    def test_leverage_failure_aborts_before_any_entry_attempt(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=False), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            result = execution.enter_trade_retracement(_plan())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("leverage", result["error"])
+        limit_order.assert_not_called()
+
+    def test_entry_order_failure_returns_not_ok(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", side_effect=RuntimeError("boom")):
+            result = execution.enter_trade_retracement(_plan())
+
+        self.assertFalse(result["ok"])
+        self.assertIn("boom", result["error"])
+
+
 def _dca_plan():
     return dict(_plan(), dca_price=96)
 
@@ -377,6 +437,110 @@ class EnterTradeDcaPendingSingleTpTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIsNone(result["tp_order"])
+
+
+class PlaceProtectionOrdersTests(unittest.TestCase):
+    """SL+TP1+TP2 placement, extracted out of enter_trade's tail so
+    config.RETRACEMENT_ENTRY_ENABLED's settle path (position_manager.
+    _finalize_retracement_entry) can place the exact same protection for
+    a fill that already happened, without a second entry order. enter_trade
+    itself already exercises this end-to-end (EnterTradeLiveModeTests) -
+    these cover it directly, including a settled quantity that differs
+    from the plan's own (the whole reason this needed extracting)."""
+
+    def test_places_sl_then_tp1_tp2(self):
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}) as sl, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}) as tp1, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp2:
+            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+                "BTCUSDT", "BUY", _plan()
+            )
+
+        self.assertIsNone(error)
+        sl.assert_called_once_with("BTCUSDT", "BUY", 98)
+        tp1.assert_called_once_with("BTCUSDT", "BUY", 0.5, 102)
+        tp2.assert_called_once_with("BTCUSDT", "BUY", 104)
+        self.assertEqual(sl_order, {"algoId": 2})
+        self.assertEqual(tp1_order, {"algoId": 3})
+        self.assertEqual(tp2_order, {"algoId": 4})
+
+    def test_uses_whatever_quantity_the_plan_carries_not_a_fixed_one(self):
+        # The real motivation for extracting this at all: a retracement
+        # settle's plan can carry a real fill quantity that differs from
+        # the originally-planned one (a blended limit+market-fallback
+        # fill) - this must size the SL-failure market-close off THAT
+        # quantity, not silently reuse whatever the original plan said.
+        settled = dict(_plan(), quantity=1.7)
+
+        with patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
+             patch.object(exchange, "close_position_market") as close_market:
+            execution.place_protection_orders("BTCUSDT", "BUY", settled)
+
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.7)
+
+    def test_sl_failure_closes_at_market_and_returns_an_error(self):
+        with patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
+             patch.object(exchange, "close_position_market") as close_market:
+            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+                "BTCUSDT", "BUY", _plan()
+            )
+
+        self.assertIsNone(sl_order)
+        self.assertIsNone(tp1_order)
+        self.assertIsNone(tp2_order)
+        self.assertIn("rejected", error)
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+
+    def test_tp1_failure_does_not_abort(self):
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
+             patch.object(exchange, "place_take_profit_partial", side_effect=RuntimeError("rejected")), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
+            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+                "BTCUSDT", "BUY", _plan()
+            )
+
+        self.assertIsNone(error)
+        self.assertIsNone(tp1_order)
+        self.assertEqual(tp2_order, {"algoId": 4})
+
+
+class PlaceDcaProtectionOrdersTests(unittest.TestCase):
+    """TP1+TP2 or a single TP, no SL - extracted out of enter_trade_dca_
+    pending's tail for the same reason as place_protection_orders above."""
+
+    def test_dual_tp_plan_places_tp1_and_tp2(self):
+        with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}) as tp1, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp2:
+            tp1_order, tp2_order, tp_order = execution.place_dca_protection_orders(
+                "BTCUSDT", "BUY", _dca_plan()
+            )
+
+        tp1.assert_called_once_with("BTCUSDT", "BUY", 0.5, 102)
+        tp2.assert_called_once_with("BTCUSDT", "BUY", 104)
+        self.assertEqual(tp1_order, {"algoId": 3})
+        self.assertEqual(tp2_order, {"algoId": 4})
+        self.assertIsNone(tp_order)
+
+    def test_single_tp_plan_places_only_the_full_tp(self):
+        with patch.object(exchange, "place_take_profit_partial") as tp1, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp_full:
+            tp1_order, tp2_order, tp_order = execution.place_dca_protection_orders(
+                "BTCUSDT", "BUY", _dca_single_tp_plan()
+            )
+
+        tp1.assert_not_called()
+        tp_full.assert_called_once_with("BTCUSDT", "BUY", 104)
+        self.assertIsNone(tp1_order)
+        self.assertIsNone(tp2_order)
+        self.assertEqual(tp_order, {"algoId": 4})
+
+    def test_tp_failure_does_not_raise(self):
+        with patch.object(exchange, "place_take_profit_full", side_effect=RuntimeError("rejected")):
+            tp1_order, tp2_order, tp_order = execution.place_dca_protection_orders(
+                "BTCUSDT", "BUY", _dca_single_tp_plan()
+            )
+
+        self.assertIsNone(tp_order)
 
 
 if __name__ == "__main__":

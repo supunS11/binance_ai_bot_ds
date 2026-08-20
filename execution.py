@@ -10,7 +10,101 @@ run of this bot cannot place a real order by accident.
 """
 import config
 import exchange
+import risk_manager
 from logger import log_error, log_info, log_warning
+
+
+def place_protection_orders(symbol, side, plan):
+    """SL (atomic - a failure here closes plan["quantity"] at market
+    immediately, matching enter_trade's own discipline) then TP1(partial)+
+    TP2(full), both best-effort. Extracted out of enter_trade's tail so
+    config.RETRACEMENT_ENTRY_ENABLED's settle path (position_manager.
+    _finalize_retracement_entry, resolving a fill that already happened -
+    real limit fill, or its market fallback) can place the exact same
+    protection without a second entry order. Returns (sl_order, tp1_order,
+    tp2_order, error) - error is None on success; on SL failure the
+    position has already been closed at market and (for a stale-order
+    -4130) all open orders cancelled, and callers must NOT register a
+    position at all."""
+    try:
+        sl_order = exchange.place_stop_loss(symbol, side, plan["sl_price"])
+    except Exception as exc:
+        log_error(
+            f"{symbol} SL placement failed after entry filled - closing "
+            f"position at market rather than leave it unprotected: {exc}"
+        )
+        try:
+            exchange.close_position_market(symbol, side, plan["quantity"])
+        except Exception as close_exc:
+            log_error(
+                f"{symbol} CRITICAL: failed to close unprotected position "
+                f"after SL placement failure - manual intervention needed: "
+                f"{close_exc}"
+            )
+
+        if "-4130" in str(exc):
+            # See enter_trade's own comment on this - a conflicting
+            # closePosition stop/TP already sitting on this symbol before
+            # this entry started, otherwise stuck there forever blocking
+            # every future attempt.
+            exchange.cancel_all_open_orders(symbol)
+
+        return None, None, None, f"SL placement failed: {exc}"
+
+    tp1_order = None
+    tp2_order = None
+
+    try:
+        tp1_order = exchange.place_take_profit_partial(
+            symbol, side, plan["tp1_quantity"], plan["tp1_price"]
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} TP1 placement failed (SL is active): {exc}")
+
+    try:
+        tp2_order = exchange.place_take_profit_full(symbol, side, plan["tp2_price"])
+    except Exception as exc:
+        log_warning(f"{symbol} TP2 placement failed (SL is active): {exc}")
+
+    return sl_order, tp1_order, tp2_order, None
+
+
+def place_dca_protection_orders(symbol, side, plan):
+    """No SL (matches enter_trade_dca_pending's own no-SL-before-DCA
+    design) - a single full-position TP (plan["single_tp"]) or TP1
+    (partial) + TP2 (full), both best-effort. Extracted out of
+    enter_trade_dca_pending's tail for the same reason place_protection_
+    orders was: config.RETRACEMENT_ENTRY_ENABLED's settle path needs to
+    place DCA-shaped protection for a fill that already happened, without
+    placing a second entry order. Returns (tp1_order, tp2_order, tp_order) -
+    exactly one of (tp_order) or (tp1_order, tp2_order) is ever non-None
+    depending on plan["single_tp"], the other pair stays None."""
+    if plan.get("single_tp"):
+        tp_order = None
+
+        try:
+            tp_order = exchange.place_take_profit_full(symbol, side, plan["tp_price"])
+        except Exception as exc:
+            log_warning(f"{symbol} TP placement failed: {exc}")
+
+        return None, None, tp_order
+
+    tp1_order = None
+    tp2_order = None
+
+    try:
+        tp1_order = exchange.place_take_profit_partial(
+            symbol, side, plan["tp1_quantity"], plan["tp1_price"]
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} TP1 placement failed: {exc}")
+
+    try:
+        tp2_order = exchange.place_take_profit_full(symbol, side, plan["tp2_price"])
+    except Exception as exc:
+        log_warning(f"{symbol} TP2 placement failed: {exc}")
+
+    return tp1_order, tp2_order, None
 
 
 def enter_trade(plan):
@@ -58,55 +152,10 @@ def enter_trade(plan):
 
     real_entry_price = exchange.resolve_market_fill_price(symbol, entry_order, plan["entry_price"])
 
-    try:
-        sl_order = exchange.place_stop_loss(symbol, side, plan["sl_price"])
-    except Exception as exc:
-        log_error(
-            f"{symbol} SL placement failed after entry filled - closing "
-            f"position at market rather than leave it unprotected: {exc}"
-        )
-        try:
-            exchange.close_position_market(symbol, side, plan["quantity"])
-        except Exception as close_exc:
-            log_error(
-                f"{symbol} CRITICAL: failed to close unprotected position "
-                f"after SL placement failure - manual intervention needed: "
-                f"{close_exc}"
-            )
+    sl_order, tp1_order, tp2_order, error = place_protection_orders(symbol, side, plan)
 
-        if "-4130" in str(exc):
-            # -4130 means a conflicting closePosition stop/TP was already
-            # sitting on this symbol before this entry even started - real
-            # bug found live (STGUSDT/DEXEUSDT, 2026-08-08): that order
-            # survives the market-close above untouched (closePosition
-            # orders aren't cancelled just because the position went flat),
-            # so leaving it in place made every future entry attempt on
-            # this symbol hit the identical -4130 forever, every eval
-            # cycle, each one opening and immediately flattening a real
-            # position for no reason. Clear it so the next attempt has a
-            # clean slate. cancel_all_open_orders never raises (each of
-            # its two endpoint calls is independently try/excepted).
-            exchange.cancel_all_open_orders(symbol)
-
-        return {"ok": False, "shadow": False, "error": f"SL placement failed: {exc}"}
-
-    # TP1/TP2 are best-effort from here: the position already has real
-    # downside protection via SL, so a failure here is degraded (missing
-    # profit-taking) but not dangerous - the position still gets tracked.
-    tp1_order = None
-    tp2_order = None
-
-    try:
-        tp1_order = exchange.place_take_profit_partial(
-            symbol, side, plan["tp1_quantity"], plan["tp1_price"]
-        )
-    except Exception as exc:
-        log_warning(f"{symbol} TP1 placement failed (SL is active): {exc}")
-
-    try:
-        tp2_order = exchange.place_take_profit_full(symbol, side, plan["tp2_price"])
-    except Exception as exc:
-        log_warning(f"{symbol} TP2 placement failed (SL is active): {exc}")
+    if error:
+        return {"ok": False, "shadow": False, "error": error}
 
     log_info(
         f"{symbol} entered {side} qty={plan['quantity']} | "
@@ -185,48 +234,18 @@ def enter_trade_dca_pending(plan):
     # DCA-or-TP1/TP either way), not a naked-position risk on its own, so
     # it doesn't trigger the emergency-close path enter_trade's SL step
     # does.
+    tp1_order, tp2_order, tp_order = place_dca_protection_orders(symbol, side, plan)
+
     if single_tp:
-        tp_order = None
-
-        try:
-            tp_order = exchange.place_take_profit_full(symbol, side, plan["tp_price"])
-        except Exception as exc:
-            log_warning(f"{symbol} TP placement failed: {exc}")
-
         log_info(
             f"{symbol} entered {side} qty={plan['quantity']} | NO SL (DCA pending) "
             f"dca_price={plan['dca_price']} TP={plan['tp_price']}"
         )
-
-        return {
-            "ok": True,
-            "shadow": False,
-            "entry_order": entry_order,
-            "tp1_order": None,
-            "tp2_order": None,
-            "tp_order": tp_order,
-            "real_entry_price": real_entry_price,
-        }
-
-    tp1_order = None
-    tp2_order = None
-
-    try:
-        tp1_order = exchange.place_take_profit_partial(
-            symbol, side, plan["tp1_quantity"], plan["tp1_price"]
+    else:
+        log_info(
+            f"{symbol} entered {side} qty={plan['quantity']} | NO SL (DCA pending) "
+            f"dca_price={plan['dca_price']} TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
         )
-    except Exception as exc:
-        log_warning(f"{symbol} TP1 placement failed: {exc}")
-
-    try:
-        tp2_order = exchange.place_take_profit_full(symbol, side, plan["tp2_price"])
-    except Exception as exc:
-        log_warning(f"{symbol} TP2 placement failed: {exc}")
-
-    log_info(
-        f"{symbol} entered {side} qty={plan['quantity']} | NO SL (DCA pending) "
-        f"dca_price={plan['dca_price']} TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
-    )
 
     return {
         "ok": True,
@@ -234,7 +253,7 @@ def enter_trade_dca_pending(plan):
         "entry_order": entry_order,
         "tp1_order": tp1_order,
         "tp2_order": tp2_order,
-        "tp_order": None,
+        "tp_order": tp_order,
         "real_entry_price": real_entry_price,
     }
 
@@ -284,3 +303,58 @@ def enter_trade_limit(plan):
     )
 
     return {"ok": True, "shadow": False, "entry_order": entry_order}
+
+
+def enter_trade_retracement(plan):
+    """config.RETRACEMENT_ENTRY_ENABLED - places a resting GTC LIMIT at a
+    small pullback toward the stop (risk_manager.compute_retracement_
+    price) instead of paying the trigger-instant price plan["entry_price"]
+    itself. No protection is placed here - there is no fill yet, and
+    unlike enter_trade_limit this doesn't even know yet whether the
+    eventual position will be DCA-shaped or plain. position_manager.
+    poll_retracement_pending/poll_shadow_retracement_pending resolve the
+    fill (or the bounded market fallback via config.RETRACEMENT_ENTRY_
+    TIMEOUT_SECONDS if it never comes) and place protection afterward via
+    place_protection_orders/place_dca_protection_orders. Callers register
+    the result via positions.register_retracement_pending(...), not
+    register()/register_dca_pending() directly - see config.py's own
+    comment for the full mechanism and the real evidence behind it."""
+    symbol = plan["symbol"]
+    side = plan["side"]
+    retracement_price = risk_manager.compute_retracement_price(
+        plan["entry_price"], plan["sl_price"], side
+    )
+
+    if config.EXECUTION_MODE != "LIVE":
+        log_info(
+            f"[SHADOW] {symbol} would place a RETRACEMENT limit {side} "
+            f"qty={plan['quantity']} @ {retracement_price} "
+            f"(trigger price was {plan['entry_price']})"
+        )
+        return {
+            "ok": True, "shadow": True, "entry_order": None,
+            "retracement_price": retracement_price,
+        }
+
+    # Same abort-before-any-order-attempt discipline as enter_trade.
+    if not exchange.setup_leverage(symbol):
+        error = f"leverage {config.LEVERAGE}x not available for {symbol}"
+        log_error(f"{symbol} retracement entry aborted | {error}")
+        return {"ok": False, "shadow": False, "error": error}
+
+    try:
+        entry_order = exchange.place_limit_order(symbol, side, plan["quantity"], retracement_price)
+    except Exception as exc:
+        log_error(f"{symbol} retracement entry order error: {exc}")
+        return {"ok": False, "shadow": False, "error": str(exc)}
+
+    log_info(
+        f"{symbol} retracement entry placed {side} qty={plan['quantity']} "
+        f"@ {retracement_price} (trigger was {plan['entry_price']}) | "
+        f"expires in {config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS}s -> market fallback"
+    )
+
+    return {
+        "ok": True, "shadow": False, "entry_order": entry_order,
+        "retracement_price": retracement_price,
+    }

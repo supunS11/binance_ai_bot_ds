@@ -1213,6 +1213,42 @@ class ComputeDcaTargetTests(unittest.TestCase):
         self.assertAlmostEqual(target, 95.0)
 
 
+class ComputeRetracementPriceTests(unittest.TestCase):
+    """config.RETRACEMENT_ENTRY_ENABLED - a small pullback toward the stop
+    from the planned entry price, in RETRACEMENT_ENTRY_OFFSET_R units of
+    the planned risk distance."""
+
+    def test_buy_rests_below_entry_toward_the_stop(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1):
+            price = risk_manager.compute_retracement_price(100, 90, "BUY")
+
+        self.assertEqual(price, 99.0)  # 100 - 0.1 * (100 - 90)
+
+    def test_sell_rests_above_entry_toward_the_stop(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1):
+            price = risk_manager.compute_retracement_price(100, 110, "SELL")
+
+        self.assertEqual(price, 101.0)  # 100 + 0.1 * (110 - 100)
+
+    def test_zero_offset_rests_exactly_at_the_trigger_price(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0):
+            price = risk_manager.compute_retracement_price(100, 90, "BUY")
+
+        self.assertEqual(price, 100.0)
+
+    def test_larger_offset_rests_further_toward_the_stop(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.5):
+            price = risk_manager.compute_retracement_price(100, 90, "BUY")
+
+        self.assertEqual(price, 95.0)  # halfway to the stop
+
+    def test_negative_offset_is_clamped_to_zero(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", -0.5):
+            price = risk_manager.compute_retracement_price(100, 90, "BUY")
+
+        self.assertEqual(price, 100.0)
+
+
 class PriceAtRoiPctTests(unittest.TestCase):
     def test_buy_target_scales_with_roi_and_leverage(self):
         with patch.object(config, "LEVERAGE", 10):

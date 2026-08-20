@@ -1279,6 +1279,60 @@ ENTRY_ROUTING_EXTENSION_THRESHOLD_R = env_float("ENTRY_ROUTING_EXTENSION_THRESHO
 # stale mid-candle. Starting value, not yet calibrated against real
 # fill-rate data.
 LIMIT_ENTRY_EXPIRY_SECONDS = env_int("LIMIT_ENTRY_EXPIRY_SECONDS", 600)
+# Real evidence (2026-08-20, 24 resolved trades cross-checked against
+# real 1-minute Binance price data around each entry): 75% dipped at
+# least 0.1R against the position within 5 minutes of entry, regardless
+# of trigger type (even retest-style triggers, not just breakouts) -
+# entries fire at market the instant a trigger condition is detected,
+# which is disproportionately often a local extreme that immediately
+# mean-reverts before the real move starts. Most of these trades still
+# won once they recovered - the direction was right, the entry price/
+# timing wasn't.
+#
+# Unlike LIMIT_ENTRY_MODE_ENABLED above (which routes only already-
+# extended entries, and deliberately has no market fallback - walking
+# away is the point there), this applies to EVERY entry regardless of
+# entry_extension_r and NEVER skips a signal: places a resting limit at
+# a small pullback toward the stop (risk_manager.compute_retracement_
+# price) instead of paying the trigger-instant price, but always falls
+# back to a market order for whatever didn't fill once RETRACEMENT_
+# ENTRY_TIMEOUT_SECONDS elapses (see position_manager.RETRACEMENT_PENDING/
+# _finalize_retracement_entry) - so every signal still results in a
+# position exactly as today, just later and (on the ~75% of trades that
+# dip) at a real, better price. Takes priority over both DCA_ENABLED's
+# and LIMIT_ENTRY_MODE_ENABLED's own routing when on (see main.py) -
+# after the fill/fallback resolves, it hands off into DCA_PENDING or
+# TP1_PENDING exactly like a direct entry would have.
+#
+# A resting, unfilled retracement limit has no matching real exchange
+# position, so it can't be recovered by reconcile_on_startup (which only
+# walks REAL open positions) - position_manager.reconcile_pending_entries_
+# on_startup covers this instead (the same account-wide "cancel any
+# stray resting LIMIT order, re-evaluate fresh" sweep LIMIT_ENTRY_MODE_
+# ENABLED already relies on), so a restart mid-window loses at most that
+# one pending signal, never leaves an order truly orphaned.
+#
+# Default False: the entry-timing PROBLEM is evidence-backed, but this
+# specific FIX has zero live track record of its own yet - same "earns a
+# live default only after real data on the mechanism itself" rule as
+# every other unvalidated mechanism here.
+RETRACEMENT_ENTRY_ENABLED = env_bool("RETRACEMENT_ENTRY_ENABLED", "False")
+# In units of the planned risk distance (entry to sl_price) - 0.1 means
+# a limit resting 10% of the way from the trigger price toward the stop.
+# Chosen directly off the measured data: 75% of trades already reach at
+# least this much adverse excursion within 5 minutes, so a fill is
+# likely without resting deep enough to risk missing a genuine
+# continuation entirely. Starting value, not yet calibrated against real
+# RETRACEMENT-mechanism fill-rate/outcome data of its own.
+RETRACEMENT_ENTRY_OFFSET_R = env_float("RETRACEMENT_ENTRY_OFFSET_R", 0.1)
+# How long the resting limit waits before falling back to market for
+# whatever didn't fill. Short by design (minutes, not
+# LIMIT_ENTRY_EXPIRY_SECONDS' 600s) - the measured adverse dip already
+# happens fast (average worst point ~16 minutes in, but most of the
+# first move happens within 5) and this mechanism's whole point is
+# capturing that early pullback, not waiting out a slower one. Starting
+# value, not yet calibrated.
+RETRACEMENT_ENTRY_TIMEOUT_SECONDS = env_int("RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300)
 
 # =========================
 # LOGGING / ALERTING

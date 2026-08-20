@@ -18,7 +18,7 @@ import risk_manager
 import signal_engine
 import signal_journal
 from logger import log_error, log_info, log_warning
-from position_manager import PENDING_LIMIT_FILL, PositionManager
+from position_manager import PENDING_LIMIT_FILL, RETRACEMENT_PENDING, PositionManager
 from ws_client import RealtimeMarketData
 
 
@@ -276,20 +276,32 @@ def _evaluate_symbol(
     # instead. entry_extension_r is always a real float here (build_trade_plan
     # only returns "OK" once it's computable), so the None branch below
     # is a defensive fallback (market), not an expected path.
+    # config.RETRACEMENT_ENTRY_ENABLED takes priority over everything
+    # below - it applies uniformly regardless of DCA_ENABLED/entry_
+    # extension_r, and once its fill (or bounded market fallback) is
+    # resolved it hands off into DCA_PENDING or TP1_PENDING via the exact
+    # same register_dca_pending()/register() paths those branches use
+    # directly - see position_manager.RETRACEMENT_PENDING/
+    # _finalize_retracement_entry.
+    #
     # config.DCA_ENABLED takes priority over LIMIT_ENTRY_MODE_ENABLED's own
     # market-vs-limit routing below - this project's DCA design (market
     # entry, no SL, TP1/TP2 live) was never specified alongside a resting
     # limit entry, and layering a third pending state on top of
     # PENDING_LIMIT_FILL/DCA_PENDING would add real complexity nothing
     # asked for. A DCA-enabled signal always enters at market.
+    use_retracement = config.RETRACEMENT_ENTRY_ENABLED
     use_limit = (
-        not config.DCA_ENABLED
+        not use_retracement
+        and not config.DCA_ENABLED
         and config.LIMIT_ENTRY_MODE_ENABLED
         and plan.get("entry_extension_r") is not None
         and plan["entry_extension_r"] > config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R
     )
 
-    if config.DCA_ENABLED:
+    if use_retracement:
+        execution_result = execution.enter_trade_retracement(plan)
+    elif config.DCA_ENABLED:
         execution_result = execution.enter_trade_dca_pending(plan)
     elif use_limit:
         execution_result = execution.enter_trade_limit(plan)
@@ -303,7 +315,9 @@ def _evaluate_symbol(
 
     trade_id = signal_journal.append_signal(result, plan)
 
-    if config.DCA_ENABLED:
+    if use_retracement:
+        positions.register_retracement_pending(plan, execution_result, trade_id=trade_id)
+    elif config.DCA_ENABLED:
         positions.register_dca_pending(plan, execution_result, trade_id=trade_id)
     elif use_limit:
         positions.register_pending_entry(plan, execution_result, trade_id=trade_id)
@@ -326,6 +340,16 @@ def _poll_positions(feed, positions):
         position = positions.positions.get(symbol)
 
         if not position:
+            continue
+
+        if position["stage"] == RETRACEMENT_PENDING:
+            latest_candle = feed.candles.latest(symbol)
+
+            if position["shadow"]:
+                positions.poll_shadow_retracement_pending(symbol, latest_candle)
+            else:
+                positions.poll_retracement_pending(symbol, latest_candle)
+
             continue
 
         if position["stage"] == PENDING_LIMIT_FILL:
@@ -435,6 +459,23 @@ def _log_heartbeat(
 
     for symbol in list(positions.positions.keys()):
         position = positions.positions[symbol]
+
+        # config.RETRACEMENT_ENTRY_ENABLED - this stage's position dict
+        # keeps the whole plan nested under "plan" instead of flattening
+        # entry_price/sl_price/tp1_price/tp2_price/tp_price/single_tp onto
+        # itself (see register_retracement_pending's own docstring for
+        # why) - logged from there instead, distinctly, rather than
+        # forcing the general case below to branch on a shape it doesn't
+        # otherwise need to know about.
+        if position["stage"] == RETRACEMENT_PENDING:
+            plan = position["plan"]
+            log_info(
+                f"  OPEN {symbol} {position['side']} stage={position['stage']} "
+                f"retracement={position['retracement_price']} trigger={plan['entry_price']} "
+                f"sl={plan['sl_price']}"
+            )
+            continue
+
         filled_note = (
             f" filled={position['filled_quantity']}"
             if position["stage"] == PENDING_LIMIT_FILL else ""

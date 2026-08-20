@@ -184,6 +184,19 @@ def compute_dca_sl_price(dca_fill_price, side, pools, atr=0, buffer_atr_multiple
     return _apply_min_stop_distance(sl_price, dca_fill_price, side, atr=atr)
 
 
+def compute_retracement_price(entry_price, sl_price, side):
+    """config.RETRACEMENT_ENTRY_ENABLED - a small pullback toward the stop
+    from the planned (trigger-instant) entry price, in RETRACEMENT_ENTRY_
+    OFFSET_R units of the planned risk distance (entry to sl_price) - see
+    config.py's own comment for the real evidence behind this. BUY rests
+    below entry_price (toward its stop, which is lower); SELL rests above
+    (toward its stop, which is higher). Never past the stop itself for any
+    sane offset (<1.0), since it's a fraction of that same distance."""
+    risk_distance = abs(entry_price - sl_price)
+    offset = risk_distance * max(float(config.RETRACEMENT_ENTRY_OFFSET_R), 0)
+    return entry_price - offset if side == "BUY" else entry_price + offset
+
+
 def price_at_roi_pct(entry_price, side, roi_pct):
     """Price at which unrealized ROI (at LEVERAGE) equals roi_pct% of
     margin - same underlying relationship _roi_pct/_price_at_tp1_roi_

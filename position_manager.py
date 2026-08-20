@@ -16,6 +16,7 @@ from pathlib import Path
 
 import config
 import exchange
+import execution
 import market_structure
 import risk_manager
 import signal_engine
@@ -62,6 +63,16 @@ DCA_ACTIVE = "DCA_ACTIVE"
 # placed, same as capital is nominally committed the moment it rests on
 # the book.
 PENDING_LIMIT_FILL = "PENDING_LIMIT_FILL"
+# config.RETRACEMENT_ENTRY_ENABLED - a resting GTC LIMIT at a small
+# pullback toward the stop from the planned entry price, placed instead
+# of a synchronous market/DCA-pending entry. Same MAX_TOTAL_POSITIONS-
+# slot-reservation shape as PENDING_LIMIT_FILL above, but resolves
+# differently: it ALWAYS ends in a real position (a bounded market
+# fallback for whatever didn't fill by config.RETRACEMENT_ENTRY_TIMEOUT_
+# SECONDS, never a walk-away) and, once resolved, hands off into
+# DCA_PENDING or TP1_PENDING via the normal register_dca_pending()/
+# register() - see register_retracement_pending/_finalize_retracement_entry.
+RETRACEMENT_PENDING = "RETRACEMENT_PENDING"
 # Tags the real SL/TP orders _execute_dca places, so a restart's
 # _adopt_position can tell a genuine DCA_ACTIVE position apart from an
 # ordinary post-TP1 BREAKEVEN_ACTIVE one - both are otherwise the exact
@@ -469,6 +480,49 @@ class PositionManager:
         self.positions[symbol] = position
         return position
 
+    def register_retracement_pending(self, plan, execution_result, trade_id=None):
+        """config.RETRACEMENT_ENTRY_ENABLED - a resting retracement limit
+        has been placed (or, in shadow mode, would have been) but not yet
+        resolved. Unlike register()/register_dca_pending()/register_
+        pending_entry(), which all flatten plan fields onto the position
+        dict, this keeps the WHOLE plan nested under "plan" - this stage's
+        only job is to hand off to one of those two once resolved (see
+        _finalize_retracement_entry), and re-flattening a second time here
+        would just be duplicated bookkeeping. "is_dca" is captured once,
+        from config.DCA_ENABLED at the moment this fires, rather than
+        re-read at resolution time - the routing decision that led here
+        was already made in main.py against that same value, and a
+        resting order can outlive a config change mid-flight.
+
+        A resting, unfilled limit has no matching real exchange position,
+        so a restart before it resolves can't be recovered by reconcile_
+        on_startup (which only walks REAL open positions) -
+        reconcile_pending_entries_on_startup covers this instead (cancels
+        any stray resting LIMIT order found account-wide, re-evaluates
+        fresh next tick), same as it already does for LIMIT_ENTRY_MODE_
+        ENABLED's own resting orders."""
+        symbol = plan["symbol"]
+        shadow = execution_result.get("shadow", True)
+
+        position = {
+            "symbol": symbol,
+            "trade_id": trade_id,
+            "side": plan["side"],
+            "plan": plan,
+            "is_dca": bool(config.DCA_ENABLED),
+            "retracement_price": execution_result.get("retracement_price"),
+            "limit_order_id": (
+                exchange._accepted_order_id(execution_result.get("entry_order"))
+                if not shadow else None
+            ),
+            "limit_placed_at": time.time(),
+            "stage": RETRACEMENT_PENDING,
+            "shadow": shadow,
+            "opened_at": time.time(),
+        }
+        self.positions[symbol] = position
+        return position
+
     def reconcile_on_startup(self, feed=None):
         """Rebuild tracking for positions already open on the exchange
         when the process starts - crash, manual restart, or a redeploy.
@@ -533,8 +587,17 @@ class PositionManager:
         limit order that had already partially filled into a real
         position gets adopted (and protected) by the existing self-heal
         path first - this only ever touches still-resting orders with no
-        exchange position attached."""
-        if not config.LIMIT_ENTRY_MODE_ENABLED:
+        exchange position attached.
+
+        Covers BOTH config.LIMIT_ENTRY_MODE_ENABLED's and config.
+        RETRACEMENT_ENTRY_ENABLED's resting orders - both place a plain
+        (non-algo) LIMIT via exchange.place_limit_order, indistinguishable
+        on this account-wide endpoint, and both get the exact same
+        "no recoverable plan, cancel and re-evaluate fresh" treatment.
+        This is what actually closes the "orphaned resting order" risk
+        RETRACEMENT_ENTRY_ENABLED's own config.py comment describes -
+        bounded to at most one poll cycle after a restart, not open-ended."""
+        if not config.LIMIT_ENTRY_MODE_ENABLED and not config.RETRACEMENT_ENTRY_ENABLED:
             return
 
         cancelled = 0
@@ -3079,5 +3142,279 @@ class PositionManager:
 
         if expired:
             return self._drop_unfilled_pending_entry(position, invalidated=False, shadow=True)
+
+        return None
+
+    @staticmethod
+    def _retracement_entry_invalidated(position, latest_candle):
+        """Same real-time invalidation check as _pending_entry_invalidated
+        (has price already reached the level the eventual stop would sit
+        at, before the retracement limit ever filled?), reading sl_price
+        out of the nested plan - config.RETRACEMENT_ENTRY_ENABLED's
+        position shape, unlike PENDING_LIMIT_FILL's, never flattens it
+        onto the position dict directly."""
+        if not latest_candle:
+            return False
+
+        side = position["side"]
+        sl_price = position["plan"]["sl_price"]
+
+        if side == "BUY":
+            return latest_candle["low"] <= sl_price
+
+        return latest_candle["high"] >= sl_price
+
+    def _resolve_retracement_market_fallback(self, position, filled_quantity, filled_avg_price):
+        """Places a market order for whatever quantity the resting
+        retracement limit did NOT fill (all of it, if none) - the
+        guarantee that config.RETRACEMENT_ENTRY_ENABLED never skips a
+        signal the way a plain limit-with-no-fallback would. A no-op
+        (returns the fill exactly as given) when the limit already filled
+        in full - remainder <= 0. Blends a genuine partial limit fill with
+        the market fallback into one quantity-weighted entry price, the
+        same blending math risk_manager.build_dca_plan already uses for a
+        DCA fill - a partial fill isn't thrown away just because the
+        remainder timed out. Returns (total_quantity, entry_price, error) -
+        error is None on success; on a market-order failure the resting
+        limit has already been cancelled by the caller, so any real
+        partial fill IS on the exchange right now, unprotected, and the
+        caller must retry resolution next poll rather than give up."""
+        plan = position["plan"]
+        symbol = position["symbol"]
+        side = position["side"]
+        remainder = round(plan["quantity"] - filled_quantity, 8)
+
+        if remainder <= 0:
+            return filled_quantity, filled_avg_price, None
+
+        try:
+            market_order = exchange.place_market_order(symbol, side, remainder)
+        except Exception as exc:
+            return None, None, f"market fallback order error: {exc}"
+
+        market_price = exchange.resolve_market_fill_price(symbol, market_order, plan["entry_price"])
+        total_quantity = round(filled_quantity + remainder, 8)
+
+        if filled_quantity > 0:
+            entry_price = (
+                filled_avg_price * filled_quantity + market_price * remainder
+            ) / total_quantity
+        else:
+            entry_price = market_price
+
+        return total_quantity, entry_price, None
+
+    def _finalize_retracement_entry(self, position, entry_price, quantity):
+        """Common tail once a final entry_price/quantity is known - a
+        genuine full limit fill, a blended limit+market-fallback fill, or
+        (shadow mode) a simulated touch/fallback. Builds a settled plan
+        (entry_price/quantity/tp1_quantity/tp2_quantity/breakeven_price/
+        risk_distance recomputed from these real numbers; every structure-
+        anchored level - sl_price/tp1_price/tp2_price/tp_price/dca_price -
+        left exactly as risk_manager originally computed it, same
+        principle _resolve_real_entry already applies for ordinary
+        slippage on a synchronous market entry), places protection orders
+        (DCA-shaped or plain, per position["is_dca"]/plan["single_tp"]),
+        and hands off to register_dca_pending()/register() so the
+        position ends up in the exact same shape a direct, same-price
+        entry would have produced. Returns an outcome string only if a
+        non-DCA settle's SL placement failed outright (closed already, at
+        market - see execution.place_protection_orders); None otherwise,
+        including the ordinary case where this settled into DCA_PENDING/
+        TP1_PENDING, which is not itself a closed-trade outcome."""
+        plan = position["plan"]
+        symbol = position["symbol"]
+        side = position["side"]
+        shadow = position["shadow"]
+        is_dca = position["is_dca"]
+        trade_id = position.get("trade_id")
+
+        settled_plan = dict(plan)
+        settled_plan["entry_price"] = entry_price
+        settled_plan["quantity"] = quantity
+        settled_plan["breakeven_price"] = risk_manager.compute_breakeven_price(entry_price, side)
+        risk_distance = abs(entry_price - plan["sl_price"])
+        settled_plan["risk_distance"] = risk_distance if risk_distance > 0 else plan.get("risk_distance")
+
+        if plan.get("single_tp"):
+            settled_plan["tp1_quantity"] = None
+            settled_plan["tp2_quantity"] = None
+        else:
+            tp1_close_pct = min(max(float(config.TP1_CLOSE_PCT), 0), 100)
+            settled_plan["tp1_quantity"] = round(quantity * tp1_close_pct / 100, 8)
+            settled_plan["tp2_quantity"] = round(quantity - settled_plan["tp1_quantity"], 8)
+
+        if shadow:
+            execution_result = {
+                "ok": True, "shadow": True, "entry_order": None,
+                "sl_order": None, "tp1_order": None, "tp2_order": None, "tp_order": None,
+            }
+        elif is_dca:
+            tp1_order, tp2_order, tp_order = execution.place_dca_protection_orders(
+                symbol, side, settled_plan
+            )
+            execution_result = {
+                "ok": True, "shadow": False, "entry_order": None,
+                "tp1_order": tp1_order, "tp2_order": tp2_order, "tp_order": tp_order,
+                "real_entry_price": entry_price,
+            }
+        else:
+            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+                symbol, side, settled_plan
+            )
+
+            if error:
+                self.positions.pop(symbol, None)
+                self._closed_at[symbol] = time.time()
+                log_error(f"{symbol} retracement settle failed | {error}")
+                signal_journal.append_outcome(symbol, "RETRACEMENT_SL_PLACEMENT_FAILED", trade_id)
+                return "RETRACEMENT_SL_PLACEMENT_FAILED"
+
+            execution_result = {
+                "ok": True, "shadow": False, "entry_order": None,
+                "sl_order": sl_order, "tp1_order": tp1_order, "tp2_order": tp2_order,
+                "real_entry_price": entry_price,
+            }
+
+        if is_dca:
+            self.register_dca_pending(settled_plan, execution_result, trade_id=trade_id)
+        else:
+            self.register(settled_plan, execution_result, trade_id=trade_id)
+
+        return None
+
+    def _drop_unfilled_retracement_entry(self, position, shadow=False):
+        """Genuinely zero-fill invalidation before the retracement limit
+        ever touched - nothing was protected, nothing to unwind beyond the
+        cancel already issued by the caller. Gets the same cooldown
+        treatment as a real SL hit (the level failed before entry even
+        happened) - see _drop_unfilled_pending_entry's identical
+        reasoning for its own invalidated branch."""
+        symbol = position["symbol"]
+        self.positions.pop(symbol, None)
+        self._closed_at[symbol] = time.time()
+        prefix = " [SHADOW]" if shadow else ""
+        log_info(f"{symbol}{prefix} retracement entry invalidated before filling - never entered")
+        signal_journal.append_outcome(symbol, "RETRACEMENT_INVALIDATED_UNFILLED", position.get("trade_id"))
+        return "RETRACEMENT_INVALIDATED_UNFILLED"
+
+    def poll_retracement_pending(self, symbol, latest_candle):
+        """Returns an outcome string if this call closed things out
+        outright (a genuine pre-fill invalidation, or a non-DCA settle's
+        SL placement failure); None otherwise, including the ordinary
+        case where this call either kept the limit resting or settled the
+        position into DCA_PENDING/TP1_PENDING. Only meaningful for
+        stage == RETRACEMENT_PENDING, non-shadow positions - see main.py's
+        _poll_positions dispatch."""
+        position = self.positions.get(symbol)
+
+        if not position or position["shadow"] or position["stage"] != RETRACEMENT_PENDING:
+            return None
+
+        plan = position["plan"]
+        order = exchange.get_order_status(symbol, position["limit_order_id"])
+
+        if order["status"] == "UNKNOWN":
+            return None  # transient fetch failure - retry next poll
+
+        filled_quantity = order["executed_qty"]
+        fully_filled = filled_quantity >= plan["quantity"]
+        invalidated = self._retracement_entry_invalidated(position, latest_candle)
+        expired = (
+            time.time() - position["limit_placed_at"]
+        ) >= max(float(config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS), 0)
+
+        if not fully_filled and not invalidated and not expired:
+            return None  # keep resting
+
+        exchange.cancel_order(symbol, position["limit_order_id"])
+
+        # A fill can race the cancel - re-check ground truth after, same
+        # discipline poll_pending_entry's own _resolve_pending_entry_cancel
+        # already applies.
+        order = exchange.get_order_status(symbol, position["limit_order_id"])
+
+        if order["status"] != "UNKNOWN":
+            filled_quantity = order["executed_qty"]
+
+        filled_avg_price = order["avg_price"] if filled_quantity > 0 else None
+
+        if filled_quantity <= 0 and invalidated:
+            # Setup failed before ever filling - nothing to unwind, nothing
+            # protected, and never falls back to market into a broken
+            # setup.
+            return self._drop_unfilled_retracement_entry(position)
+
+        # Every other resolution (full fill, partial fill + invalidated,
+        # partial/zero fill + expired) ends here: market-fallback for
+        # whatever didn't fill (a no-op if it's already fully filled),
+        # then finalize with the real (possibly blended) quantity/price -
+        # guarantees this signal still becomes a position exactly like a
+        # direct entry would have.
+        total_quantity, entry_price, error = self._resolve_retracement_market_fallback(
+            position, filled_quantity, filled_avg_price
+        )
+
+        if error:
+            log_error(f"{symbol} {error} - leaving unresolved for the next poll")
+            return None
+
+        return self._finalize_retracement_entry(position, entry_price, total_quantity)
+
+    def _close_shadow_retracement_invalidated(self, position):
+        symbol = position["symbol"]
+        self.positions.pop(symbol, None)
+        self._closed_at[symbol] = time.time()
+        log_info(f"{symbol} [SHADOW] retracement entry invalidated before filling - never entered")
+        signal_journal.append_outcome(
+            symbol, "SHADOW_RETRACEMENT_INVALIDATED_UNFILLED", position.get("trade_id")
+        )
+        return "SHADOW_RETRACEMENT_INVALIDATED_UNFILLED"
+
+    def poll_shadow_retracement_pending(self, symbol, latest_candle):
+        """SHADOW equivalent of poll_retracement_pending - no real orders
+        exist, so "filled" is simulated against the candle's own range
+        (same deliberately conservative "assume the adverse side touched
+        first" simplification poll_shadow's own docstring already
+        documents for a real SL-vs-target ambiguity) and the market
+        fallback on expiry just uses the candle's own close as the
+        simulated fill price for the full planned quantity - there is no
+        real partial fill to blend against in shadow mode."""
+        position = self.positions.get(symbol)
+
+        if (
+            not position or not position["shadow"]
+            or position["stage"] != RETRACEMENT_PENDING or not latest_candle
+        ):
+            return None
+
+        plan = position["plan"]
+        side = position["side"]
+        retracement_price = position["retracement_price"]
+        sl_price = plan["sl_price"]
+        low = latest_candle["low"]
+        high = latest_candle["high"]
+        touches_retracement = low <= retracement_price <= high
+        touches_sl = low <= sl_price if side == "BUY" else high >= sl_price
+
+        if touches_sl:
+            # Whether or not it also touched the retracement level this
+            # same candle - same conservative "assume the adverse side
+            # first" bias as the live invalidation check.
+            return self._close_shadow_retracement_invalidated(position)
+
+        if touches_retracement:
+            return self._finalize_retracement_entry(position, retracement_price, plan["quantity"])
+
+        expired = (
+            time.time() - position["limit_placed_at"]
+        ) >= max(float(config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS), 0)
+
+        if expired:
+            log_info(
+                f"{symbol} [SHADOW] retracement entry expired unfilled - "
+                f"market fallback @ {latest_candle['close']}"
+            )
+            return self._finalize_retracement_entry(position, latest_candle["close"], plan["quantity"])
 
         return None

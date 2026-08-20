@@ -47,6 +47,7 @@ class _FakePositions:
         self.registered = []
         self.registered_pending = []
         self.registered_dca_pending = []
+        self.registered_retracement_pending = []
         self.positions = {}
 
     def has_open_position(self, symbol):
@@ -69,6 +70,9 @@ class _FakePositions:
 
     def register_dca_pending(self, plan, execution_result, trade_id=None):
         self.registered_dca_pending.append((plan, execution_result, trade_id))
+
+    def register_retracement_pending(self, plan, execution_result, trade_id=None):
+        self.registered_retracement_pending.append((plan, execution_result, trade_id))
 
 
 class EvaluateSymbolRejectCountsTests(unittest.TestCase):
@@ -896,6 +900,35 @@ class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
         self.assertEqual(len(positions.registered_pending), 0)
 
 
+class LogHeartbeatRetracementPendingTests(unittest.TestCase):
+    """config.RETRACEMENT_ENTRY_ENABLED - this stage's position dict keeps
+    the whole plan nested under "plan" instead of flattening entry_price/
+    sl_price/tp1_price/tp2_price/tp_price/single_tp the way every other
+    stage's shape does (see register_retracement_pending's own docstring) -
+    the general OPEN-position log line would KeyError on it without its
+    own branch."""
+
+    def test_does_not_raise_and_logs_from_the_nested_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        positions.positions = {
+            "BTCUSDT": {
+                "side": "BUY", "stage": main.RETRACEMENT_PENDING,
+                "retracement_price": 99.8,
+                "plan": {"entry_price": 100, "sl_price": 98},
+            },
+        }
+
+        with patch.object(main, "log_info") as log_mock:
+            main._log_heartbeat(feed, ["BTCUSDT"], positions)
+
+        logged = " ".join(call.args[0] for call in log_mock.call_args_list)
+        self.assertIn("stage=RETRACEMENT_PENDING", logged)
+        self.assertIn("retracement=99.8", logged)
+        self.assertIn("trigger=100", logged)
+        self.assertIn("sl=98", logged)
+
+
 class PollPositionsDispatchTests(unittest.TestCase):
     """main._poll_positions dispatches on stage == PENDING_LIMIT_FILL
     first, before the existing shadow/live dispatch - a resting entry
@@ -929,6 +962,28 @@ class PollPositionsDispatchTests(unittest.TestCase):
         positions.poll_live.assert_not_called()
         positions.poll_shadow.assert_not_called()
         positions.poll_pending_entry.assert_not_called()
+
+    def test_retracement_live_dispatches_to_poll_retracement_pending(self):
+        feed = _FakeFeed()
+        positions = self._positions_with(main.RETRACEMENT_PENDING, shadow=False)
+
+        main._poll_positions(feed, positions)
+
+        positions.poll_retracement_pending.assert_called_once()
+        positions.poll_live.assert_not_called()
+        positions.poll_shadow.assert_not_called()
+        positions.poll_shadow_retracement_pending.assert_not_called()
+
+    def test_retracement_shadow_dispatches_to_poll_shadow_retracement_pending(self):
+        feed = _FakeFeed()
+        positions = self._positions_with(main.RETRACEMENT_PENDING, shadow=True)
+
+        main._poll_positions(feed, positions)
+
+        positions.poll_shadow_retracement_pending.assert_called_once()
+        positions.poll_live.assert_not_called()
+        positions.poll_shadow.assert_not_called()
+        positions.poll_retracement_pending.assert_not_called()
 
     def test_filled_live_dispatches_to_poll_live_unchanged(self):
         feed = _FakeFeed()
@@ -1099,6 +1154,92 @@ class EvaluateSymbolDcaRoutingTests(unittest.TestCase):
 
         enter_limit.assert_called_once()
         enter_dca.assert_not_called()
+
+
+class EvaluateSymbolRetracementRoutingTests(unittest.TestCase):
+    """config.RETRACEMENT_ENTRY_ENABLED takes priority over BOTH DCA_ENABLED
+    and LIMIT_ENTRY_MODE_ENABLED's own routing entirely - it applies
+    regardless of entry_extension_r, and hands off into DCA_PENDING/
+    TP1_PENDING itself once resolved (position_manager.
+    _finalize_retracement_entry), not at routing time."""
+
+    def _plan(self, entry_extension_r=0.5, dca_price=96):
+        return {
+            "symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+            "tp1_price": 102, "tp2_price": 104, "entry_extension_r": entry_extension_r,
+            "dca_price": dca_price,
+        }
+
+    def test_retracement_enabled_routes_there_even_when_dca_is_also_on(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "RETRACEMENT_ENTRY_ENABLED", True), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", True), \
+             patch.object(config, "ENTRY_ROUTING_EXTENSION_THRESHOLD_R", 0.2), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.5), "OK")), \
+             patch.object(execution, "enter_trade_retracement", return_value={"ok": True, "shadow": True}) as enter_retracement, \
+             patch.object(execution, "enter_trade_dca_pending") as enter_dca, \
+             patch.object(execution, "enter_trade_limit") as enter_limit, \
+             patch.object(execution, "enter_trade") as enter_market, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_retracement.assert_called_once()
+        enter_dca.assert_not_called()
+        enter_limit.assert_not_called()
+        enter_market.assert_not_called()
+        self.assertEqual(len(positions.registered_retracement_pending), 1)
+        self.assertEqual(len(positions.registered_dca_pending), 0)
+
+    def test_retracement_enabled_routes_there_even_for_an_unextended_signal(self):
+        # Unlike LIMIT_ENTRY_MODE_ENABLED's own routing, this applies
+        # regardless of entry_extension_r - it's not an extension-based
+        # switch.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "RETRACEMENT_ENTRY_ENABLED", True), \
+             patch.object(config, "DCA_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.05), "OK")), \
+             patch.object(execution, "enter_trade_retracement", return_value={"ok": True, "shadow": True}) as enter_retracement, \
+             patch.object(execution, "enter_trade") as enter_market, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_retracement.assert_called_once()
+        enter_market.assert_not_called()
+
+    def test_disabled_falls_through_to_the_existing_dca_routing(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "RETRACEMENT_ENTRY_ENABLED", False), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(entry_extension_r=0.5), "OK")), \
+             patch.object(execution, "enter_trade_retracement") as enter_retracement, \
+             patch.object(execution, "enter_trade_dca_pending", return_value={"ok": True, "shadow": True}) as enter_dca, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        enter_retracement.assert_not_called()
+        enter_dca.assert_called_once()
+
+    def test_entry_failure_marks_entry_failure_not_registered(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+
+        with patch.object(config, "RETRACEMENT_ENTRY_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value={"signal": "BUY"}), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(self._plan(), "OK")), \
+             patch.object(execution, "enter_trade_retracement", return_value={"ok": False, "error": "boom"}):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        self.assertEqual(len(positions.registered_retracement_pending), 0)
 
 
 if __name__ == "__main__":
