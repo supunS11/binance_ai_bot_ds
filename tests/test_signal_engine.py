@@ -943,9 +943,13 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["setup_age_candles"], 7)
 
     def test_setup_age_reflects_how_old_the_choch_event_is(self):
+        # CHOCH_TRIGGER_MIN_AGE_CANDLES pinned off - this test is about the
+        # setup_age_candles VALUE at a specific age (6), not about the
+        # min-age gate rejecting it (age 6 < the gate's own default of 9).
         analysis = self._choch_analysis("BULLISH", event_price=95, event_index=-6)
 
-        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_TRIGGER_MIN_AGE_CANDLES", 0):
             result = self._run(ltf_analysis=analysis, sweep_direction=None)
 
         self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
@@ -1279,7 +1283,11 @@ class SignalEngineTests(unittest.TestCase):
     # Ranked last in priority: STRUCTURE_BREAK > OB_FVG_RETEST >
     # LIQUIDITY_SWEEP > CHOCH_RETEST.
 
-    def _choch_analysis(self, direction, event_price, event_index=0, event_type="CHoCH"):
+    def _choch_analysis(self, direction, event_price, event_index=-9, event_type="CHoCH"):
+        # event_index=-9 (age=9) by default - config.CHOCH_TRIGGER_MIN_AGE_
+        # CANDLES defaults to 9, so every test below that isn't specifically
+        # about age needs a fixture that already clears it, same as it
+        # already needed to clear CHOCH_TRIGGER_MAX_AGE_CANDLES(10).
         analysis = dict(LTF_BULLISH_BREAK if direction == "BULLISH" else LTF_BEARISH_BREAK)
         analysis["live_break"] = {"broken": False}
         analysis["last_event"] = {
@@ -1340,6 +1348,45 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertIsNone(result["signal"])
         self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_choch_retest_ignored_when_event_too_fresh(self):
+        # config.CHOCH_TRIGGER_MIN_AGE_CANDLES - real evidence (2026-08-21):
+        # a CHoCH still fresh (age well under the default 9) is
+        # disproportionately a fakeout - see config.py's own comment for
+        # the full numbers. age=3 here is well under that default.
+        analysis = self._choch_analysis("BULLISH", event_price=95, event_index=-3)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_TRIGGER_MIN_AGE_CANDLES", 9):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_choch_retest_accepted_right_at_the_minimum_age(self):
+        # Boundary is inclusive (">=" not ">") - age exactly equal to
+        # CHOCH_TRIGGER_MIN_AGE_CANDLES must still qualify.
+        analysis = self._choch_analysis("BULLISH", event_price=95, event_index=-9)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_TRIGGER_MIN_AGE_CANDLES", 9):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+
+    def test_choch_retest_min_age_of_zero_preserves_original_behavior(self):
+        # 0 disables the new gate entirely (every age qualifies, same as
+        # before this feature existed) - a fresh (age=0) event must still
+        # be accepted when the gate is explicitly turned off.
+        analysis = self._choch_analysis("BULLISH", event_price=95, event_index=0)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_TRIGGER_MIN_AGE_CANDLES", 0):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
 
     def test_choch_retest_ignored_when_last_event_is_bos_not_choch(self):
         analysis = self._choch_analysis("BULLISH", event_price=95, event_type="BOS")

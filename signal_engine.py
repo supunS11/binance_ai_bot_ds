@@ -272,12 +272,30 @@ def evaluate(
             "setup_age_candles": None,
         })
 
+    choch_age = (
+        (len(ltf_candles) - 1 - ltf_analysis["last_event"]["index"])
+        if ltf_analysis.get("last_event") and ltf_analysis["last_event"]["type"] == "CHoCH"
+        else None
+    )
+
     if (
         config.CHOCH_RETEST_TRIGGER_ENABLED
-        and ltf_analysis.get("last_event")
-        and ltf_analysis["last_event"]["type"] == "CHoCH"
-        and (len(ltf_candles) - 1 - ltf_analysis["last_event"]["index"])
-            <= max(int(config.CHOCH_TRIGGER_MAX_AGE_CANDLES), 0)
+        and choch_age is not None
+        and choch_age <= max(int(config.CHOCH_TRIGGER_MAX_AGE_CANDLES), 0)
+        # Real evidence (2026-08-21, 13 resolved CHOCH_RETEST trades with
+        # setup_age_candles data): age==CHOCH_TRIGGER_MAX_AGE_CANDLES (10)
+        # went 4/4 (100%) wins; every younger age (4-8 candles) combined
+        # went 2/9 (22%). A CHoCH that's still fresh hasn't been retested/
+        # proven yet and is disproportionately a fakeout; one that's held
+        # for close to the full lookback window has shown it's real.
+        # Reject-only (never makes anything MORE permissive than today),
+        # same "safe to ship on real evidence immediately" precedent as
+        # OI_RISING_REJECT_ENABLED. 9, not 10, deliberately leaves one
+        # candle of slack below the exact age the evidence covers - no
+        # data point at age==9 exists yet to say whether it shares the
+        # same pattern, but requiring the literal maximum only would be
+        # stricter than the evidence actually demands.
+        and choch_age >= max(int(config.CHOCH_TRIGGER_MIN_AGE_CANDLES), 0)
     ):
         choch_direction = ltf_analysis["last_event"]["direction"]
         candidates.append({
@@ -294,12 +312,12 @@ def evaluate(
             ),
             "trigger_candle_open_time": None,
             # Same expression the age-gate check just above already
-            # computes to enforce CHOCH_TRIGGER_MAX_AGE_CANDLES - never
-            # journaled before now (see signal_journal.py's
+            # computes to enforce CHOCH_TRIGGER_MAX_AGE_CANDLES/MIN_AGE_
+            # CANDLES - never journaled before now (see signal_journal.py's
             # setup_age_candles comment). CHOCH_RETEST is a retest of an
             # already-confirmed reversal, so unlike STRUCTURE_BREAK/
             # EMA_PULLBACK this is almost never 0.
-            "setup_age_candles": len(ltf_candles) - 1 - ltf_analysis["last_event"]["index"],
+            "setup_age_candles": choch_age,
         })
 
     if (

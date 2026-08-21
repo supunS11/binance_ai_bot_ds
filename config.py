@@ -401,6 +401,26 @@ LIQUIDITY_SWEEP_TRIGGER_ENABLED = env_bool("LIQUIDITY_SWEEP_TRIGGER_ENABLED", "F
 # will show whether either is a real problem. Default OFF.
 CHOCH_RETEST_TRIGGER_ENABLED = env_bool("CHOCH_RETEST_TRIGGER_ENABLED", "False")
 CHOCH_TRIGGER_MAX_AGE_CANDLES = env_int("CHOCH_TRIGGER_MAX_AGE_CANDLES", 10)
+# Real evidence (2026-08-21, 13 resolved CHOCH_RETEST trades with real
+# setup_age_candles data - the journal field this reuses): every trade at
+# age==CHOCH_TRIGGER_MAX_AGE_CANDLES (10) won (4/4); every younger trade
+# (age 4-8) combined won only 2/9 (22%). CHOCH_RETEST was also the single
+# worst-performing trigger overall in that same pull (47% win rate, 8 of
+# the 15 total DCA events project-wide, on 30% of trade volume) - this is
+# the one concrete, evidence-backed lever found for it. A CHoCH that's
+# still fresh hasn't been retested/proven yet and is disproportionately a
+# fakeout; one that's held for nearly the whole lookback window has shown
+# it's real. Reject-only (can only make CHOCH_RETEST fire LESS often than
+# today, never more) - same "safe to ship on real evidence immediately"
+# precedent as OI_RISING_REJECT_ENABLED, not the "earns a live default
+# only after evidence on the mechanism itself" class of feature.
+#
+# 9, not the literal max (10): no trade at age==9 exists yet in the
+# evidence to confirm it shares the same pattern, but requiring exactly
+# the maximum would reject every CHOCH_RETEST signal except the single
+# oldest age the lookback window allows - stricter than the data actually
+# demands. Revisit once age==9 trades exist to check against.
+CHOCH_TRIGGER_MIN_AGE_CANDLES = env_int("CHOCH_TRIGGER_MIN_AGE_CANDLES", 9)
 # Fourth entry trigger: a fresh rejection wick into an UNMITIGATED fair
 # value gap (market_structure.find_fvg_retest) - independent of any live
 # break right now, the classic OB/FVG "retest" entry. Scoped to FVGs only
@@ -878,17 +898,31 @@ TP2_R_MULTIPLE = env_float("TP2_R_MULTIPLE", 4.0)
 # fallback is used instead of the distant pool.
 TP1_MAX_R_MULTIPLE = env_float("TP1_MAX_R_MULTIPLE", 6.0)
 TP2_MAX_R_MULTIPLE = env_float("TP2_MAX_R_MULTIPLE", 10.0)
-# Operator-requested alternative to the TP1(partial)+TP2(remainder) ladder
-# above (2026-08-19, no evidence yet either way): ONE fixed ROI% target
-# (at LEVERAGE) that closes the WHOLE position at once - no partial TP1
-# close, no TP1_CLOSE_PCT, no breakeven promotion on TP1 fill (there's
-# nothing left to promote once the single TP closes everything). Applies
-# to a DCA_PENDING position before DCA ever fires - see risk_manager.
-# build_trade_plan/position_manager.register_dca_pending. Reuses the same
-# price_at_roi_pct helper DCA_TP_STATIC_ROI_ENABLED already uses for the
-# POST-DCA target - this is the pre-DCA equivalent. Default False - same
-# "new mechanism earns a live default only after real data" rule every
-# other unvalidated mechanism this project ships follows.
+# Operator-requested alternative to TP1's own calculation (2026-08-19,
+# revised 2026-08-21): TP1 becomes a fixed ROI% target (at LEVERAGE,
+# risk_manager.price_at_roi_pct - the same math DCA_TP_STATIC_ROI_ENABLED
+# already uses for the post-DCA target) instead of the structure-resolved
+# one - TP2 stays exactly the existing real-liquidity-first structure
+# target (risk_manager.compute_static_tp1_structure_tp2 reuses compute_
+# targets' own TP2 resolution, just fed the static TP1 price as its "at
+# least 1R beyond TP1" floor input). Still a normal TP1(partial)+TP2
+# (remainder) close with TP1_CLOSE_PCT and breakeven-on-TP1-fill
+# promotion - nothing about that machinery changes, only how TP1's PRICE
+# gets computed. Applies to a DCA_PENDING position before DCA ever fires -
+# see risk_manager.build_trade_plan/position_manager.register_dca_pending.
+#
+# 2026-08-19 original shipped shape (superseded 2026-08-21 on operator
+# request): a single whole-position target instead, no TP2/partial close
+# at all. That shape's downstream handling (single_tp - position_manager.
+# poll_live/poll_shadow's DCA_PENDING branches, execution.
+# place_dca_protection_orders) is NOT removed - DCA_ACTIVE (post-DCA)
+# always uses it unconditionally regardless of this flag, and it still
+# services any already-open position that entered under the old shape
+# before this change. New signals under this flag no longer produce it.
+#
+# Default False - same "new mechanism earns a live default only after
+# real data" rule every other unvalidated mechanism this project ships
+# follows.
 TP_STATIC_ROI_ENABLED = env_bool("TP_STATIC_ROI_ENABLED", "False")
 # Leveraged ROI%, same units as DCA_TP_TARGET_ROI_PCT/
 # PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT elsewhere in this file.

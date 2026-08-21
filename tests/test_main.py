@@ -88,9 +88,16 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
         # exercise (see main.py's routing comment) - their own minimal
         # `plan` fixtures predate the DCA fields that path now requires.
         # Not what these tests are about, so pinned off here.
-        patcher = patch.object(config, "DCA_ENABLED", False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # config.RETRACEMENT_ENTRY_ENABLED - takes priority over EVERYTHING
+        # else in that same routing (see main.py's use_retracement) - a
+        # real .env flip to True (the operator's own live setting) routes
+        # these same minimal fixtures into enter_trade_retracement instead,
+        # which needs plan["side"] these fixtures don't carry. Pinned off
+        # for the same isolation reason as DCA_ENABLED above.
+        for name, value in (("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False)):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_missing_candle_data_is_tallied(self):
         feed = _FakeFeed(ltf_candles=[], htf_candles=[])
@@ -452,10 +459,11 @@ class SignalStabilityTrackerTests(unittest.TestCase):
 
 class EvaluateSymbolStabilityTests(unittest.TestCase):
     def setUp(self):
-        # See EvaluateSymbolRejectCountsTests.setUp - same reason.
-        patcher = patch.object(config, "DCA_ENABLED", False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # See EvaluateSymbolRejectCountsTests.setUp - same reason, both flags.
+        for name, value in (("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False)):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _plan(self):
         return {
@@ -775,15 +783,17 @@ class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
     against the real PositionManager dict (see test_position_manager.py's
     RegisterPendingEntryTests.test_reserves_a_max_total_positions_slot_immediately).
 
-    config.DCA_ENABLED takes priority over this routing entirely (see
-    main.py's own comment above use_limit) - pinned off below so this
-    class keeps testing LIMIT_ENTRY_MODE_ENABLED's routing in isolation,
-    the same non-DCA path it was written against."""
+    config.DCA_ENABLED and config.RETRACEMENT_ENTRY_ENABLED both take
+    priority over this routing entirely (see main.py's own comment above
+    use_limit) - pinned off below so this class keeps testing LIMIT_ENTRY_
+    MODE_ENABLED's routing in isolation, the same path it was written
+    against."""
 
     def setUp(self):
-        patcher = patch.object(config, "DCA_ENABLED", False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in (("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False)):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _plan(self, entry_extension_r=0.5):
         return {
@@ -1110,6 +1120,17 @@ class EvaluateSymbolDcaRoutingTests(unittest.TestCase):
     own market-vs-limit routing entirely (see main.py's comment above
     use_limit) - a DCA-enabled signal always enters via enter_trade_dca_
     pending/register_dca_pending, regardless of entry_extension_r."""
+
+    def setUp(self):
+        # config.RETRACEMENT_ENTRY_ENABLED takes priority over even
+        # DCA_ENABLED's own routing (see main.py's use_retracement) - a
+        # real .env flip to True would route these fixtures (missing
+        # plan["side"]) into enter_trade_retracement instead of the DCA/
+        # limit paths this class is actually testing. Pinned off, same
+        # isolation reason as every other routing test class here.
+        patcher = patch.object(config, "RETRACEMENT_ENTRY_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _plan(self, entry_extension_r=0.5):
         return {

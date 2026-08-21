@@ -354,15 +354,52 @@ def compute_targets(entry_price, sl_price, side, pools=None):
     tp2_max = max(float(config.TP2_MAX_R_MULTIPLE), tp2_min)
 
     tp1_price = _resolve_target(pools, entry_price, side, tp1_min, tp1_max, risk_distance)
-    tp1_actual_multiple = abs(tp1_price - entry_price) / risk_distance
+    tp2_price = _resolve_tp2_given_tp1(entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools)
 
-    # TP2 must clear whichever is further out: the configured floor, or
-    # at least 1R beyond wherever TP1 actually landed - guarantees TP2
-    # always sits meaningfully beyond TP1 regardless of whether either
-    # came from a real structure level or the fallback. Capped at its own
-    # max the same way TP1 is, for the same reason.
+    return tp1_price, tp2_price
+
+
+def _resolve_tp2_given_tp1(entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools=None):
+    """TP2's own real-liquidity-first resolution, given a TP1 price that's
+    already been decided by whatever means (compute_targets' own
+    structure-resolved TP1, or config.TP_STATIC_ROI_ENABLED's fixed-ROI%
+    one via compute_static_tp1_structure_tp2) - extracted out of
+    compute_targets so both callers share the exact same "TP2 must clear
+    whichever is further out: the configured floor, or at least 1R beyond
+    wherever TP1 actually landed" floor, regardless of TP1's origin."""
+    risk_distance = abs(entry_price - sl_price)
+
+    if risk_distance <= 0 or tp1_price is None:
+        return None
+
+    tp1_actual_multiple = abs(tp1_price - entry_price) / risk_distance
     tp2_min_multiple = min(max(tp2_min, tp1_actual_multiple + 1.0), tp2_max)
-    tp2_price = _resolve_target(pools, entry_price, side, tp2_min_multiple, tp2_max, risk_distance)
+    return _resolve_target(pools, entry_price, side, tp2_min_multiple, tp2_max, risk_distance)
+
+
+def compute_static_tp1_structure_tp2(entry_price, sl_price, side, roi_pct, pools=None):
+    """config.TP_STATIC_ROI_ENABLED - TP1 is a fixed ROI% target
+    (price_at_roi_pct, same math DCA_TP_STATIC_ROI_ENABLED's post-DCA
+    target already uses), TP2 is the EXISTING real-liquidity-first
+    structure target compute_targets' own TP2 half always computed - this
+    is NOT a new target-selection mechanism, just TP1's calculation
+    swapped out from the structure-resolved one. TP1(partial)+TP2
+    (remainder) close, breakeven-on-TP1-fill promotion, DCA-vs-TP1 race -
+    all unchanged, all driven generically off tp1_price/tp2_price exactly
+    like the non-static path, since neither position_manager.py nor
+    execution.py's dual-TP handling ever cared how tp1_price was computed,
+    only its value.
+
+    Returns (tp1_price, tp2_price) - either can be None on failure,
+    mirroring compute_targets' own None-on-failure shape."""
+    tp1_price = price_at_roi_pct(entry_price, side, roi_pct)
+
+    if tp1_price is None:
+        return None, None
+
+    tp2_min = max(float(config.TP2_R_MULTIPLE), 0)
+    tp2_max = max(float(config.TP2_MAX_R_MULTIPLE), tp2_min)
+    tp2_price = _resolve_tp2_given_tp1(entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools)
 
     return tp1_price, tp2_price
 
@@ -614,30 +651,34 @@ def build_trade_plan(signal, balance):
         return None, "SL_ROI_TOO_HIGH"
 
     # config.TP_STATIC_ROI_ENABLED - operator-requested alternative to the
-    # TP1(partial)+TP2(remainder) ladder below: ONE fixed ROI% target that
-    # closes the whole position at once, computed the same way DCA_TP_
-    # STATIC_ROI_ENABLED's post-DCA target already is (price_at_roi_pct).
-    # Skips compute_targets/TP1_CLOSE_PCT entirely - there is no partial
-    # close or breakeven-on-TP1-fill step in this mode, so tp1_price/
-    # tp2_price/tp1_quantity/tp2_quantity are deliberately left None
-    # rather than populated with values nothing will use.
-    single_tp = bool(config.TP_STATIC_ROI_ENABLED)
+    # fully structure-resolved TP1 below: TP1 becomes a fixed ROI% target
+    # (price_at_roi_pct, same math DCA_TP_STATIC_ROI_ENABLED's post-DCA
+    # target already uses) instead of a structure-resolved one, while TP2
+    # stays exactly the existing real-liquidity-first structure target
+    # (compute_static_tp1_structure_tp2 reuses compute_targets' own TP2
+    # resolution, just fed the static TP1 price as its "at least 1R beyond
+    # TP1" floor input). Still a normal TP1(partial)+TP2(remainder) close
+    # with breakeven-on-TP1-fill promotion - single_tp stays False here;
+    # that flag now only ever becomes True post-DCA (_execute_dca, a
+    # separate concept - see position_manager.py), never from this signal-
+    # time branch. 2026-08-19: originally shipped as a single whole-
+    # position target instead (tp1_price/tp2_price both None, single_tp
+    # True) - changed 2026-08-21 on operator request to reuse the existing
+    # TP2 machinery rather than replace it.
+    tp_price = None
+    single_tp = False
 
-    if single_tp:
-        tp_price = price_at_roi_pct(entry_price, side, config.TP_TARGET_ROI_PCT)
-
-        if tp_price is None:
-            return None, "TARGETS_UNAVAILABLE"
-
-        tp1_price = tp2_price = None
+    if config.TP_STATIC_ROI_ENABLED:
+        tp1_price, tp2_price = compute_static_tp1_structure_tp2(
+            entry_price, sl_price, side, config.TP_TARGET_ROI_PCT, pools=signal.get("liquidity_pools")
+        )
     else:
-        tp_price = None
         tp1_price, tp2_price = compute_targets(
             entry_price, sl_price, side, pools=signal.get("liquidity_pools")
         )
 
-        if tp1_price is None:
-            return None, "TARGETS_UNAVAILABLE"
+    if tp1_price is None or tp2_price is None:
+        return None, "TARGETS_UNAVAILABLE"
 
     nearest_favorable_sr_r = nearest_favorable_structure_r(
         signal.get("liquidity_pools"), entry_price, side, risk_distance

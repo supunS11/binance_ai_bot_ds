@@ -160,6 +160,67 @@ class ComputeTargetsTests(unittest.TestCase):
         self.assertIsNone(tp2)
 
 
+class ComputeStaticTp1StructureTp2Tests(unittest.TestCase):
+    """config.TP_STATIC_ROI_ENABLED - TP1 is a fixed ROI% price, TP2 is
+    the SAME real-liquidity-first target compute_targets' own TP2 half
+    would produce, just fed the static TP1 price as its own "at least 1R
+    beyond TP1" floor input instead of a structure-resolved one."""
+
+    def test_buy_tp1_is_static_tp2_falls_back_to_r_multiple(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), patch.object(config, "TP2_MAX_R_MULTIPLE", 10.0):
+            tp1, tp2 = risk_manager.compute_static_tp1_structure_tp2(
+                entry_price=100, sl_price=98, side="BUY", roi_pct=40,
+            )
+
+        self.assertAlmostEqual(tp1, 104.0)  # 40% ROI / 10x leverage = 4% price move
+        # risk_distance=2, tp1 sits at 2.0R -> TP2 floor = 2.0+1.0 = 3.0R,
+        # no pools -> plain fallback: 100 + 3*2.
+        self.assertAlmostEqual(tp2, 106.0)
+
+    def test_sell_mirrors_buy(self):
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), patch.object(config, "TP2_MAX_R_MULTIPLE", 10.0):
+            tp1, tp2 = risk_manager.compute_static_tp1_structure_tp2(
+                entry_price=100, sl_price=102, side="SELL", roi_pct=40,
+            )
+
+        self.assertAlmostEqual(tp1, 96.0)
+        self.assertAlmostEqual(tp2, 94.0)
+
+    def test_tp2_targets_a_real_pool_beyond_the_static_tp1(self):
+        pools = [{"type": "BUY_SIDE", "price": 108}]  # 4R - clears a 3R floor
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), patch.object(config, "TP2_MAX_R_MULTIPLE", 10.0):
+            tp1, tp2 = risk_manager.compute_static_tp1_structure_tp2(
+                entry_price=100, sl_price=98, side="BUY", roi_pct=40, pools=pools,
+            )
+
+        self.assertAlmostEqual(tp1, 104.0)
+        self.assertEqual(tp2, 108)  # real pool used instead of the fallback
+
+    def test_tp1_unavailable_returns_none_none(self):
+        # LEVERAGE=0 makes price_at_roi_pct fail.
+        with patch.object(config, "LEVERAGE", 0):
+            tp1, tp2 = risk_manager.compute_static_tp1_structure_tp2(
+                entry_price=100, sl_price=98, side="BUY", roi_pct=40,
+            )
+
+        self.assertIsNone(tp1)
+        self.assertIsNone(tp2)
+
+    def test_zero_risk_distance_still_returns_the_static_tp1(self):
+        # TP1 doesn't depend on risk_distance at all - only TP2 does.
+        with patch.object(config, "LEVERAGE", 10):
+            tp1, tp2 = risk_manager.compute_static_tp1_structure_tp2(
+                entry_price=100, sl_price=100, side="BUY", roi_pct=40,
+            )
+
+        self.assertAlmostEqual(tp1, 104.0)
+        self.assertIsNone(tp2)
+
+
 class StructureBasedTargetTests(unittest.TestCase):
     """TP1/TP2 should target a real liquidity pool when one exists with
     enough room, matching v7's structure-based TP - the R-multiple is
@@ -606,40 +667,54 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertIsNone(plan["tp_price"])
         self.assertFalse(plan["single_tp"])
 
-    def test_static_roi_mode_produces_a_single_full_close_tp(self):
+    def test_static_roi_mode_uses_static_tp1_and_structure_tp2(self):
+        # 2026-08-21: revised from a single whole-position target to a
+        # normal TP1(partial)+TP2(remainder) shape - TP1 is the fixed
+        # ROI% price, TP2 is the SAME real-liquidity-first structure
+        # target the non-static path would have produced (no pools here,
+        # so it falls back to the plain R-multiple distance).
         with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
              patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
              patch.object(config, "TP_TARGET_ROI_PCT", 40), \
              patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP2_MAX_R_MULTIPLE", 10.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
              patch.object(risk_manager, "calculate_position_size", return_value=10.0):
             plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
 
         self.assertEqual(status, "OK")
-        self.assertTrue(plan["single_tp"])
-        self.assertAlmostEqual(plan["tp_price"], 104.0)  # 40% ROI / 10x leverage = 4% price move
-        self.assertIsNone(plan["tp1_price"])
-        self.assertIsNone(plan["tp2_price"])
-        self.assertIsNone(plan["tp1_quantity"])
-        self.assertIsNone(plan["tp2_quantity"])
-        self.assertEqual(plan["quantity"], 10.0)  # full quantity, no TP1_CLOSE_PCT split
+        self.assertFalse(plan["single_tp"])
+        self.assertIsNone(plan["tp_price"])
+        self.assertAlmostEqual(plan["tp1_price"], 104.0)  # 40% ROI / 10x leverage = 4% price move
+        # risk_distance=2, tp1 landed at 2.0R -> TP2 floor becomes 3.0R
+        # (tp1's own 2.0R + 1.0R), no pool -> plain fallback: 100 + 3*2.
+        self.assertAlmostEqual(plan["tp2_price"], 106.0)
+        self.assertEqual(plan["quantity"], 10.0)
+        self.assertAlmostEqual(plan["tp1_quantity"], 5.0)
+        self.assertAlmostEqual(plan["tp2_quantity"], 5.0)
 
     def test_static_roi_mode_mirrors_for_sell(self):
         with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
              patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
              patch.object(config, "TP_TARGET_ROI_PCT", 40), \
              patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP2_MAX_R_MULTIPLE", 10.0), \
              patch.object(risk_manager, "calculate_position_size", return_value=10.0):
             plan, status = risk_manager.build_trade_plan(
                 self._signal(side="SELL", entry_price=100, structure_level=102), balance=1000,
             )
 
         self.assertEqual(status, "OK")
-        self.assertAlmostEqual(plan["tp_price"], 96.0)
+        self.assertAlmostEqual(plan["tp1_price"], 96.0)
+        self.assertAlmostEqual(plan["tp2_price"], 94.0)  # 100 - 3*2, mirrored
 
-    def test_static_roi_mode_ignores_tp1_close_pct(self):
-        # A 100% TP1_CLOSE_PCT would normally make the split invalid
-        # (TP_SPLIT_INVALID) - static ROI mode doesn't compute a split at
-        # all, so this must still succeed.
+    def test_static_roi_mode_respects_tp1_close_pct_same_as_normal_mode(self):
+        # 2026-08-21: no longer a special exemption - static-TP1 mode now
+        # goes through the exact same TP1_CLOSE_PCT split as the ordinary
+        # ladder, so a 100% close (leaving nothing for TP2) must still be
+        # rejected the same way.
         with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
              patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
              patch.object(config, "TP_TARGET_ROI_PCT", 40), \
@@ -648,7 +723,8 @@ class BuildTradePlanTests(unittest.TestCase):
              patch.object(risk_manager, "calculate_position_size", return_value=10.0):
             plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
 
-        self.assertEqual(status, "OK")
+        self.assertIsNone(plan)
+        self.assertEqual(status, "TP_SPLIT_INVALID")
 
     def test_static_roi_mode_unavailable_rejects_the_plan(self):
         with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
