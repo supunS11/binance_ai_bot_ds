@@ -66,6 +66,7 @@ class SignalEngineTests(unittest.TestCase):
         fvg_retest_level=None,
         fvg_retest_open_time=0,
         fvg_retest_index=0,
+        fvg_retest_tested_index=0,
         divergence_direction=None,
         divergence_level=None,
         divergence_index=5,
@@ -109,6 +110,10 @@ class SignalEngineTests(unittest.TestCase):
                 "direction": fvg_retest_direction, "level": fvg_retest_level,
                 "gap": {"index": fvg_retest_index},
                 "open_time": fvg_retest_open_time,
+                # market_structure.find_fvg_retest's own age-gate/setup_age_
+                # candles reference index - see its docstring for why this
+                # is distinct from len(ltf_candles)-1.
+                "tested_index": fvg_retest_tested_index,
             }
             if fvg_retest_direction else None
         )
@@ -928,7 +933,7 @@ class SignalEngineTests(unittest.TestCase):
             )
 
         self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
-        self.assertEqual(result["setup_age_candles"], 4)  # (1-1) - (-4)
+        self.assertEqual(result["setup_age_candles"], 4)  # tested_index(0) - gap_index(-4)
 
     def test_setup_age_reflects_how_old_the_retested_order_block_is(self):
         with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):

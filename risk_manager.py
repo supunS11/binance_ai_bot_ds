@@ -667,6 +667,16 @@ def build_trade_plan(signal, balance):
     # TP2 machinery rather than replace it.
     tp_price = None
     single_tp = False
+    # config.TP_STATIC_ROI_ENABLED - the ROI% actually used for TP1, or
+    # None when TP1 is structure-resolved instead. Carried through so a
+    # caller that later learns the REAL entry price differed from this
+    # one (position_manager._finalize_retracement_entry, under config.
+    # RETRACEMENT_ENTRY_ENABLED) can recompute TP1 correctly - unlike
+    # sl_price/tp2_price (real structure levels, meant to stay fixed
+    # regardless of entry slippage), a static TP1 is a pure function of
+    # entry_price and silently drifts off its intended ROI% if the price
+    # it was computed from turns out not to be the real one.
+    tp1_static_roi_pct = config.TP_TARGET_ROI_PCT if config.TP_STATIC_ROI_ENABLED else None
 
     if config.TP_STATIC_ROI_ENABLED:
         tp1_price, tp2_price = compute_static_tp1_structure_tp2(
@@ -739,6 +749,7 @@ def build_trade_plan(signal, balance):
         # where this actually branches into a differently-shaped position.
         "tp_price": tp_price,
         "single_tp": single_tp,
+        "tp1_static_roi_pct": tp1_static_roi_pct,
         "breakeven_price": compute_breakeven_price(entry_price, side),
         "quantity": quantity,
         "tp1_quantity": tp1_quantity,

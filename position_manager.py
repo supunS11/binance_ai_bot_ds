@@ -158,6 +158,22 @@ def _resolve_real_entry(plan, execution_result, side):
     chase half a percent of slippage on the entry would be wrong, that
     level doesn't move just because the fill did.
 
+    Known, accepted residual gap: config.TP_STATIC_ROI_ENABLED's TP1 is
+    NOT a structure level - it's a pure function of entry_price
+    (risk_manager.price_at_roi_pct) - so ordinary market-order slippage
+    technically makes it stale too, same slippage this function's own
+    docstring already describes for the general case. NOT corrected here,
+    because
+    by the time this runs the real TP1 order has ALREADY been placed
+    (enter_trade/enter_trade_dca_pending place it synchronously, before
+    the real fill price is even resolved) - correcting the tracked value
+    alone without also replacing the real resting order would make the
+    bot's own bookkeeping disagree with the exchange, worse than the
+    small (~0.25%, per the evidence above) staleness itself. See
+    _resolve_tp1_price below - only safe to use where protection orders
+    are placed AFTER the real entry_price is already known, e.g.
+    _finalize_retracement_entry's settle path.
+
     Shadow mode (no real order, no real_entry_price) and any resolution
     failure both fall through to the exact old behavior (the planned
     price) - this is a bookkeeping accuracy improvement, never a reason
@@ -179,6 +195,49 @@ def _resolve_real_entry(plan, execution_result, side):
 
     breakeven_price = risk_manager.compute_breakeven_price(entry_price, side)
     return entry_price, breakeven_price, risk_distance
+
+
+def _resolve_tp1_price(plan, entry_price, side):
+    """plan["tp1_price"] as risk_manager originally computed it, UNLESS
+    config.TP_STATIC_ROI_ENABLED was on for this plan (plan["tp1_static_
+    roi_pct"] is then the ROI% used, not None) - a static-ROI TP1 is a
+    pure function of entry_price, not a real structure level, so unlike
+    sl_price/tp2_price (deliberately left alone by _resolve_real_entry
+    above) it must be recomputed against whatever entry_price actually
+    turned out to be, or the position's real target silently drifts by
+    however much the real fill differed from the planned one.
+
+    Real bug found live (2026-08-21, SLXUSDT under config.RETRACEMENT_
+    ENTRY_ENABLED): a limit fill landed noticeably better than the
+    planned trigger price (that's the whole point of retracement entry),
+    but TP1 stayed computed off the STALE trigger price - closer than the
+    intended TP_TARGET_ROI_PCT, not the 10% ROI the setting promised.
+
+    ONLY safe to call from a settle path that places protection orders
+    AFTER the real entry_price is already known - _finalize_retracement_
+    entry (the caller this was built for) recomputes settled_plan["tp1_
+    price"] with this BEFORE execution.place_protection_orders/place_dca_
+    protection_orders ever run, so the real exchange order and the
+    tracked value always agree. NOT called from register()/register_dca_
+    pending() themselves - enter_trade/enter_trade_dca_pending place the
+    real TP1 order synchronously, before real_entry_price is even
+    resolved, so correcting only the tracked value there would make the
+    bot's own bookkeeping disagree with what's actually resting on the
+    exchange - see _resolve_real_entry's own docstring for that residual,
+    accepted gap (ordinary slippage only, much smaller than retracement's
+    deliberate price difference).
+
+    Falls back to the original plan value if the recompute itself fails
+    (entry_price<=0/LEVERAGE<=0) - same "never fail an entry over a
+    bookkeeping accuracy improvement" principle _resolve_real_entry
+    already follows."""
+    roi_pct = plan.get("tp1_static_roi_pct")
+
+    if roi_pct is None:
+        return plan["tp1_price"]
+
+    recomputed = risk_manager.price_at_roi_pct(entry_price, side, roi_pct)
+    return plan["tp1_price"] if recomputed is None else recomputed
 
 
 class PositionManager:
@@ -3209,19 +3268,26 @@ class PositionManager:
         genuine full limit fill, a blended limit+market-fallback fill, or
         (shadow mode) a simulated touch/fallback. Builds a settled plan
         (entry_price/quantity/tp1_quantity/tp2_quantity/breakeven_price/
-        risk_distance recomputed from these real numbers; every structure-
-        anchored level - sl_price/tp1_price/tp2_price/tp_price/dca_price -
+        risk_distance recomputed from these real numbers; every REAL
+        structure-anchored level - sl_price/tp2_price/tp_price/dca_price -
         left exactly as risk_manager originally computed it, same
         principle _resolve_real_entry already applies for ordinary
-        slippage on a synchronous market entry), places protection orders
-        (DCA-shaped or plain, per position["is_dca"]/plan["single_tp"]),
-        and hands off to register_dca_pending()/register() so the
-        position ends up in the exact same shape a direct, same-price
-        entry would have produced. Returns an outcome string only if a
-        non-DCA settle's SL placement failed outright (closed already, at
-        market - see execution.place_protection_orders); None otherwise,
-        including the ordinary case where this settled into DCA_PENDING/
-        TP1_PENDING, which is not itself a closed-trade outcome."""
+        slippage on a synchronous market entry. tp1_price is the one
+        exception: under config.TP_STATIC_ROI_ENABLED it's a pure
+        function of entry_price, not a structure level, so it's
+        recomputed here via _resolve_tp1_price - safe to do here
+        specifically because protection orders haven't been placed yet at
+        this point, unlike the synchronous entry paths - see that
+        function's own docstring for the real bug this closes), places
+        protection orders (DCA-shaped or plain, per position["is_dca"]/
+        plan["single_tp"]), and hands off to register_dca_pending()/
+        register() so the position ends up in the exact same shape a
+        direct entry at this real price would have produced from the
+        start. Returns an outcome string only if a non-DCA settle's SL
+        placement failed outright (closed already, at market - see
+        execution.place_protection_orders); None otherwise, including the
+        ordinary case where this settled into DCA_PENDING/TP1_PENDING,
+        which is not itself a closed-trade outcome."""
         plan = position["plan"]
         symbol = position["symbol"]
         side = position["side"]
@@ -3235,6 +3301,9 @@ class PositionManager:
         settled_plan["breakeven_price"] = risk_manager.compute_breakeven_price(entry_price, side)
         risk_distance = abs(entry_price - plan["sl_price"])
         settled_plan["risk_distance"] = risk_distance if risk_distance > 0 else plan.get("risk_distance")
+
+        if not plan.get("single_tp"):
+            settled_plan["tp1_price"] = _resolve_tp1_price(plan, entry_price, side)
 
         if plan.get("single_tp"):
             settled_plan["tp1_quantity"] = None

@@ -250,7 +250,18 @@ def evaluate(
             # formation, which OB_FVG_RETEST_MAX_AGE_CANDLES already caps
             # but was never journaled - see signal_journal.py's
             # setup_age_candles comment for why this was built.
-            "setup_age_candles": (len(ltf_candles) - 1) - fvg_retest["gap"]["index"],
+            #
+            # Real bug found live (2026-08-21, SYNUSDT journaled age=21
+            # despite OB_FVG_RETEST_MAX_AGE_CANDLES=20): using
+            # len(ltf_candles)-1 here measures a DIFFERENT candle than the
+            # gate itself checks whenever REQUIRE_CLOSE_CONFIRMED_BREAK is
+            # on and the very latest candle is still forming - the gate's
+            # own age-check (find_fvg_retest) uses the last CLOSED
+            # candle's index instead. tested_index is that same index,
+            # so this now measures the exact age that was actually
+            # enforced, never off by however many still-forming candles
+            # trail the last closed one.
+            "setup_age_candles": fvg_retest["tested_index"] - fvg_retest["gap"]["index"],
         })
 
     if config.LIQUIDITY_SWEEP_TRIGGER_ENABLED and sweep is not None:

@@ -693,6 +693,18 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertEqual(plan["quantity"], 10.0)
         self.assertAlmostEqual(plan["tp1_quantity"], 5.0)
         self.assertAlmostEqual(plan["tp2_quantity"], 5.0)
+        # config.RETRACEMENT_ENTRY_ENABLED - position_manager._resolve_tp1_price
+        # needs this to know TP1 must be recomputed if the real fill price
+        # ever differs from this plan's own.
+        self.assertEqual(plan["tp1_static_roi_pct"], 40)
+
+    def test_non_static_mode_leaves_tp1_static_roi_pct_none(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertIsNone(plan["tp1_static_roi_pct"])
 
     def test_static_roi_mode_mirrors_for_sell(self):
         with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \

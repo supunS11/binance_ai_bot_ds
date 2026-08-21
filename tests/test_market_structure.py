@@ -358,6 +358,23 @@ class FindFvgRetestTests(unittest.TestCase):
 
         self.assertEqual(result["open_time"], 3)
 
+    def test_result_includes_the_tested_candles_index(self):
+        # Real bug found live (2026-08-21): signal_engine.py's
+        # setup_age_candles used to recompute this as len(ltf_candles)-1
+        # instead of reading it from here - silently wrong whenever
+        # require_closed_candle left the tested candle short of the
+        # buffer's own last index (see the require_closed_candle test
+        # below for exactly that case).
+        candles = [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            _candle(3, high=10.8, low=10.5, open_=10.7, close=10.6),
+        ]
+        result = ms.find_fvg_retest(candles)
+
+        self.assertEqual(result["tested_index"], 3)
+
 
 class FindFvgRetestRequireClosedCandleTests(unittest.TestCase):
     """config.REQUIRE_CLOSE_CONFIRMED_BREAK - same real motivation as
@@ -388,6 +405,19 @@ class FindFvgRetestRequireClosedCandleTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["direction"], "BULLISH")
         self.assertEqual(result["open_time"], 3)
+
+    def test_tested_index_is_the_closed_candle_not_a_later_still_forming_one(self):
+        # The real scenario behind the setup_age_candles bug: a still-
+        # forming candle sits AFTER the one this function actually tested
+        # (and gated the age of) - tested_index must point at the closed
+        # one (3), not len(candles)-1 (4).
+        candles = self._gapped_candles(retest_closed=True) + [
+            _candle(4, high=10.9, low=10.6, open_=10.6, close=10.7, closed=False),
+        ]
+
+        result = ms.find_fvg_retest(candles, require_closed_candle=True)
+
+        self.assertEqual(result["tested_index"], 3)
 
     def test_no_closed_candle_at_all_returns_none(self):
         candles = [_candle(0, high=10, low=9, closed=False)]

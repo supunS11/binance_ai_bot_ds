@@ -475,7 +475,14 @@ def find_fvg_retest(candles, fvgs=None, max_age_candles=None, require_closed_can
     as detect_sweep's identical change: a live-candle wick-and-reject read
     that hadn't actually held by the time the candle finished forming.
     Returns the most recently formed qualifying gap (direction/level/gap/
-    open_time - the candle actually tested), or None."""
+    open_time - the candle actually tested), or None. tested_index is
+    that same tested candle's index within `candles` - the SAME index
+    this function's own age-gate check above (OB_FVG_RETEST_MAX_AGE_
+    CANDLES) already uses, so a caller computing "how old is this gap"
+    for its own purposes (signal_engine.py's setup_age_candles) measures
+    the exact same age the gate enforced, not a naive len(candles)-1 that
+    can silently differ by however many still-forming candles sit past
+    the last CLOSED one when require_closed_candle is True."""
     if len(candles) < 3:
         return None
 
@@ -513,10 +520,16 @@ def find_fvg_retest(candles, fvgs=None, max_age_candles=None, require_closed_can
             continue
 
         if gap["type"] == "BULLISH" and latest["low"] <= top and latest["close"] > bottom:
-            return {"direction": "BULLISH", "level": bottom, "gap": gap, "open_time": latest["open_time"]}
+            return {
+                "direction": "BULLISH", "level": bottom, "gap": gap,
+                "open_time": latest["open_time"], "tested_index": latest_index,
+            }
 
         if gap["type"] == "BEARISH" and latest["high"] >= bottom and latest["close"] < top:
-            return {"direction": "BEARISH", "level": top, "gap": gap, "open_time": latest["open_time"]}
+            return {
+                "direction": "BEARISH", "level": top, "gap": gap,
+                "open_time": latest["open_time"], "tested_index": latest_index,
+            }
 
     return None
 

@@ -12,7 +12,7 @@ import risk_manager
 import signal_engine
 from position_manager import (
     BREAKEVEN_ACTIVE, DCA_ACTIVE, DCA_PENDING, PENDING_LIMIT_FILL, RETRACEMENT_PENDING, TP1_PENDING,
-    PositionManager, _more_favorable, _order_type, _structure_stop_candidate,
+    PositionManager, _more_favorable, _order_type, _resolve_tp1_price, _structure_stop_candidate,
 )
 
 
@@ -3473,6 +3473,45 @@ class ResolveRetracementMarketFallbackTests(unittest.TestCase):
         self.assertIn("boom", error)
 
 
+class ResolveTp1PriceTests(unittest.TestCase):
+    """config.TP_STATIC_ROI_ENABLED - a static TP1 is a pure function of
+    entry_price, so unlike a structure-resolved one it must be recomputed
+    when the real entry_price differs from the plan's own (real bug found
+    live, 2026-08-21: a retracement fill better than the trigger price
+    left TP1 computed off the stale trigger)."""
+
+    def test_non_static_plan_returns_the_original_tp1_unchanged(self):
+        plan = {"tp1_price": 102, "tp1_static_roi_pct": None}
+        result = _resolve_tp1_price(plan, entry_price=99, side="BUY")
+        self.assertEqual(result, 102)
+
+    def test_static_plan_recomputes_from_the_real_entry_price(self):
+        plan = {"tp1_price": 104.0, "tp1_static_roi_pct": 40}  # originally computed off entry=100
+
+        with patch.object(config, "LEVERAGE", 10):
+            result = _resolve_tp1_price(plan, entry_price=99, side="BUY")
+
+        # 40% ROI / 10x leverage = 4% price move, off the REAL entry (99),
+        # not the plan's original one (100, which gave 104.0).
+        self.assertAlmostEqual(result, 99 * 1.04)
+
+    def test_static_plan_mirrors_for_sell(self):
+        plan = {"tp1_price": 96.0, "tp1_static_roi_pct": 40}
+
+        with patch.object(config, "LEVERAGE", 10):
+            result = _resolve_tp1_price(plan, entry_price=101, side="SELL")
+
+        self.assertAlmostEqual(result, 101 * 0.96)
+
+    def test_recompute_failure_falls_back_to_the_original_plan_value(self):
+        plan = {"tp1_price": 104.0, "tp1_static_roi_pct": 40}
+
+        with patch.object(config, "LEVERAGE", 0):  # makes price_at_roi_pct fail
+            result = _resolve_tp1_price(plan, entry_price=99, side="BUY")
+
+        self.assertEqual(result, 104.0)
+
+
 class FinalizeRetracementEntryTests(unittest.TestCase):
     def test_dca_dual_tp_places_tp1_tp2_no_sl_and_becomes_dca_pending(self):
         manager = _retracement_manager(dca=True, single_tp=False)
@@ -3495,6 +3534,32 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         sl.assert_not_called()
         tp1.assert_called_once()
         tp2.assert_called_once()
+
+    def test_static_tp1_is_recomputed_from_the_real_fill_not_the_stale_trigger(self):
+        # Real bug found live (2026-08-21, SLXUSDT): TP1 stayed computed
+        # off the planned trigger price even though the retracement limit
+        # filled at a meaningfully better real price - the real exchange
+        # order (and the tracked value) must reflect the ACTUAL entry.
+        manager = PositionManager()
+        execution_result = {"shadow": False, "entry_order": {"orderId": "limit1"}, "retracement_price": 99.8}
+        plan = _retracement_plan(dca=True, single_tp=False)
+        plan["tp1_price"] = 104.0  # as originally computed off the planned entry_price=100
+        plan["tp1_static_roi_pct"] = 40
+
+        with patch.object(config, "DCA_ENABLED", True):
+            manager.register_retracement_pending(plan, execution_result, trade_id="BTCUSDT_1")
+
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as tp1, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            manager._finalize_retracement_entry(position, 99.0, 1.0)  # real fill: 99.0, not the planned 100
+
+        final = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(final["tp1_price"], 99.0 * 1.04)  # 40% ROI/10x off the REAL entry
+        tp1.assert_called_once()
+        self.assertAlmostEqual(tp1.call_args.args[3], 99.0 * 1.04)  # the REAL order uses the same price
 
     def test_dca_single_tp_places_only_the_full_tp(self):
         manager = _retracement_manager(dca=True, single_tp=True)
