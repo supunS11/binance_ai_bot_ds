@@ -1064,6 +1064,33 @@ PROFIT_PROTECTION_LOCK_PCT_OF_TP1 = env_float(
     "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25
 )
 PROFIT_PROTECTION_RETRACE_PCT = env_float("PROFIT_PROTECTION_RETRACE_PCT", 50)
+# Real gap found live (2026-08-22, operator observation): every tiered
+# ACTIVATION_PCT_OF_TP1/_HIGH_ROI knob above assumes TP1 itself is a
+# variable, potentially large target - structure-based TP1 always was.
+# Under TP_STATIC_ROI_ENABLED, TP1 is a small, FIXED ROI% (TP_TARGET_
+# ROI_PCT, typically ~10%) well under PROFIT_PROTECTION_HIGH_TP1_ROI_
+# THRESHOLD_PCT, so it always lands on the plain (80%) activation branch -
+# arming at ~8% ROI and then locking/retracing from there, on a target
+# that was only ever 10% away in the first place. Real trade (TREEUSDT,
+# 2026-08-21): armed at 8% ROI, price ran to ~9% (never reached the 10%
+# TP1), reversed, and closed via the trailing stop for ~4% gross - a
+# fraction of a target that was already small and often achievable in
+# full. Unlike EARLY_BREAKEVEN (a flat R-multiple of risk_distance,
+# genuinely a different, still-relevant metric), profit protection's
+# whole premise - protecting a potentially-large, slow-to-resolve TP1 -
+# doesn't fit a small, fast, fixed target the same way; letting it run to
+# the real TP1 or the original SL is a tighter, faster resolution either
+# way. Scoped to the pre-TP1 leg only (_is_profit_protection_candidate,
+# TP1_PENDING/DCA_PENDING) - the post-TP1 remainder still running toward
+# a real, structure-based TP2 (_is_dca_profit_protection_candidate,
+# DCA_ACTIVE/BREAKEVEN_ACTIVE) is untouched, since TP2 is never static and
+# keeps the same "can be far away, worth protecting early" justification
+# as before. Evidence is thin (5 pre-TP1 trades matching this pattern,
+# no counterfactual showing what would have happened without it) but
+# consistent and directly requested - default ON.
+PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED = env_bool(
+    "PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED", "True"
+)
 # Replaces the fixed EARLY_BREAKEVEN_LOCK_R_MULTIPLE distance with the
 # most recent CONFIRMED swing point in the trade's favor
 # (market_structure.structure_state's last_swing_low/last_swing_high),

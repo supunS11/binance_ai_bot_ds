@@ -1094,7 +1094,8 @@ class ProfitProtectionEligibilityTests(unittest.TestCase):
     def test_otherwise_eligible_position_is_a_candidate(self):
         manager = PositionManager()
 
-        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False):
             self.assertTrue(manager._is_profit_protection_candidate(self._position()))
 
     def test_single_tp_dca_pending_is_never_a_candidate(self):
@@ -1114,10 +1115,44 @@ class ProfitProtectionEligibilityTests(unittest.TestCase):
         # candidate - identical real gap, same fix.
         manager = PositionManager()
 
-        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False):
             self.assertTrue(manager._is_profit_protection_candidate(
                 self._position(stage=DCA_PENDING)
             ))
+
+    def test_static_tp1_is_not_a_candidate_when_the_skip_flag_is_on(self):
+        # config.PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED - real
+        # motivation (2026-08-22): TP1 under TP_STATIC_ROI_ENABLED is a
+        # small, fixed ROI% target, not the variable/potentially-large one
+        # the activation tiers were built around (TREEUSDT, 2026-08-21:
+        # armed at 8% of a 10%-ROI TP1, reversed before reaching it,
+        # closed for ~4% - a fraction of an already-small target).
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED", True):
+            self.assertFalse(manager._is_profit_protection_candidate(self._position()))
+
+    def test_static_tp1_still_a_candidate_when_the_skip_flag_is_off(self):
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED", False):
+            self.assertTrue(manager._is_profit_protection_candidate(self._position()))
+
+    def test_structure_tp1_is_unaffected_by_the_skip_flag(self):
+        # The skip only fires when TP_STATIC_ROI_ENABLED is ALSO True -
+        # a structure-based TP1 (the flag off) keeps today's behavior
+        # regardless of PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED.
+        manager = PositionManager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False), \
+             patch.object(config, "PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED", True):
+            self.assertTrue(manager._is_profit_protection_candidate(self._position()))
 
 
 class ProfitProtectionPriceReachedTests(unittest.TestCase):
@@ -2225,6 +2260,7 @@ class PollShadowTests(unittest.TestCase):
         # (60% of that)=101.2. LOCK_PCT_OF_TP1=10% -> floor=100.2 fixed;
         # RETRACE_PCT=50% of the entry->peak gain retained.
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False), \
              patch.object(config, "LEVERAGE", 10), \
              patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
              patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
@@ -2907,6 +2943,7 @@ class ProfitProtectionPollLiveTests(PollLiveTests):
         manager = self._manager_with_position()
 
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False), \
              patch.object(config, "LEVERAGE", 10), \
              patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
              patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
@@ -2946,6 +2983,7 @@ class ProfitProtectionPollLiveTests(PollLiveTests):
         manager = self._manager_with_position()
 
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False), \
              patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.1), \
              patch.object(config, "LEVERAGE", 10), \
@@ -2970,6 +3008,7 @@ class ProfitProtectionPollLiveTests(PollLiveTests):
         manager = self._manager_with_position()
 
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False), \
              patch.object(config, "LEVERAGE", 10), \
              patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
              patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
@@ -4407,6 +4446,7 @@ class PollShadowDcaPendingTests(unittest.TestCase):
         candle = _candle(high=101, low=99.5, close=101)
 
         with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", False), \
              patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 1), \
              patch.object(config, "LEVERAGE", 10):
             outcome = manager.poll_shadow("BTCUSDT", candle)

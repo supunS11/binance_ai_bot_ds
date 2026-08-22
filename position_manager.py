@@ -1916,6 +1916,15 @@ class PositionManager:
         if position.get("single_tp"):
             return False
 
+        # config.PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED - see
+        # config.py's own comment for the full reasoning. TP1 here is a
+        # small, fixed ROI% target, not the variable/potentially-large
+        # one the activation tiers above were built around - the
+        # post-TP1 remainder toward a real TP2 (_is_dca_profit_
+        # protection_candidate) is a separate check, untouched by this.
+        if config.PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED and config.TP_STATIC_ROI_ENABLED:
+            return False
+
         return position.get("tp1_price") is not None
 
     def _is_dca_profit_protection_candidate(self, position):
