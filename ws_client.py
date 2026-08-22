@@ -24,6 +24,7 @@ from order_flow import CVDEngine
 from orderbook import DepthImbalanceEngine
 from open_interest import OpenInterestEngine
 from liquidation_tracker import LiquidationEngine, LIQUIDATION_STREAM_URL
+from crash_detector import CrashDetector
 
 
 FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
@@ -136,6 +137,7 @@ class RealtimeMarketData:
         self.depth = DepthImbalanceEngine()
         self.open_interest = OpenInterestEngine()
         self.liquidations = LiquidationEngine()
+        self.crash_detector = CrashDetector()
         # 24h quote volume per symbol - the data behind the signal-time
         # liquidity floor (config.MIN_24H_QUOTE_VOLUME_USDT). Plain dict,
         # not a dedicated engine class: it's a single bulk snapshot
@@ -483,6 +485,13 @@ class RealtimeMarketData:
             bool(data.get("m")),
             timestamp=timestamp,
         )
+
+        # config.CRASH_DETECTOR_REFERENCE_SYMBOL - single-symbol check,
+        # negligible added cost on this otherwise-hot per-tick path (see
+        # crash_detector.py for why this needs the raw trade stream
+        # instead of the much coarser LTF kline).
+        if symbol == config.CRASH_DETECTOR_REFERENCE_SYMBOL:
+            self.crash_detector.record_price(data.get("p"), timestamp=timestamp)
 
     # =========================
     # DEPTH (heavier - own socket group, only for the watchlist tier)

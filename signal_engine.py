@@ -50,7 +50,7 @@ def long_short_favorable(side, long_short_ratio):
 def evaluate(
     symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
     oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,
-    btc_candles=None, funding_rate=None,
+    btc_candles=None, funding_rate=None, crash_snapshot=None,
 ):
     if not htf_candles or not ltf_candles:
         return _reject("INSUFFICIENT_CANDLES")
@@ -600,6 +600,33 @@ def evaluate(
         # it into one count instead of one per oi_change_pct value.
         if config.OI_RISING_REJECT_ENABLED and oi_rising:
             return _reject("OI_RISING")
+
+        # CRASH_MODE - config.CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED. See
+        # crash_detector.py for the real incident this was built for: a
+        # BUY position DCA'd right into the bottom of a BTC flash-crash
+        # while every SELL-side position open at the same moment profited
+        # from the identical move. Only blocks the side that would be
+        # ADDING risk in the crash's own direction (BUY during a BEARISH
+        # crash, SELL during a BULLISH one) - the aligned side is exactly
+        # the kind of setup this detector's own evidence shows benefits
+        # from the move, not one that needs blocking. Universal across
+        # triggers (same as OI_RISING/DEPTH_OPPOSING) - a market-wide
+        # condition has no relationship to any one trigger's own detection
+        # logic. Reason string carries no continuous value, same
+        # aggregation-friendly convention as every other reject reason
+        # here.
+        crash_snapshot_ = crash_snapshot or {}
+
+        if (
+            config.CRASH_DETECTOR_ENABLED
+            and config.CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED
+            and crash_snapshot_.get("active")
+            and (
+                (side == "BUY" and crash_snapshot_.get("direction") == "BEARISH")
+                or (side == "SELL" and crash_snapshot_.get("direction") == "BULLISH")
+            )
+        ):
+            return _reject("CRASH_MODE")
 
         # Liquidation clustering: informational only, NOT a gate - see
         # config.LIQUIDATION_CONFIRMATION_ENABLED for rationale. A

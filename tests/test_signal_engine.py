@@ -95,6 +95,7 @@ class SignalEngineTests(unittest.TestCase):
         btc_return=0.02,
         funding_rate=None,
         oi_rising_reject_enabled=False,
+        crash_snapshot=None,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -201,7 +202,7 @@ class SignalEngineTests(unittest.TestCase):
                 symbol, ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
                 quote_volume_usdt=quote_volume_usdt, btc_candles=btc_candles,
-                funding_rate=funding_rate,
+                funding_rate=funding_rate, crash_snapshot=crash_snapshot,
             )
 
     def test_full_buy_signal_when_everything_aligns(self):
@@ -605,6 +606,75 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
         self.assertIsNone(result["oi_change_pct"])
         self.assertIsNone(result["oi_rising"])
+
+    def test_crash_mode_blocks_a_buy_during_a_bearish_crash(self):
+        # config.CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED - real motivation
+        # (2026-08-22): a BUY DCA'd right into the bottom of a real BTC
+        # flash-crash while every SELL-side position open at the same
+        # moment profited from the identical move.
+        with patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED", True):
+            result = self._run(
+                crash_snapshot={"available": True, "active": True, "direction": "BEARISH"},
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "CRASH_MODE")
+
+    def test_crash_mode_blocks_a_sell_during_a_bullish_crash(self):
+        with patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH,
+                ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH",
+                ema_value=115.0,
+                crash_snapshot={"available": True, "active": True, "direction": "BULLISH"},
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "CRASH_MODE")
+
+    def test_crash_mode_does_not_block_the_aligned_side(self):
+        # A BUY during a BULLISH crash (a violent rally) is the side that
+        # benefits from the move, not the one this gate exists to protect.
+        with patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED", True):
+            result = self._run(
+                crash_snapshot={"available": True, "active": True, "direction": "BULLISH"},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_crash_mode_does_not_block_when_inactive(self):
+        with patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED", True):
+            result = self._run(
+                crash_snapshot={"available": True, "active": False, "direction": None},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_crash_mode_does_not_block_when_the_block_flag_is_off(self):
+        with patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED", False):
+            result = self._run(
+                crash_snapshot={"available": True, "active": True, "direction": "BEARISH"},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_crash_mode_does_not_block_when_the_master_flag_is_off(self):
+        with patch.object(config, "CRASH_DETECTOR_ENABLED", False), \
+             patch.object(config, "CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED", True):
+            result = self._run(
+                crash_snapshot={"available": True, "active": True, "direction": "BEARISH"},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
 
     def test_liquidation_cluster_aligned_with_bullish_break_is_recorded(self):
         result = self._run(liquidation_snapshot={

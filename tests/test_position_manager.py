@@ -4316,6 +4316,96 @@ class ExecuteDcaPressureCheckTests(unittest.TestCase):
 
         market_order.assert_called_once_with("BTCUSDT", "BUY", 0.5)  # reduced, not the plan's 1.0
 
+    # config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED - real motivation
+    # (2026-08-22): a BUY DCA'd right into the bottom of a real BTC
+    # flash-crash. _dca_plan() defaults side="BUY", so a BEARISH crash is
+    # the risk side these tests exercise.
+
+    def test_crash_mode_forces_not_confirmed_even_when_the_normal_check_says_confirmed(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            manager._execute_dca(
+                position, htf_candles=["htf"], cvd_snapshot={}, current_price=96,
+                crash_snapshot={"available": True, "active": True, "direction": "BEARISH"},
+            )
+
+        self.assertFalse(position["dca_pressure_confirmed"])
+        build_plan.assert_called_once_with(
+            100, 1.0, 96, 0.5, "BUY", None, atr=1.0, buffer_atr_multiple=0.25,
+        )
+
+    def test_crash_mode_on_the_aligned_side_does_not_force(self):
+        # A BUY during a BULLISH crash (a violent rally) is the side that
+        # benefits, not the one this exists to protect.
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            manager._execute_dca(
+                position, htf_candles=["htf"], cvd_snapshot={}, current_price=96,
+                crash_snapshot={"available": True, "active": True, "direction": "BULLISH"},
+            )
+
+        self.assertTrue(position["dca_pressure_confirmed"])
+
+    def test_crash_mode_inactive_does_not_force(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            manager._execute_dca(
+                position, htf_candles=["htf"], cvd_snapshot={}, current_price=96,
+                crash_snapshot={"available": True, "active": False, "direction": None},
+            )
+
+        self.assertTrue(position["dca_pressure_confirmed"])
+
+    def test_crash_force_flag_off_does_not_force(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED", False), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            manager._execute_dca(
+                position, htf_candles=["htf"], cvd_snapshot={}, current_price=96,
+                crash_snapshot={"available": True, "active": True, "direction": "BEARISH"},
+            )
+
+        self.assertTrue(position["dca_pressure_confirmed"])
+
+    def test_crash_master_flag_off_does_not_force(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(config, "CRASH_DETECTOR_ENABLED", False), \
+             patch.object(config, "CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            manager._execute_dca(
+                position, htf_candles=["htf"], cvd_snapshot={}, current_price=96,
+                crash_snapshot={"available": True, "active": True, "direction": "BEARISH"},
+            )
+
+        self.assertTrue(position["dca_pressure_confirmed"])
+
 
 class PollShadowDcaPendingTests(unittest.TestCase):
     def setUp(self):

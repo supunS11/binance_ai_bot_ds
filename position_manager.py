@@ -1639,7 +1639,10 @@ class PositionManager:
         dca_price = position["dca_price"]
         return current_price <= dca_price if side == "BUY" else current_price >= dca_price
 
-    def _execute_dca(self, position, candles=None, htf_candles=None, cvd_snapshot=None, current_price=None):
+    def _execute_dca(
+        self, position, candles=None, htf_candles=None, cvd_snapshot=None, current_price=None,
+        crash_snapshot=None,
+    ):
         """config.DCA_ENABLED - price reached position["dca_price"]
         before TP1 ever filled. Adds position["dca_quantity"] at that
         level, computes the blended entry / first-ever-real-SL / single-
@@ -1663,6 +1666,17 @@ class PositionManager:
         only used when that flag is on; a no-op without it, same
         convention as every other optional-data parameter in this class.
 
+        config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED - extends the
+        pressure check above rather than replacing it: if a market-wide
+        crash is active in the direction this DCA is fighting (BUY DCA
+        during a BEARISH crash, SELL DCA during a BULLISH one), pressure
+        is forced not-confirmed regardless of what direction_still_
+        confirmed found - a confirmed market-wide crash is stronger, more
+        directly-evidenced signal than the per-symbol trend/CVD read.
+        Deliberately does NOT skip the DCA itself (see crash_detector.py/
+        config.py for why - this position has no real SL until this DCA
+        places one).
+
         Returns a close-outcome string only if the post-DCA SL placement
         failed badly enough to force closing the position; otherwise
         None (including the ordinary case where DCA succeeded and the
@@ -1680,6 +1694,26 @@ class PositionManager:
             pressure_confirmed, pressure_detail = signal_engine.direction_still_confirmed(
                 side, htf_candles, candles, cvd_snapshot, current_price
             )
+
+            crash_snapshot_ = crash_snapshot or {}
+            crash_forced = (
+                config.CRASH_DETECTOR_ENABLED
+                and config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED
+                and crash_snapshot_.get("active")
+                and (
+                    (side == "BUY" and crash_snapshot_.get("direction") == "BEARISH")
+                    or (side == "SELL" and crash_snapshot_.get("direction") == "BULLISH")
+                )
+            )
+
+            if crash_forced and pressure_confirmed:
+                pressure_confirmed = False
+                pressure_detail = {
+                    **(pressure_detail or {}),
+                    "crash_detector_forced": True,
+                    "crash_direction": crash_snapshot_.get("direction"),
+                    "crash_move_pct": crash_snapshot_.get("pct_move"),
+                }
 
             if not pressure_confirmed:
                 dca_quantity = round(
@@ -2137,7 +2171,9 @@ class PositionManager:
 
         return False
 
-    def poll_live(self, symbol, candles=None, htf_candles=None, cvd_snapshot=None):
+    def poll_live(
+        self, symbol, candles=None, htf_candles=None, cvd_snapshot=None, crash_snapshot=None,
+    ):
         """Returns an outcome string if the position closed this call,
         otherwise None. `candles` (LTF history for the symbol) is only
         used by config.STRUCTURE_STOP_MANAGEMENT_ENABLED's structure-aware
@@ -2145,7 +2181,9 @@ class PositionManager:
         when it's not supplied. `htf_candles`/`cvd_snapshot` are only used
         by config.DCA_BREAKEVEN_CONFIRMATION_ENABLED (see
         _dca_breakeven_confirmation) and config.DCA_PRESSURE_CHECK_ENABLED
-        (see _execute_dca) - also a no-op without them, same convention."""
+        (see _execute_dca) - also a no-op without them, same convention.
+        `crash_snapshot` - config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED,
+        also only consumed by _execute_dca, same no-op-without-it shape."""
         position = self.positions.get(symbol)
 
         if not position or position["shadow"]:
@@ -2196,6 +2234,7 @@ class PositionManager:
                 return self._execute_dca(
                     position, candles=candles, htf_candles=htf_candles,
                     cvd_snapshot=cvd_snapshot, current_price=current_price,
+                    crash_snapshot=crash_snapshot,
                 )
 
             if self._try_early_promotions(
@@ -2696,7 +2735,10 @@ class PositionManager:
 
         return False
 
-    def poll_shadow(self, symbol, latest_candle, candles=None, htf_candles=None, cvd_snapshot=None):
+    def poll_shadow(
+        self, symbol, latest_candle, candles=None, htf_candles=None, cvd_snapshot=None,
+        crash_snapshot=None,
+    ):
         """Simulates the same TP1 -> breakeven -> TP2/SL sequence against
         live price action. When both the stop and a target fall inside the
         same candle's range, the SL side is assumed to have been touched
@@ -2704,9 +2746,10 @@ class PositionManager:
         don't overstate win rate; it is not a substitute for real fills.
         `candles` (LTF history) is only used by config.STRUCTURE_STOP_MANAGEMENT_ENABLED's
         structure-aware early-breakeven lock and post-TP1 trailing - both
-        are no-ops when it's not supplied. `htf_candles`/`cvd_snapshot` -
-        see poll_live's own docstring, same DCA_BREAKEVEN_CONFIRMATION_
-        ENABLED/DCA_PRESSURE_CHECK_ENABLED no-op convention."""
+        are no-ops when it's not supplied. `htf_candles`/`cvd_snapshot`/
+        `crash_snapshot` - see poll_live's own docstring, same
+        DCA_BREAKEVEN_CONFIRMATION_ENABLED/DCA_PRESSURE_CHECK_ENABLED/
+        CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED no-op convention."""
         position = self.positions.get(symbol)
 
         if not position or not position["shadow"] or not latest_candle:
@@ -2761,6 +2804,7 @@ class PositionManager:
                     return self._execute_dca(
                         position, candles=candles, htf_candles=htf_candles,
                         cvd_snapshot=cvd_snapshot, current_price=latest_candle["close"],
+                        crash_snapshot=crash_snapshot,
                     )
 
             if self._try_early_promotions_shadow(position, latest_candle, candles):

@@ -16,6 +16,11 @@ class _FakeSnapshotSource:
         return {"available": False}
 
 
+class _FakeCrashDetector:
+    def snapshot(self, now=None):
+        return {"available": False, "active": False, "direction": None, "pct_move": 0.0}
+
+
 class _FakeCandleSource:
     def __init__(self, candles=None):
         self._candles = candles if candles is not None else [{"open_time": 0, "close": 1}]
@@ -35,6 +40,7 @@ class _FakeFeed:
         self.depth = _FakeSnapshotSource()
         self.open_interest = _FakeSnapshotSource()
         self.liquidations = _FakeSnapshotSource()
+        self.crash_detector = _FakeCrashDetector()
         self.volumes = volumes if volumes is not None else {}
         self.funding_rates = funding_rates if funding_rates is not None else {}
 
@@ -1004,6 +1010,7 @@ class PollPositionsDispatchTests(unittest.TestCase):
         positions.poll_live.assert_called_once_with(
             "BTCUSDT", candles=feed.candles.get("BTCUSDT"),
             htf_candles=feed.htf_candles.get("BTCUSDT"), cvd_snapshot=feed.cvd.snapshot("BTCUSDT"),
+            crash_snapshot=feed.crash_detector.snapshot(),
         )
         positions.poll_pending_entry.assert_not_called()
         positions.poll_shadow_pending_entry.assert_not_called()

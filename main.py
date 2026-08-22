@@ -176,12 +176,13 @@ def _evaluate_symbol(
     quote_volume_usdt = feed.volumes.get(symbol)
     btc_candles = feed.candles.get(config.CORRELATION_REFERENCE_SYMBOL)
     funding_rate = feed.funding_rates.get(symbol)
+    crash_snapshot = feed.crash_detector.snapshot()
 
     result = signal_engine.evaluate(
         symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
         oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
         quote_volume_usdt=quote_volume_usdt, btc_candles=btc_candles,
-        funding_rate=funding_rate,
+        funding_rate=funding_rate, crash_snapshot=crash_snapshot,
     )
 
     if not result.get("signal"):
@@ -371,17 +372,23 @@ def _poll_positions(feed, positions):
         # here, same convention as candles= above.
         htf_candles = feed.htf_candles.get(symbol)
         cvd_snapshot = feed.cvd.snapshot(symbol)
+        # config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED - same cheap
+        # in-memory read as htf_candles/cvd_snapshot above, only actually
+        # consumed by PositionManager._execute_dca, a no-op otherwise.
+        crash_snapshot = feed.crash_detector.snapshot()
 
         if position["shadow"]:
             latest_candle = feed.candles.latest(symbol)
             positions.poll_shadow(
                 symbol, latest_candle, candles=feed.candles.get(symbol),
                 htf_candles=htf_candles, cvd_snapshot=cvd_snapshot,
+                crash_snapshot=crash_snapshot,
             )
         else:
             positions.poll_live(
                 symbol, candles=feed.candles.get(symbol),
                 htf_candles=htf_candles, cvd_snapshot=cvd_snapshot,
+                crash_snapshot=crash_snapshot,
             )
 
     # Full-fidelity snapshot for the next restart - see position_manager.

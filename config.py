@@ -190,6 +190,51 @@ CHOP_FILTER_LOOKBACK_CANDLES = env_int("CHOP_FILTER_LOOKBACK_CANDLES", 14)
 BTC_CORRELATION_ENABLED = env_bool("BTC_CORRELATION_ENABLED", "True")
 CORRELATION_LOOKBACK_CANDLES = env_int("CORRELATION_LOOKBACK_CANDLES", 20)
 CORRELATION_REFERENCE_SYMBOL = os.getenv("CORRELATION_REFERENCE_SYMBOL", "BTCUSDT").upper()
+# =========================
+# CRASH DETECTOR
+# =========================
+# Real incident (2026-08-22): a BTC flash-crash (~2.65% in ~4 minutes,
+# 05:07-05:11 UTC) caught one open BUY position mid-DCA - it averaged in
+# right at the bottom, then its real SL placement was rejected by the
+# exchange ("Order would immediately trigger" - price had already blown
+# through the level), forcing an emergency market-close at a real loss.
+# Every position on the OTHER side of the same move profited from it.
+# config.DCA_PRESSURE_CHECK_ENABLED DID fire correctly at that exact
+# moment (reduced the DCA size) - real, working infrastructure, just not
+# strong enough alone: volume was already 15-20x normal a full 2 minutes
+# before that damaging DCA fired, real lead time crash_detector.py exists
+# to use. See crash_detector.py's own docstring for the full mechanism.
+#
+# Two-phase rollout, same convention as DCA_BREAKEVEN_CONFIRMATION_
+# ENABLED/..._WITHHOLD_ENABLED above: detection itself ships on
+# immediately (tracking + transition logging only, zero trading behavior
+# change on its own) - the two behavior-changing switches below ship OFF
+# until the detector's been observed firing correctly against real data
+# a few more times.
+CRASH_DETECTOR_ENABLED = env_bool("CRASH_DETECTOR_ENABLED", "True")
+# The actual behavior-changing switches - both require CRASH_DETECTOR_
+# ENABLED ALSO on to do anything. Left independently toggleable so the
+# informational phase can run for as long as needed without either being
+# touched.
+CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED = env_bool("CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED", "False")
+CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED = env_bool(
+    "CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED", "False"
+)
+CRASH_DETECTOR_REFERENCE_SYMBOL = os.getenv("CRASH_DETECTOR_REFERENCE_SYMBOL", "BTCUSDT").upper()
+# Real incident's damaging leg fit inside ~4 minutes - 3 minutes catches
+# a move like that mid-way through, not only after it's already over.
+CRASH_DETECTOR_WINDOW_SECONDS = env_int("CRASH_DETECTOR_WINDOW_SECONDS", 180)
+# Real incident moved ~2.65% in ~4 min; ordinary 15-min BTC swings around
+# it (same day's own price history) were all under 0.6%. 1.5% within a
+# 3-min window sits meaningfully above routine noise and below the real
+# event, with margin either way. Starting value, not fully calibrated -
+# only one real incident exists to check it against so far - revisit
+# once it's been observed live a few more times.
+CRASH_DETECTOR_MOVE_PCT = env_float("CRASH_DETECTOR_MOVE_PCT", 1.5)
+# Stays active this long after the LAST trigger (extends, not resets, on
+# repeat triggers - see crash_detector.py's _trigger) so a sustained
+# crash doesn't flicker crash-mode off on a single brief bounce.
+CRASH_DETECTOR_COOLDOWN_SECONDS = env_int("CRASH_DETECTOR_COOLDOWN_SECONDS", 600)
 # HTF bias freshness check. Real motivation (2026-08-15, traced directly
 # against real Binance history): htf_structure's trend comes from
 # structure_state() applied to the HTF (4h) candles using the SAME
