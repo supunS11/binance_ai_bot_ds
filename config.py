@@ -432,6 +432,22 @@ CHOCH_TRIGGER_MIN_AGE_CANDLES = env_int("CHOCH_TRIGGER_MIN_AGE_CANDLES", 9)
 # where freshness should matter more). Default OFF.
 OB_FVG_RETEST_TRIGGER_ENABLED = env_bool("OB_FVG_RETEST_TRIGGER_ENABLED", "False")
 OB_FVG_RETEST_MAX_AGE_CANDLES = env_int("OB_FVG_RETEST_MAX_AGE_CANDLES", 20)
+# How far the retest candle's CLOSE has to reclaim back out of the gap
+# before the retest qualifies - see market_structure.find_fvg_retest's own
+# docstring for the full reasoning. 0.0 = original behavior (close
+# anywhere past the gap's far edge, no minimum reclaim depth). 0.5 =
+# midpoint (default). Real motivation (2026-08-22): live OB_FVG_RETEST
+# trades averaged ~0.68R max adverse excursion even on eventual WINS
+# (28% of wins still ran 1R+ against the position first), and the
+# original condition (close > bottom for BULLISH / close < top for
+# BEARISH) accepted a close barely off the far edge - deep inside the
+# zone - as an equally valid "retest" as a strong reclaim near the near
+# edge. Not outcome-validated yet (the journal never captured
+# close-position-within-gap before this change existed to check it
+# against) - a reasoned starting point, not the literal strictest option
+# (1.0 would reject genuine retests along with weak ones). Revisit once
+# trades post-dating this change have resolved.
+OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT = env_float("OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT", 0.5)
 # Extra consecutive SIGNAL_CONFIRM_TICKS (main.py's SignalStabilityTracker)
 # required for any trigger except the one proven trigger, STRUCTURE_BREAK -
 # LIQUIDITY_SWEEP (already live), CHOCH_RETEST, and OB_FVG_RETEST all get

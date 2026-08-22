@@ -459,7 +459,10 @@ def find_liquidity_pools(swings, tolerance_pct=None):
     return pools
 
 
-def find_fvg_retest(candles, fvgs=None, max_age_candles=None, require_closed_candle=None):
+def find_fvg_retest(
+    candles, fvgs=None, max_age_candles=None, require_closed_candle=None,
+    min_close_through_pct=None,
+):
     """A fresh rejection wick into an UNMITIGATED fair value gap - the
     classic OB/FVG "retest" entry, independent of any live structure break
     right now. "Unmitigated" means no candle strictly between the gap's
@@ -482,12 +485,38 @@ def find_fvg_retest(candles, fvgs=None, max_age_candles=None, require_closed_can
     for its own purposes (signal_engine.py's setup_age_candles) measures
     the exact same age the gate enforced, not a naive len(candles)-1 that
     can silently differ by however many still-forming candles sit past
-    the last CLOSED one when require_closed_candle is True."""
+    the last CLOSED one when require_closed_candle is True.
+
+    min_close_through_pct (config.OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT)
+    raises how far the retest candle's CLOSE has to reclaim back out of
+    the gap, measured from the far edge (0.0, the close-anywhere-past-the-
+    far-edge behavior this function originally shipped with) toward the
+    near edge (1.0, a full close back outside the gap). Real motivation
+    (2026-08-22): live OB_FVG_RETEST trades were still averaging ~0.68R
+    max adverse excursion even on trades that went on to WIN (28% of wins
+    still ran 1R+ against the position first) - and reading this
+    function's own qualifying condition showed why: the original
+    close > bottom (BULLISH) / close < top (BEARISH) check accepts a
+    retest candle that closes barely off the gap's far edge, deep inside
+    the zone, as equally valid as one that closes back near the near edge
+    - no confirmation the rejection actually has any strength behind it.
+    Defaults to the midpoint (0.5), not the strictest 1.0: a full close
+    back outside the gap would reject a lot of genuine retests along with
+    the weak ones, and no outcome data yet exists isolating exactly how
+    much depth is enough - the journal never captured close-position-
+    within-gap before now, so this is a reasoned, not yet outcome-
+    validated, starting point (revisit once trades post-dating this
+    change have resolved)."""
     if len(candles) < 3:
         return None
 
     if require_closed_candle is None:
         require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    if min_close_through_pct is None:
+        min_close_through_pct = float(config.OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT)
+
+    min_close_through_pct = min(max(min_close_through_pct, 0.0), 1.0)
 
     if require_closed_candle:
         closed_candles = [(i, c) for i, c in enumerate(candles) if c.get("closed")]
@@ -519,13 +548,29 @@ def find_fvg_retest(candles, fvgs=None, max_age_candles=None, require_closed_can
         if mitigated:
             continue
 
-        if gap["type"] == "BULLISH" and latest["low"] <= top and latest["close"] > bottom:
+        gap_range = top - bottom
+        # Near edge = the side price approached the gap FROM (BULLISH came
+        # from above -> near edge is top; BEARISH came from below -> near
+        # edge is bottom). The close must reclaim min_close_through_pct of
+        # the distance from the far edge toward that near edge.
+        bullish_required_close = bottom + gap_range * min_close_through_pct
+        bearish_required_close = top - gap_range * min_close_through_pct
+
+        if (
+            gap["type"] == "BULLISH"
+            and latest["low"] <= top
+            and latest["close"] > bullish_required_close
+        ):
             return {
                 "direction": "BULLISH", "level": bottom, "gap": gap,
                 "open_time": latest["open_time"], "tested_index": latest_index,
             }
 
-        if gap["type"] == "BEARISH" and latest["high"] >= bottom and latest["close"] < top:
+        if (
+            gap["type"] == "BEARISH"
+            and latest["high"] >= bottom
+            and latest["close"] < bearish_required_close
+        ):
             return {
                 "direction": "BEARISH", "level": top, "gap": gap,
                 "open_time": latest["open_time"], "tested_index": latest_index,

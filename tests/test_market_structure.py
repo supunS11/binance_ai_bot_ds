@@ -285,7 +285,9 @@ class FindFvgRetestTests(unittest.TestCase):
             _candle(0, high=12, low=11),
             _candle(1, high=10.5, low=10.2),
             _candle(2, high=10, low=9),  # gap: top=11, bottom=10, index=2
-            _candle(3, high=10.5, low=10.3, open_=10.4, close=10.8),  # wick in, close below top
+            # wick in, close reclaims well past the midpoint (10.5) back
+            # toward the near edge (bottom=10) - a strong rejection.
+            _candle(3, high=10.5, low=10.3, open_=10.4, close=10.2),
         ]
         result = ms.find_fvg_retest(candles)
 
@@ -374,6 +376,90 @@ class FindFvgRetestTests(unittest.TestCase):
         result = ms.find_fvg_retest(candles)
 
         self.assertEqual(result["tested_index"], 3)
+
+
+class FindFvgRetestMinCloseThroughPctTests(unittest.TestCase):
+    """config.OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT - real motivation
+    (2026-08-22): live OB_FVG_RETEST trades averaged ~0.68R max adverse
+    excursion even on eventual wins, and the original condition accepted
+    a close barely past the gap's far edge - deep inside the zone - as
+    equally valid as a strong reclaim near the near edge."""
+
+    def _bullish_gap_candles(self, retest_close):
+        return [
+            _candle(0, high=10, low=9),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=12, low=11),  # gap: bottom=10, top=11, index=2
+            _candle(3, high=10.8, low=10.5, open_=10.7, close=retest_close),
+        ]
+
+    def _bearish_gap_candles(self, retest_close):
+        return [
+            _candle(0, high=12, low=11),
+            _candle(1, high=10.5, low=10.2),
+            _candle(2, high=10, low=9),  # gap: top=11, bottom=10, index=2
+            _candle(3, high=10.5, low=10.3, open_=10.4, close=retest_close),
+        ]
+
+    def test_bullish_close_that_only_clears_the_far_edge_is_rejected_at_default(self):
+        # close=10.05 is barely above bottom(10) - deep inside the gap,
+        # well short of the midpoint(10.5) the default 0.5 requires.
+        candles = self._bullish_gap_candles(retest_close=10.05)
+
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNone(result)
+
+    def test_bullish_close_that_clears_the_midpoint_is_accepted_at_default(self):
+        candles = self._bullish_gap_candles(retest_close=10.51)
+
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+
+    def test_bearish_close_that_only_clears_the_far_edge_is_rejected_at_default(self):
+        # close=10.95 is barely below top(11) - deep inside the gap, well
+        # short of the midpoint(10.5) the default 0.5 requires.
+        candles = self._bearish_gap_candles(retest_close=10.95)
+
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNone(result)
+
+    def test_bearish_close_that_clears_the_midpoint_is_accepted_at_default(self):
+        candles = self._bearish_gap_candles(retest_close=10.49)
+
+        result = ms.find_fvg_retest(candles)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BEARISH")
+
+    def test_pct_zero_restores_the_original_close_anywhere_past_far_edge_behavior(self):
+        candles = self._bullish_gap_candles(retest_close=10.05)
+
+        result = ms.find_fvg_retest(candles, min_close_through_pct=0.0)
+
+        self.assertIsNotNone(result)
+
+    def test_pct_one_requires_a_full_close_back_outside_the_gap(self):
+        # close=10.99 clears the midpoint easily but still hasn't fully
+        # exited the gap (top=11) - only qualifies once pct reaches 1.0's
+        # requirement is NOT met here, confirming pct=1.0 is stricter than
+        # the 0.5 default already tested above.
+        candles = self._bullish_gap_candles(retest_close=10.99)
+
+        result = ms.find_fvg_retest(candles, min_close_through_pct=1.0)
+
+        self.assertIsNone(result)
+
+    def test_defaults_from_config(self):
+        candles = self._bullish_gap_candles(retest_close=10.05)
+
+        with patch.object(config, "OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT", 0.0):
+            result = ms.find_fvg_retest(candles)
+
+        self.assertIsNotNone(result)
 
 
 class FindFvgRetestRequireClosedCandleTests(unittest.TestCase):
