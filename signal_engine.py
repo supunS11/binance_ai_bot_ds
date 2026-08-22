@@ -795,6 +795,11 @@ def evaluate(
             "premium_discount_zone": price_zone,
             "zone_retracement_pct": zone_retracement_pct,
             "liquidity_pools": pools,
+            # config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - already computed
+            # once per eval tick regardless (ltf_analysis["fair_value_gaps"]),
+            # carried through here at zero added cost, same as liquidity_pools
+            # above - see risk_manager.compute_retracement_price.
+            "fair_value_gaps": ltf_analysis["fair_value_gaps"],
             "ema_value": ema_value,
             "ema_aligned": ema_aligned,
             "oi_change_pct": oi_change_pct,

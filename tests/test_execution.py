@@ -4,6 +4,7 @@ from unittest.mock import patch
 import config
 import exchange
 import execution
+import risk_manager
 
 
 def _plan():
@@ -305,6 +306,28 @@ class EnterTradeRetracementLiveModeTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("boom", result["error"])
+
+    def test_forwards_fair_value_gaps_and_liquidity_pools_from_the_plan(self):
+        # config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - risk_manager.
+        # compute_retracement_price needs these to consider a real
+        # structural level; this is the only call site that ever supplies
+        # them for a real order.
+        plan = _plan()
+        plan["fair_value_gaps"] = [{"top": 99, "bottom": 98.5}]
+        plan["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 99.2, "touches": 2}]
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}), \
+             patch.object(
+                 risk_manager, "compute_retracement_price", return_value=99.2,
+             ) as compute_price:
+            execution.enter_trade_retracement(plan)
+
+        compute_price.assert_called_once_with(
+            100, 98, "BUY",
+            fvgs=plan["fair_value_gaps"], pools=plan["liquidity_pools"],
+        )
 
 
 def _dca_plan():

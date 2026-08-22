@@ -215,6 +215,17 @@ class SignalEngineTests(unittest.TestCase):
         # (range_high=110 - entry=93) / (range_high=110 - range_low=90)
         self.assertAlmostEqual(result["zone_retracement_pct"], 0.85)
 
+    def test_success_dict_carries_the_fair_value_gaps_used_for_this_eval(self):
+        # config.RETRACEMENT_STRUCTURE_TARGET_ENABLED -
+        # risk_manager.build_trade_plan carries this onto the plan so
+        # execution.enter_trade_retracement can consider a real structural
+        # level instead of only a synthetic R-fraction. Zero extra cost -
+        # the same ltf_analysis["fair_value_gaps"] already computed for
+        # every eval tick regardless.
+        result = self._run()
+
+        self.assertEqual(result["fair_value_gaps"], LTF_BULLISH_BREAK["fair_value_gaps"])
+
     def test_full_sell_signal_when_everything_aligns(self):
         result = self._run(
             ltf_close=108.0,

@@ -1455,6 +1455,29 @@ RETRACEMENT_ENTRY_OFFSET_R = env_float("RETRACEMENT_ENTRY_OFFSET_R", 0.1)
 # capturing that early pullback, not waiting out a slower one. Starting
 # value, not yet calibrated.
 RETRACEMENT_ENTRY_TIMEOUT_SECONDS = env_int("RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300)
+# RETRACEMENT_ENTRY_OFFSET_R above is a pure calculation, not tied to any
+# real market structure. Investigated (2026-08-22, 21 real retracement
+# signals): a real structural level (FVG edge, liquidity pool) sat
+# strictly between entry and SL for 14/21 (67%) of them, but its own
+# distance varied wildly (0.024R to 0.717R, avg 0.197R) - not clustered
+# near RETRACEMENT_ENTRY_OFFSET_R's own value. When on, risk_manager.
+# compute_retracement_price prefers the nearest real level within
+# RETRACEMENT_STRUCTURE_MAX_R of entry over the fixed-R calculation;
+# falls back to it otherwise (flag off, no real level present, or the
+# nearest one is deeper than the cap allows). Default OFF: unlike the
+# other fixes in this file, this one is explicitly exploratory - the
+# investigation itself found real levels present only 2/3 of the time
+# with no outcome evidence either approach wins - same "earns a live
+# default only after real data on the mechanism itself" rule as every
+# other unvalidated mechanism here.
+RETRACEMENT_STRUCTURE_TARGET_ENABLED = env_bool("RETRACEMENT_STRUCTURE_TARGET_ENABLED", "False")
+# Real investigation data: the "similar to RETRACEMENT_ENTRY_OFFSET_R's
+# own default" band was 0.05-0.30R (10/21 signals). 0.35 gives a little
+# headroom above that without accepting the 0.717R outlier a real level
+# occasionally produces - a real level deeper than this is treated as not
+# "sane" and the fixed-R fallback is used instead. Starting value, not
+# outcome-validated - revisit once this has run live.
+RETRACEMENT_STRUCTURE_MAX_R = env_float("RETRACEMENT_STRUCTURE_MAX_R", 0.35)
 
 # =========================
 # LOGGING / ALERTING

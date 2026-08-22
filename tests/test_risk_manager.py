@@ -1336,6 +1336,94 @@ class ComputeRetracementPriceTests(unittest.TestCase):
 
         self.assertEqual(price, 100.0)
 
+    def test_structure_target_disabled_ignores_fvgs_and_pools(self):
+        # entry=100, sl=90 -> fallback = 100 - 0.1*10 = 99. A qualifying
+        # real level at 97 exists but must be ignored while the flag is off.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", False):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY", fvgs=[{"top": 97, "bottom": 96}],
+            )
+
+        self.assertEqual(price, 99.0)
+
+    def test_structure_target_prefers_a_real_level_within_the_cap(self):
+        # 97 is 0.3R from entry (100-97=3, risk=10) - within the 0.35 cap.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY", fvgs=[{"top": 97, "bottom": 96}],
+            )
+
+        self.assertEqual(price, 97.0)
+
+    def test_structure_target_sell_mirrors_the_buy_case(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
+            price = risk_manager.compute_retracement_price(
+                100, 110, "SELL", fvgs=[{"top": 104, "bottom": 103}],
+            )
+
+        self.assertEqual(price, 103.0)
+
+    def test_structure_target_falls_back_when_the_level_is_deeper_than_the_cap(self):
+        # 80 is 2.0R from entry - far beyond a sane 0.35R cap, and even
+        # past the stop itself; must fall back to the fixed-R calculation.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY", fvgs=[{"top": 80, "bottom": 79}],
+            )
+
+        self.assertEqual(price, 99.0)
+
+    def test_structure_target_falls_back_when_no_level_is_in_the_risk_window(self):
+        # 101 sits above entry, not between entry and the stop - not a
+        # valid pullback target for a BUY at all.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY", fvgs=[{"top": 101, "bottom": 100.5}],
+            )
+
+        self.assertEqual(price, 99.0)
+
+    def test_structure_target_falls_back_when_no_fvgs_or_pools_supplied(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True):
+            price = risk_manager.compute_retracement_price(100, 90, "BUY")
+
+        self.assertEqual(price, 99.0)
+
+    def test_structure_target_considers_liquidity_pools_too(self):
+        # 97 is 0.3R from entry (100-97=3, risk=10) - within the 0.35 cap.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY", pools=[{"type": "SELL_SIDE", "price": 97, "touches": 2}],
+            )
+
+        self.assertEqual(price, 97.0)
+
+    def test_structure_target_picks_the_level_nearest_entry_among_several(self):
+        # Both candidates qualify (0.3R and 0.15R, both under the 0.35 cap) -
+        # the nearer one (98.5) must win over the farther one (97).
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY",
+                fvgs=[{"top": 97, "bottom": 96}],
+                pools=[{"type": "SELL_SIDE", "price": 98.5, "touches": 2}],
+            )
+
+        self.assertEqual(price, 98.5)
+
 
 class PriceAtRoiPctTests(unittest.TestCase):
     def test_buy_target_scales_with_roi_and_leverage(self):
@@ -1512,6 +1600,19 @@ class BuildTradePlanDcaFieldsTests(unittest.TestCase):
     def test_atr_is_carried_through_to_the_plan(self):
         plan, _ = risk_manager.build_trade_plan(self._signal(atr=3.5), balance=1000)
         self.assertEqual(plan["atr"], 3.5)
+
+    def test_fair_value_gaps_and_liquidity_pools_are_carried_through_to_the_plan(self):
+        # config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - execution.
+        # enter_trade_retracement needs these on the plan to consider a
+        # real structural level instead of only a synthetic R-fraction.
+        signal = self._signal()
+        signal["fair_value_gaps"] = [{"type": "BULLISH", "top": 99, "bottom": 97}]
+        signal["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 96, "touches": 2}]
+
+        plan, _ = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(plan["fair_value_gaps"], signal["fair_value_gaps"])
+        self.assertEqual(plan["liquidity_pools"], signal["liquidity_pools"])
 
 
 if __name__ == "__main__":

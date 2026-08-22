@@ -322,7 +322,8 @@ def enter_trade_retracement(plan):
     symbol = plan["symbol"]
     side = plan["side"]
     retracement_price = risk_manager.compute_retracement_price(
-        plan["entry_price"], plan["sl_price"], side
+        plan["entry_price"], plan["sl_price"], side,
+        fvgs=plan.get("fair_value_gaps"), pools=plan.get("liquidity_pools"),
     )
 
     if config.EXECUTION_MODE != "LIVE":

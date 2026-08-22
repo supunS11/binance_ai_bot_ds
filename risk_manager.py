@@ -184,17 +184,81 @@ def compute_dca_sl_price(dca_fill_price, side, pools, atr=0, buffer_atr_multiple
     return _apply_min_stop_distance(sl_price, dca_fill_price, side, atr=atr)
 
 
-def compute_retracement_price(entry_price, sl_price, side):
+def _nearest_structure_retracement_level(entry_price, sl_price, side, risk_distance, fvgs, pools):
+    """config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - candidate real levels
+    are FVG top/bottom edges and liquidity pool prices (order blocks
+    deliberately excluded from v1 - enumerating them costs a real extra
+    find_order_blocks() call this data doesn't already pay for; add later
+    with its own evidence). Keeps only levels strictly between entry and
+    the stop AND within RETRACEMENT_STRUCTURE_MAX_R of entry, then picks
+    whichever is nearest to entry (the shallowest qualifying real level -
+    most likely to actually fill) - same selection logic validated against
+    real signals in the 2026-08-22 investigation this was built from.
+    Returns None if nothing qualifies (caller falls back to the fixed-R
+    calculation)."""
+    if risk_distance <= 0:
+        return None
+
+    max_r = max(float(config.RETRACEMENT_STRUCTURE_MAX_R), 0)
+    candidates = []
+
+    for gap in (fvgs or []):
+        candidates.append(gap.get("top"))
+        candidates.append(gap.get("bottom"))
+
+    for pool in (pools or []):
+        candidates.append(pool.get("price"))
+
+    qualifying = []
+
+    for level in candidates:
+        if level is None:
+            continue
+
+        if side == "BUY":
+            in_range = sl_price < level < entry_price
+        else:
+            in_range = entry_price < level < sl_price
+
+        if not in_range:
+            continue
+
+        if abs(entry_price - level) / risk_distance > max_r:
+            continue
+
+        qualifying.append(level)
+
+    if not qualifying:
+        return None
+
+    return max(qualifying) if side == "BUY" else min(qualifying)
+
+
+def compute_retracement_price(entry_price, sl_price, side, fvgs=None, pools=None):
     """config.RETRACEMENT_ENTRY_ENABLED - a small pullback toward the stop
     from the planned (trigger-instant) entry price, in RETRACEMENT_ENTRY_
     OFFSET_R units of the planned risk distance (entry to sl_price) - see
     config.py's own comment for the real evidence behind this. BUY rests
     below entry_price (toward its stop, which is lower); SELL rests above
     (toward its stop, which is higher). Never past the stop itself for any
-    sane offset (<1.0), since it's a fraction of that same distance."""
+    sane offset (<1.0), since it's a fraction of that same distance.
+
+    config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - when on, prefers the
+    nearest real structural level (see _nearest_structure_retracement_
+    level) over this fixed-R calculation; falls back to it when the flag
+    is off, no fvgs/pools were supplied, or nothing qualifies."""
     risk_distance = abs(entry_price - sl_price)
     offset = risk_distance * max(float(config.RETRACEMENT_ENTRY_OFFSET_R), 0)
-    return entry_price - offset if side == "BUY" else entry_price + offset
+    fallback_price = entry_price - offset if side == "BUY" else entry_price + offset
+
+    if not config.RETRACEMENT_STRUCTURE_TARGET_ENABLED:
+        return fallback_price
+
+    structure_price = _nearest_structure_retracement_level(
+        entry_price, sl_price, side, risk_distance, fvgs, pools
+    )
+
+    return fallback_price if structure_price is None else structure_price
 
 
 def price_at_roi_pct(entry_price, side, roi_pct):
@@ -771,4 +835,11 @@ def build_trade_plan(signal, balance):
         # a fresh ATR buffer for the post-DCA SL without re-fetching
         # candles/re-running market_structure.analyze() itself.
         "atr": signal.get("atr"),
+        # config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - carried through so
+        # execution.enter_trade_retracement can prefer a real structural
+        # level over a synthetic RETRACEMENT_ENTRY_OFFSET_R fraction,
+        # without re-fetching candles/re-running market_structure itself -
+        # same free-carry pattern as atr above.
+        "liquidity_pools": signal.get("liquidity_pools"),
+        "fair_value_gaps": signal.get("fair_value_gaps"),
     }, "OK"
