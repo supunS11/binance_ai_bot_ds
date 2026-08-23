@@ -1155,6 +1155,59 @@ class ProfitProtectionEligibilityTests(unittest.TestCase):
             self.assertTrue(manager._is_profit_protection_candidate(self._position()))
 
 
+class Tp2ProfitProtectionEligibilityTests(unittest.TestCase):
+    """config.PROFIT_PROTECTION_TP2_LEG_ENABLED - _is_tp2_profit_
+    protection_candidate, same shape as ProfitProtectionEligibilityTests
+    above but for the post-genuine-TP1-fill BREAKEVEN_ACTIVE leg."""
+
+    def _position(self, **overrides):
+        position = {
+            "side": "BUY",
+            "entry_price": 100,
+            "tp2_price": 110,
+            "stage": BREAKEVEN_ACTIVE,
+            "profit_protection_applied": False,
+        }
+        position.update(overrides)
+        return position
+
+    def _is_candidate(self, **overrides):
+        manager = PositionManager()
+        return manager._is_tp2_profit_protection_candidate(self._position(**overrides))
+
+    def test_disabled_master_flag_is_never_a_candidate(self):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", False), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True):
+            self.assertFalse(self._is_candidate())
+
+    def test_disabled_tp2_leg_flag_is_never_a_candidate(self):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", False):
+            self.assertFalse(self._is_candidate())
+
+    def test_already_applied_is_never_a_candidate_again(self):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True):
+            self.assertFalse(self._is_candidate(profit_protection_applied=True))
+
+    def test_wrong_stage_is_not_a_candidate(self):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True):
+            self.assertFalse(self._is_candidate(stage=TP1_PENDING))
+            self.assertFalse(self._is_candidate(stage=DCA_ACTIVE))
+            self.assertFalse(self._is_candidate(stage=DCA_PENDING))
+
+    def test_missing_tp2_price_is_not_a_candidate(self):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True):
+            self.assertFalse(self._is_candidate(tp2_price=None))
+
+    def test_otherwise_eligible_position_is_a_candidate(self):
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True):
+            self.assertTrue(self._is_candidate())
+
+
 class ProfitProtectionPriceReachedTests(unittest.TestCase):
     def _position(self, side="BUY", entry_price=100, tp1_price=110):
         return {"side": side, "entry_price": entry_price, "tp1_price": tp1_price}
@@ -2389,6 +2442,85 @@ class PollShadowTests(unittest.TestCase):
         self.assertEqual(outcome, "SHADOW_TRAILING_STOP_PROFIT_HIT")
 
 
+class ProfitProtectionTp2LegPollShadowTests(PollShadowTests):
+    """config.PROFIT_PROTECTION_TP2_LEG_ENABLED - shadow counterpart to
+    ProfitProtectionTp2LegPollLiveTests. _plan() BUY: entry=100, tp2=104
+    -> same 102.4 arm / 101.2 floor arithmetic (uses the candle's CLOSE
+    as the arm price, same convention _try_early_promotions_shadow
+    already uses for its own arm check)."""
+
+    def _breakeven_manager(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+        return manager
+
+    def test_arms_on_the_tp2_leg_and_locks_the_trailing_floor(self):
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50):
+            outcome = manager.poll_shadow("BTCUSDT", _candle(high=102.5, low=102.0, close=102.4))
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["profit_protection_applied"])
+        self.assertTrue(position["profit_protection_profit_locked"])
+        self.assertEqual(position["profit_protection_target"], "tp2_price")
+        self.assertAlmostEqual(position["profit_protection_peak_price"], 102.4)
+        self.assertAlmostEqual(position["sl_price"], 101.2)
+
+    def test_below_the_lock_price_does_not_arm(self):
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+            manager.poll_shadow("BTCUSDT", _candle(high=102.1, low=101.9, close=102.0))
+
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["profit_protection_applied"])
+        self.assertEqual(position["sl_price"], 98)  # untouched
+
+    def test_no_op_when_the_tp2_leg_flag_is_off(self):
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", False), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60):
+            manager.poll_shadow("BTCUSDT", _candle(high=102.5, low=102.0, close=102.4))
+
+        self.assertFalse(manager.positions["BTCUSDT"]["profit_protection_applied"])
+
+    def test_continues_trailing_after_arming_on_a_later_poll(self):
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50):
+            manager.poll_shadow("BTCUSDT", _candle(high=102.5, low=102.0, close=102.4))  # arms, SL -> 101.2
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50):
+            outcome = manager.poll_shadow("BTCUSDT", _candle(high=103.0, low=102.6, close=103.0))
+
+        self.assertIsNone(outcome)
+        # New peak=103.0 (high, BUY side), retrace 50% of 3.0 = 1.5 -> 101.5.
+        self.assertAlmostEqual(manager.positions["BTCUSDT"]["sl_price"], 101.5)
+
+
 class PollLiveTests(unittest.TestCase):
     def setUp(self):
         # EARLY_BREAKEVEN_ENABLED/MAE_TRACKING_ENABLED now default True -
@@ -2923,6 +3055,143 @@ class PollLiveTests(unittest.TestCase):
 
         self.assertEqual(outcome, "TRAILING_STOP_PROFIT_HIT")
         cancel_all.assert_called_once_with("BTCUSDT")
+
+
+class ProfitProtectionTp2LegPollLiveTests(PollLiveTests):
+    """config.PROFIT_PROTECTION_TP2_LEG_ENABLED - a genuine TP1 fill's
+    remainder (BREAKEVEN_ACTIVE, profit_protection_applied still False)
+    gets its own fresh-arm, reusing the exact same ACTIVATION_PCT_OF_TP1/
+    LOCK_PCT_OF_TP1/RETRACE_PCT math as the pre-TP1 case, just against
+    tp2_price instead of tp1_price. _plan() BUY: entry=100, tp2=104 ->
+    tp2 move=4, tp2 ROI=(4/100)*10*100=40%. Arm trigger: 60% of that=24%
+    -> 102.4 (mirrors ProfitProtectionPollLiveTests' own TP1-relative
+    arithmetic, just against the wider tp2 distance)."""
+
+    def _breakeven_manager(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+        return manager
+
+    def test_arms_on_the_tp2_leg_and_locks_the_trailing_floor(self):
+        # Lock: worst-case LOCK_PCT_OF_TP1=10% of tp2 ROI -> 100.4;
+        # retrace RETRACE_PCT=50% of the entry->peak gain (2.4) retained
+        # = 1.2 -> 101.2. Floor is the max of the two (101.2).
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_mark_price", return_value=102.4), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.2}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_locked"}) as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertTrue(position["profit_protection_applied"])
+        self.assertTrue(position["profit_protection_profit_locked"])
+        self.assertEqual(position["profit_protection_target"], "tp2_price")
+        self.assertAlmostEqual(position["profit_protection_peak_price"], 102.4)
+        self.assertAlmostEqual(position["sl_price"], 101.2)
+        new_sl.assert_called_once_with("BTCUSDT", "BUY", 101.2)
+
+    def test_below_the_lock_price_does_not_arm(self):
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_mark_price", return_value=102.0):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertFalse(position["profit_protection_applied"])
+        self.assertEqual(position["sl_price"], 98)  # untouched
+
+    def test_no_op_when_the_tp2_leg_flag_is_off(self):
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", False), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_mark_price", return_value=102.4):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertFalse(manager.positions["BTCUSDT"]["profit_protection_applied"])
+
+    def test_no_op_when_already_armed(self):
+        # An early-promoted position (pre-TP1 profit protection or early
+        # breakeven) that's already armed must not re-arm/re-lock here.
+        manager = self._breakeven_manager()
+        manager.positions["BTCUSDT"]["profit_protection_applied"] = True
+        manager.positions["BTCUSDT"]["profit_protection_target"] = "tp2_price"
+        manager.positions["BTCUSDT"]["sl_price"] = 100.6
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_mark_price", return_value=103.0), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.2}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_trailed"}):
+            manager.poll_live("BTCUSDT")
+
+        # Continues trailing via the EXISTING mechanism instead (not a
+        # fresh arm) - floor at peak=103.0: retrace 50% of 3.0 = 1.5 -> 101.5.
+        self.assertAlmostEqual(manager.positions["BTCUSDT"]["sl_price"], 101.5)
+
+    def test_continues_trailing_after_arming_on_a_later_poll(self):
+        manager = self._breakeven_manager()
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 60), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_mark_price", return_value=102.4), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.2}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_locked"}):
+            manager.poll_live("BTCUSDT")  # arms, SL -> 101.2
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_TP2_LEG_ENABLED", True), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 10), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "get_mark_price", return_value=103.0), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.2}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_trailed"}) as trail_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        # New peak=103.0, retrace 50% of 3.0 = 1.5 -> 101.5 - more
+        # favorable than the 101.2 armed floor, so it ratchets forward.
+        trail_sl.assert_called_once_with("BTCUSDT", "BUY", 101.5)
 
 
 class ProfitProtectionPollLiveTests(PollLiveTests):

@@ -1967,14 +1967,14 @@ class PositionManager:
         _is_profit_protection_candidate above, not a stage addition to
         it: DCA_ACTIVE has no tp1_price concept left (TP1/TP2 were
         cancelled and replaced by the single tp_price - see
-        _execute_dca), and unlike BREAKEVEN_ACTIVE (which only ever
-        TRAILS an already-armed profit-protection lock carried over from
-        TP1_PENDING/DCA_PENDING), a DCA_ACTIVE position starts this stage
-        with profit_protection_applied guaranteed False - a DCA that
-        fires always came from DCA_PENDING, never from an already-armed
+        _execute_dca), and a DCA_ACTIVE position starts this stage with
+        profit_protection_applied guaranteed False - a DCA that fires
+        always came from DCA_PENDING, never from an already-armed
         promotion (that path goes to BREAKEVEN_ACTIVE instead, and DCA
         never fires from there) - so it needs its own fresh arm step
-        here, not just a trail."""
+        here, not just a trail. See _is_tp2_profit_protection_candidate
+        below for BREAKEVEN_ACTIVE's own equivalent (a genuine TP1 fill
+        leaves the same flag False too, for the same underlying reason)."""
         if not config.PROFIT_PROTECTION_ENABLED or position.get("profit_protection_applied"):
             return False
 
@@ -1982,6 +1982,35 @@ class PositionManager:
             return False
 
         return position.get("tp_price") is not None
+
+    def _is_tp2_profit_protection_candidate(self, position):
+        """config.PROFIT_PROTECTION_TP2_LEG_ENABLED - real gap found live
+        (2026-08-23): a position that reached BREAKEVEN_ACTIVE via a
+        GENUINE TP1 fill (_promote_to_breakeven_on_tp1_fill) starts that
+        leg with profit_protection_applied still False, same as
+        DCA_ACTIVE's own gap above - but unlike DCA_ACTIVE, nothing ever
+        gave this leg a fresh-arm step; BREAKEVEN_ACTIVE's own poll logic
+        only ever TRAILS an already-armed lock (see
+        _trail_profit_protection_if_improved's `if position.get(
+        "profit_protection_applied")` guard). TP2 is always real,
+        structure-resolved - never a small fixed target the way TP1 can
+        be - so it fits this mechanism's premise exactly. Deliberately
+        doesn't distinguish a genuine TP1 fill from an early-breakeven/
+        pre-TP1-profit-protection promotion into this same stage - the
+        latter either already has profit_protection_applied True
+        (excluded below) or arrived via early breakeven instead (still
+        False, and still a legitimate BREAKEVEN_ACTIVE position worth
+        protecting toward tp2_price either way)."""
+        if not config.PROFIT_PROTECTION_ENABLED or not config.PROFIT_PROTECTION_TP2_LEG_ENABLED:
+            return False
+
+        if position.get("profit_protection_applied"):
+            return False
+
+        if position["stage"] != BREAKEVEN_ACTIVE:
+            return False
+
+        return position.get("tp2_price") is not None
 
     @staticmethod
     def _is_dca_breakeven_candidate(position):
@@ -2090,12 +2119,19 @@ class PositionManager:
         )
         position["profit_protection_peak_price"] = peak_price
 
-        # config.DCA_ENABLED - a DCA_ACTIVE position has no tp1_price
-        # concept left (TP1/TP2 were cancelled and replaced by the single
-        # tp_price when the DCA fired - see _execute_dca), so this trail
-        # (reused for BOTH the pre-DCA BREAKEVEN_ACTIVE case and the
-        # post-DCA case) picks whichever target actually applies.
-        target_price = position["tp_price"] if position["stage"] == DCA_ACTIVE else position["tp1_price"]
+        # config.PROFIT_PROTECTION_TP2_LEG_ENABLED - which target this
+        # position actually armed against varies now (tp1_price for a
+        # pre-TP1 arm, tp_price post-DCA, tp2_price for a genuine-TP1-fill
+        # BREAKEVEN_ACTIVE arm - see every profit_protection_applied=True
+        # site for where this gets set). Falls back to the pre-existing
+        # DCA_ACTIVE-vs-tp1_price stage-based guess only for a position
+        # restored from saved state written before this field existed.
+        target_field = position.get("profit_protection_target")
+
+        if target_field is None:
+            target_field = "tp_price" if position["stage"] == DCA_ACTIVE else "tp1_price"
+
+        target_price = position[target_field]
         candidate = self._profit_protection_trailing_floor(position, peak_price, target_price=target_price)
 
         if candidate is None or not _more_favorable(side, candidate, position["sl_price"]):
@@ -2146,6 +2182,7 @@ class PositionManager:
             if lock_price is not None:
                 position["profit_protection_applied"] = True
                 position["profit_protection_profit_locked"] = True
+                position["profit_protection_target"] = "tp1_price"
                 self._promote_to_breakeven(
                     position,
                     reason="Profit protection (ROI-of-TP1 trailing arm)",
@@ -2309,6 +2346,7 @@ class PositionManager:
                     if replaced:
                         position["profit_protection_applied"] = True
                         position["profit_protection_profit_locked"] = True
+                        position["profit_protection_target"] = "tp_price"
 
                     return None
 
@@ -2415,6 +2453,40 @@ class PositionManager:
             if tp2_status == "FINISHED":
                 exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "TP2_HIT")
+
+            # config.PROFIT_PROTECTION_TP2_LEG_ENABLED - a genuine TP1 fill
+            # leaves profit_protection_applied False for the rest of this
+            # leg's life (see _is_tp2_profit_protection_candidate) - this
+            # is its one-time fresh arm, mirroring _try_early_promotions'
+            # own "stop processing this tick once armed" convention (the
+            # next poll's trail-continuation branch below picks it up from
+            # here, same cadence as every other one-time arm in this
+            # class).
+            if self._is_tp2_profit_protection_candidate(position):
+                current_price = exchange.get_mark_price(symbol)
+
+                if self._profit_protection_price_reached(
+                    position, current_price, target_price=position["tp2_price"]
+                ):
+                    lock_price = self._profit_protection_trailing_floor(
+                        position, current_price, target_price=position["tp2_price"]
+                    )
+
+                    if lock_price is not None:
+                        outcome, replaced = self._replace_sl_order(
+                            position, lock_price, "Profit protection (TP2 leg)",
+                        )
+
+                        if outcome is not None:
+                            return outcome
+
+                        if replaced:
+                            position["profit_protection_applied"] = True
+                            position["profit_protection_profit_locked"] = True
+                            position["profit_protection_peak_price"] = current_price
+                            position["profit_protection_target"] = "tp2_price"
+
+                        return None
 
             if position.get("profit_protection_applied"):
                 # Extra mark-price fetch, same "only pay for it when a
@@ -2709,6 +2781,7 @@ class PositionManager:
             if lock_price is not None:
                 position["profit_protection_applied"] = True
                 position["profit_protection_profit_locked"] = True
+                position["profit_protection_target"] = "tp1_price"
                 position["stage"] = BREAKEVEN_ACTIVE
                 position["sl_price"] = lock_price
                 log_info(
@@ -2880,6 +2953,7 @@ class PositionManager:
                 if lock_price is not None:
                     position["profit_protection_applied"] = True
                     position["profit_protection_profit_locked"] = True
+                    position["profit_protection_target"] = "tp_price"
                     position["sl_price"] = lock_price
                     log_info(
                         f"{symbol} [SHADOW] profit protection (ROI-of-TP arm, post-DCA) | "
@@ -2971,6 +3045,31 @@ class PositionManager:
             if hit_tp2:
                 return self._close(symbol, "SHADOW_TP2_HIT")
 
+            # config.PROFIT_PROTECTION_TP2_LEG_ENABLED - shadow counterpart
+            # to poll_live's own fresh-arm branch; see
+            # _is_tp2_profit_protection_candidate. Uses latest_candle
+            # close as the arm price, same convention _try_early_
+            # promotions_shadow already uses for its own arm check.
+            if self._is_tp2_profit_protection_candidate(position) and self._profit_protection_price_reached(
+                position, latest_candle["close"], target_price=position["tp2_price"]
+            ):
+                arm_price = latest_candle["close"]
+                lock_price = self._profit_protection_trailing_floor(
+                    position, arm_price, target_price=position["tp2_price"]
+                )
+
+                if lock_price is not None:
+                    position["profit_protection_applied"] = True
+                    position["profit_protection_profit_locked"] = True
+                    position["profit_protection_target"] = "tp2_price"
+                    position["profit_protection_peak_price"] = arm_price
+                    position["sl_price"] = lock_price
+                    log_info(
+                        f"{symbol} [SHADOW] profit protection (TP2 leg) | SL -> {lock_price}"
+                    )
+
+                    return None
+
             if position.get("profit_protection_applied"):
                 peak_source = high if side == "BUY" else low
                 peak_price = position.get("profit_protection_peak_price")
@@ -2979,7 +3078,14 @@ class PositionManager:
                 )
                 position["profit_protection_peak_price"] = peak_price
 
-                candidate = self._profit_protection_trailing_floor(position, peak_price)
+                # config.PROFIT_PROTECTION_TP2_LEG_ENABLED - see
+                # _trail_profit_protection_if_improved's identical
+                # target_field lookup (poll_live's own copy of this same
+                # concern) for why this can no longer assume tp1_price.
+                target_field = position.get("profit_protection_target", "tp1_price")
+                candidate = self._profit_protection_trailing_floor(
+                    position, peak_price, target_price=position[target_field]
+                )
 
                 if candidate is not None and _more_favorable(side, candidate, position["sl_price"]):
                     position["sl_price"] = candidate

@@ -1127,15 +1127,35 @@ PROFIT_PROTECTION_RETRACE_PCT = env_float("PROFIT_PROTECTION_RETRACE_PCT", 50)
 # the real TP1 or the original SL is a tighter, faster resolution either
 # way. Scoped to the pre-TP1 leg only (_is_profit_protection_candidate,
 # TP1_PENDING/DCA_PENDING) - the post-TP1 remainder still running toward
-# a real, structure-based TP2 (_is_dca_profit_protection_candidate,
-# DCA_ACTIVE/BREAKEVEN_ACTIVE) is untouched, since TP2 is never static and
-# keeps the same "can be far away, worth protecting early" justification
-# as before. Evidence is thin (5 pre-TP1 trades matching this pattern,
-# no counterfactual showing what would have happened without it) but
-# consistent and directly requested - default ON.
+# a real, structure-based TP2 is untouched by THIS flag, since TP2 is
+# never static and keeps the same "can be far away, worth protecting
+# early" justification as before (see PROFIT_PROTECTION_TP2_LEG_ENABLED
+# below for that leg's own, separate protection). Evidence is thin (5
+# pre-TP1 trades matching this pattern, no counterfactual showing what
+# would have happened without it) but consistent and directly requested -
+# default ON.
 PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED = env_bool(
     "PROFIT_PROTECTION_SKIP_FOR_STATIC_TP1_ENABLED", "True"
 )
+# Real gap found live (2026-08-23, operator observation): once a genuine
+# TP1 fill promotes the remainder to BREAKEVEN_ACTIVE, profit protection
+# has never had a fresh-arm path for that leg - only a position that
+# ALREADY armed protection pre-TP1 keeps trailing it
+# (_trail_profit_protection_if_improved's own `if position.get(
+# "profit_protection_applied")` guard). A position that reached
+# BREAKEVEN_ACTIVE via a genuine TP1 fill starts with that flag False and
+# stays that way for the rest of its life - only STRUCTURE_STOP_
+# MANAGEMENT_ENABLED's trailing stop protects it, and only once a NEW
+# confirmed swing has formed (can lag hours, see that setting's own
+# comment). TP2 is always real, structure-resolved - never a small fixed
+# target - so it fits this mechanism's own "can be far away, worth
+# protecting early" premise exactly. Reuses PROFIT_PROTECTION_ACTIVATION_
+# PCT_OF_TP1/_HIGH_ROI/LOCK_PCT_OF_TP1/RETRACE_PCT unchanged (same "% of
+# whichever target actually applies" math the DCA_ACTIVE case already
+# established - the "TP1" in those names is legacy from before that
+# reuse existed). Requires PROFIT_PROTECTION_ENABLED also on. Brand new,
+# zero live track record of its own yet - default OFF.
+PROFIT_PROTECTION_TP2_LEG_ENABLED = env_bool("PROFIT_PROTECTION_TP2_LEG_ENABLED", "False")
 # Replaces the fixed EARLY_BREAKEVEN_LOCK_R_MULTIPLE distance with the
 # most recent CONFIRMED swing point in the trade's favor
 # (market_structure.structure_state's last_swing_low/last_swing_high),
