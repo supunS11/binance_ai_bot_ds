@@ -491,6 +491,20 @@ CHOCH_TRIGGER_MAX_AGE_CANDLES = env_int("CHOCH_TRIGGER_MAX_AGE_CANDLES", 10)
 # oldest age the lookback window allows - stricter than the data actually
 # demands. Revisit once age==9 trades exist to check against.
 CHOCH_TRIGGER_MIN_AGE_CANDLES = env_int("CHOCH_TRIGGER_MIN_AGE_CANDLES", 9)
+# Real evidence (2026-08-24, 32 resolved CHOCH_RETEST trades): depth_
+# imbalance clearly favorable (signed >=0.10 toward the trade's own side)
+# won 75.0% (n=12) vs only 55.0% (n=20) when merely neutral (-0.10..0.10 -
+# already clearing the universal DEPTH_OPPOSING gate, which only rejects
+# CLEARLY opposing depth, not "not yet favorable"). Tested the trend-
+# agreement hypothesis first (does CHOCH_RETEST need AGAINST_HTF_BIAS/
+# HTF_TREND_STALE after all) and found it flat - 62.5% win rate whether
+# the trade agreed or disagreed with the swing-confirmed HTF trend, so
+# that exemption stays as-is. Depth was the one real lead. Reject-only
+# (can only make CHOCH_RETEST fire LESS often, never more) - same "safe
+# to ship on real evidence immediately" precedent as CHOCH_TRIGGER_MIN_
+# AGE_CANDLES above. 0 (or negative) disables, same convention as
+# MIN_TP1_R_MULTIPLE/DCA_MIN_TP_R_MULTIPLE.
+CHOCH_RETEST_MIN_DEPTH_IMBALANCE = env_float("CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0.10)
 # Fourth entry trigger: a fresh rejection wick into an UNMITIGATED fair
 # value gap (market_structure.find_fvg_retest) - independent of any live
 # break right now, the classic OB/FVG "retest" entry. Scoped to FVGs only

@@ -712,6 +712,30 @@ def evaluate(
             if side == "SELL" and depth_imbalance > min_depth:
                 return _reject("DEPTH_OPPOSING")
 
+        # config.CHOCH_RETEST_MIN_DEPTH_IMBALANCE - real evidence
+        # (2026-08-24, 32 resolved CHOCH_RETEST trades): depth_imbalance
+        # clearly favorable (signed >=0.10 toward the trade's own side)
+        # won 75.0% (n=12) vs only 55.0% (n=20) when merely neutral
+        # (-0.10..0.10 - already clearing DEPTH_OPPOSING above, which only
+        # rejects CLEARLY opposing depth, not "not yet favorable").
+        # CHOCH_RETEST specifically benefits from requiring real order-
+        # book conviction behind the retest. Reject-only, trigger-scoped
+        # (only this candidate's own eligibility, never another trigger's
+        # for the same direction/tick - see config.py's own comment for
+        # the full reasoning, including why the trend-agreement hypothesis
+        # was tested and rejected first). depth_imbalance is None (data
+        # unavailable) never blocks, same fail-open convention as
+        # DEPTH_OPPOSING above.
+        if (
+            trigger == "CHOCH_RETEST"
+            and depth_imbalance is not None
+            and config.CHOCH_RETEST_MIN_DEPTH_IMBALANCE > 0
+        ):
+            signed_depth = depth_imbalance if side == "BUY" else -depth_imbalance
+
+            if signed_depth < config.CHOCH_RETEST_MIN_DEPTH_IMBALANCE:
+                return _reject("CHOCH_RETEST_DEPTH_WEAK")
+
         if pools is None:
             # Not already computed above - either
             # LIQUIDITY_SWEEP_TRIGGER_ENABLED is off, or it's on but the

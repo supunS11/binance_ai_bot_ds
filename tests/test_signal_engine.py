@@ -1550,6 +1550,90 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertIn("CVD_NOT_CONFIRMED", result["reason"])
 
+    # config.CHOCH_RETEST_MIN_DEPTH_IMBALANCE - real evidence (2026-08-24):
+    # depth_imbalance clearly favorable (signed >=0.10) won 75.0% (n=12)
+    # vs only 55.0% (n=20) when merely neutral. Trigger-scoped (only
+    # CHOCH_RETEST's own candidacy), reject-only, fail-open on missing
+    # data - see config.py's own comment for the full reasoning.
+
+    def test_choch_retest_rejected_when_depth_imbalance_too_weak_buy(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                depth={"available": True, "depth_imbalance": 0.05},  # below 0.10, but not opposing enough for DEPTH_OPPOSING
+            )
+
+        self.assertIn("CHOCH_RETEST_DEPTH_WEAK", result["reason"])
+
+    def test_choch_retest_rejected_when_depth_imbalance_too_weak_sell(self):
+        analysis = self._choch_analysis("BEARISH", event_price=85)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.05},  # signed=0.05, below 0.10
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+            )
+
+        self.assertIn("CHOCH_RETEST_DEPTH_WEAK", result["reason"])
+
+    def test_choch_retest_accepted_when_depth_imbalance_meets_threshold(self):
+        # Boundary is inclusive (">=" not ">") - signed depth exactly equal
+        # to the threshold must still qualify.
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                depth={"available": True, "depth_imbalance": 0.10},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+
+    def test_choch_retest_depth_requirement_disabled_lets_weak_depth_through(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                depth={"available": True, "depth_imbalance": 0.01},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+
+    def test_choch_retest_depth_unavailable_does_not_block(self):
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                depth={"available": False},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+
+    def test_choch_retest_depth_requirement_does_not_affect_other_triggers(self):
+        # Weak depth (0.05, below the 0.10 CHOCH_RETEST-specific
+        # threshold) must not block a DIFFERENT trigger (STRUCTURE_BREAK,
+        # _run()'s own default) evaluated for the same direction/tick -
+        # this check is trigger-scoped, not direction-scoped.
+        with patch.object(config, "CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(depth={"available": True, "depth_imbalance": 0.05})
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+
     # Regression coverage for the structure_level bug caught during plan
     # review: feeding a trigger's signal into a REAL risk_manager call must
     # land the SL on the structurally correct side of entry, for both new
