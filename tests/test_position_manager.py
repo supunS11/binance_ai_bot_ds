@@ -4286,23 +4286,41 @@ class IsDcaCandidateTests(unittest.TestCase):
             self.assertFalse(PositionManager._is_dca_candidate(self._position(dca_price=None)))
 
 
-class DcaPriceReachedTests(unittest.TestCase):
-    def test_buy_reached_when_price_drops_to_or_below(self):
+class DcaPriceReachedInRangeTests(unittest.TestCase):
+    def test_buy_reached_when_the_candles_low_touches_or_crosses(self):
         position = {"side": "BUY", "dca_price": 96}
-        self.assertTrue(PositionManager._dca_price_reached(position, 96))
-        self.assertTrue(PositionManager._dca_price_reached(position, 95))
-        self.assertFalse(PositionManager._dca_price_reached(position, 97))
+        self.assertTrue(PositionManager._dca_price_reached_in_range(
+            position, [{"high": 100, "low": 96}]))
+        self.assertTrue(PositionManager._dca_price_reached_in_range(
+            position, [{"high": 100, "low": 95}]))
+        self.assertFalse(PositionManager._dca_price_reached_in_range(
+            position, [{"high": 100, "low": 97}]))
 
-    def test_sell_reached_when_price_rises_to_or_above(self):
+    def test_sell_reached_when_the_candles_high_touches_or_crosses(self):
         position = {"side": "SELL", "dca_price": 104}
-        self.assertTrue(PositionManager._dca_price_reached(position, 104))
-        self.assertTrue(PositionManager._dca_price_reached(position, 105))
-        self.assertFalse(PositionManager._dca_price_reached(position, 103))
+        self.assertTrue(PositionManager._dca_price_reached_in_range(
+            position, [{"high": 104, "low": 100}]))
+        self.assertTrue(PositionManager._dca_price_reached_in_range(
+            position, [{"high": 105, "low": 100}]))
+        self.assertFalse(PositionManager._dca_price_reached_in_range(
+            position, [{"high": 103, "low": 100}]))
 
-    def test_none_or_non_positive_price_is_never_reached(self):
+    def test_uses_the_last_candle_in_the_list(self):
         position = {"side": "BUY", "dca_price": 96}
-        self.assertFalse(PositionManager._dca_price_reached(position, None))
-        self.assertFalse(PositionManager._dca_price_reached(position, 0))
+        candles = [{"high": 100, "low": 95}, {"high": 100, "low": 97}]
+        self.assertFalse(PositionManager._dca_price_reached_in_range(position, candles))
+
+    def test_none_or_empty_candles_is_never_reached(self):
+        position = {"side": "BUY", "dca_price": 96}
+        self.assertFalse(PositionManager._dca_price_reached_in_range(position, None))
+        self.assertFalse(PositionManager._dca_price_reached_in_range(position, []))
+
+    def test_candle_missing_high_or_low_is_never_reached(self):
+        position = {"side": "BUY", "dca_price": 96}
+        self.assertFalse(PositionManager._dca_price_reached_in_range(
+            position, [{"high": 100}]))
+        self.assertFalse(PositionManager._dca_price_reached_in_range(
+            position, [{"low": 95}]))
 
 
 class ExecuteDcaShadowTests(unittest.TestCase):
@@ -5173,8 +5191,11 @@ class PollLiveDcaPendingTests(unittest.TestCase):
         manager.register_dca_pending(_dca_plan(), execution_result)
         return manager
 
-    def test_dca_fires_when_mark_price_reaches_dca_price(self):
+    def test_dca_fires_when_the_candles_low_reaches_dca_price(self):
+        # config._dca_price_reached_in_range - the candle's low (not a
+        # point mark price) is what decides the DCA trigger now.
         manager = self._manager_with_dca_pending()
+        candles = [{"high": 100.0, "low": 95.0}]
 
         with patch.object(exchange, "get_mark_price", return_value=95.0), \
              patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
@@ -5183,7 +5204,45 @@ class PollLiveDcaPendingTests(unittest.TestCase):
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
              patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
-            outcome = manager.poll_live("BTCUSDT")
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_dca_does_not_fire_when_the_candles_low_never_reached_dca_price(self):
+        # The mirror of the test above - mark price alone would have said
+        # "not reached" either way here, but this confirms the candle's
+        # own low (97, above dca_price=96) is genuinely what's decisive.
+        manager = self._manager_with_dca_pending()
+        candles = [{"high": 100.0, "low": 97.0}]
+
+        with patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+
+    def test_dca_fires_on_a_wick_the_old_point_price_check_would_have_missed(self):
+        # The actual gap this fix closes: price wicked down through
+        # dca_price and back up between two poll ticks. By the time this
+        # poll runs, the mark price (99.0) has already recovered and is
+        # nowhere near dca_price=96 - the OLD _dca_price_reached(position,
+        # current_price=99.0) would have returned False here, exactly the
+        # scenario that let ~29% of resolved trades' adverse excursions go
+        # completely undetected. The candle's low (94.0) still remembers
+        # the wick, so _dca_price_reached_in_range must fire anyway.
+        manager = self._manager_with_dca_pending()
+        candles = [{"high": 100.0, "low": 94.0}]
+
+        with patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
@@ -5194,6 +5253,7 @@ class PollLiveDcaPendingTests(unittest.TestCase):
         # tick into _execute_dca rather than an extra fetch.
         manager = self._manager_with_dca_pending()
         cvd_snapshot = {"available": True, "cvd_score": 0.5}
+        candles = [{"high": 100.0, "low": 95.0}]
 
         with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
              patch.object(exchange, "get_mark_price", return_value=95.0), \
@@ -5204,9 +5264,9 @@ class PollLiveDcaPendingTests(unittest.TestCase):
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
              patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
              patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})) as confirmed_check:
-            manager.poll_live("BTCUSDT", htf_candles=["htf"], cvd_snapshot=cvd_snapshot)
+            manager.poll_live("BTCUSDT", candles=candles, htf_candles=["htf"], cvd_snapshot=cvd_snapshot)
 
-        confirmed_check.assert_called_once_with("BUY", ["htf"], None, cvd_snapshot, 95.0)
+        confirmed_check.assert_called_once_with("BUY", ["htf"], candles, cvd_snapshot, 95.0)
 
     def test_tp1_finished_promotes_normally_without_dca(self):
         manager = self._manager_with_dca_pending()
@@ -5268,6 +5328,7 @@ class PollLiveDcaPendingTests(unittest.TestCase):
 
     def test_single_tp_dca_still_fires_normally(self):
         manager = self._manager_with_single_tp_dca_pending()
+        candles = [{"high": 100.0, "low": 95.0}]
 
         with patch.object(exchange, "get_mark_price", return_value=95.0), \
              patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
@@ -5276,7 +5337,7 @@ class PollLiveDcaPendingTests(unittest.TestCase):
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
              patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
-            outcome = manager.poll_live("BTCUSDT")
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)

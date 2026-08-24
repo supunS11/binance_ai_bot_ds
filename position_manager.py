@@ -1627,17 +1627,34 @@ class PositionManager:
         )
 
     @staticmethod
-    def _dca_price_reached(position, current_price):
-        """Has price reached position["dca_price"] yet - the adverse-
-        direction level computed once at plan time (risk_manager.
-        compute_dca_price). Shared by poll_live (real mark price) and
-        poll_shadow (simulated candle touch)."""
-        if current_price is None or current_price <= 0:
+    def _dca_price_reached_in_range(position, candles):
+        """Has price reached position["dca_price"] at ANY point within
+        the current (possibly still-forming) candle - not a single
+        point-in-time sample. Real gap this closes (2026-08-24 price-path
+        audit): the old point-price check (exchange.get_mark_price,
+        sampled once every POSITION_POLL_INTERVAL_SECONDS) missed a touch
+        whenever price crossed dca_price and reversed between two poll
+        ticks - ~29% of resolved trades showed a large adverse excursion
+        that never triggered DCA. candles[-1] is continuously updated by
+        the kline websocket stream as new trades happen (ws_client.
+        CandleStore's own "last item may still be forming" docstring), so
+        its high/low reflects the full range covered since the candle
+        opened - same range-check poll_shadow already uses for
+        backtesting (touched_dca = low <= dca_price / high >= dca_price),
+        now applied to live mode. None/empty candles or a candle missing
+        high/low leaves this False - never fire on incomplete data."""
+        if not candles:
+            return False
+
+        latest_candle = candles[-1]
+        high, low = latest_candle.get("high"), latest_candle.get("low")
+
+        if high is None or low is None:
             return False
 
         side = position["side"]
         dca_price = position["dca_price"]
-        return current_price <= dca_price if side == "BUY" else current_price >= dca_price
+        return low <= dca_price if side == "BUY" else high >= dca_price
 
     def _execute_dca(
         self, position, candles=None, htf_candles=None, cvd_snapshot=None, current_price=None,
@@ -2030,7 +2047,10 @@ class PositionManager:
     def _dca_breakeven_price_reached(position, current_price):
         """Has price reached position["breakeven_price"] yet - shared by
         poll_live (real mark price) and poll_shadow (simulated candle
-        touch), same pattern as _dca_price_reached."""
+        touch), same point-price-comparison shape the pre-DCA trigger
+        used before _dca_price_reached_in_range replaced it with a
+        candle-range check (2026-08-24) - this post-DCA breakeven check
+        is a separate, out-of-scope mechanism, left unchanged here."""
         if current_price is None or current_price <= 0:
             return False
 
@@ -2264,10 +2284,12 @@ class PositionManager:
         if position["stage"] == DCA_PENDING:
             # DCA (adverse) checked before the early-promotion (favorable)
             # checks - same conservative "adverse event wins ties" bias
-            # poll_shadow's own docstring already applies, kept consistent
-            # here since both are mark-price-threshold checks rather than
-            # real order-fill status.
-            if dca_candidate and self._dca_price_reached(position, current_price):
+            # poll_shadow's own docstring already applies. Checked against
+            # the current candle's full high/low range (not current_price,
+            # a single point-in-time sample) - see
+            # _dca_price_reached_in_range's own docstring for the real
+            # gap this closes.
+            if dca_candidate and self._dca_price_reached_in_range(position, candles):
                 return self._execute_dca(
                     position, candles=candles, htf_candles=htf_candles,
                     cvd_snapshot=cvd_snapshot, current_price=current_price,
