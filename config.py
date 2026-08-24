@@ -1017,7 +1017,19 @@ TP_TARGET_ROI_PCT = env_float("TP_TARGET_ROI_PCT", 40)
 MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = env_bool(
     "MOVE_SL_TO_BREAKEVEN_AFTER_TP1", "True"
 )
-BREAKEVEN_BUFFER_PCT = env_float("BREAKEVEN_BUFFER_PCT", 0.02)
+# Real gap found live (2026-08-24, DCA -> breakeven -> SL investigation):
+# a breakeven SL still closed at a net loss. Every fill in that flow
+# (original entry, DCA fill, SL exit) is a taker order - Binance USDⓈ-M
+# futures standard taker fee is ~0.05%/side, so a round trip alone (~0.10%)
+# already exceeded the old 0.02% buffer before any slippage. 0.15% covers
+# that round-trip fee assumption plus a real slippage margin - a reasoned
+# estimate, not tied to this account's exact fee tier (BNB discount/VIP
+# tier could lower the real number) - revisit once confirmed. Verified
+# mathematically that a flat % buffer scales correctly with the doubled
+# post-DCA quantity (fees and buffer both scale with notional together),
+# so the same value is correct for both the pre-DCA/TP1 and post-DCA
+# breakeven cases - no separate DCA-specific buffer needed.
+BREAKEVEN_BUFFER_PCT = env_float("BREAKEVEN_BUFFER_PCT", 0.15)
 # Early breakeven - protects profit on a trade before it reaches TP1,
 # instead of leaving the original (wider) stop in place the whole way
 # there. Originally gated on confluence_ratio (protect low-confidence

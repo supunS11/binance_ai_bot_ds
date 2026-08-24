@@ -2044,19 +2044,41 @@ class PositionManager:
         return position["stage"] == DCA_ACTIVE
 
     @staticmethod
-    def _dca_breakeven_price_reached(position, current_price):
-        """Has price reached position["breakeven_price"] yet - shared by
-        poll_live (real mark price) and poll_shadow (simulated candle
-        touch), same point-price-comparison shape the pre-DCA trigger
-        used before _dca_price_reached_in_range replaced it with a
-        candle-range check (2026-08-24) - this post-DCA breakeven check
-        is a separate, out-of-scope mechanism, left unchanged here."""
-        if current_price is None or current_price <= 0:
+    def _dca_breakeven_price_reached_in_range(position, candles):
+        """Has price reached position["breakeven_price"] at ANY point
+        within the current (possibly still-forming) candle - not a
+        single point-in-time sample. Same class of gap _dca_price_
+        reached_in_range closed for the DCA entry trigger (2026-08-24):
+        a point-sampled check can miss a brief touch of breakeven, and
+        even when a later poll catches the recovery, by the time the SL
+        replacement order actually reaches the exchange price may have
+        already reversed back past breakeven - Binance rejects the
+        placement with -2021 ("would immediately trigger") and
+        _replace_sl_order's existing fallback closes the remainder at
+        MARKET at whatever price it's actually at then, which can land
+        the trade at a real loss despite the buffer. Catching the touch
+        as early as possible (this candle's actual high/low, not a
+        delayed point sample) narrows that race window. None/empty
+        candles or a candle missing high/low leaves this False - never
+        fire on incomplete data.
+
+        poll_live only - candles is its sole source of candle data there.
+        poll_shadow does the same high/low comparison inline instead,
+        against its own already-guaranteed latest_candle parameter
+        (candles is a separate, optional parameter in poll_shadow, not
+        reliably in sync with latest_candle the way it is in poll_live)."""
+        if not candles:
+            return False
+
+        latest_candle = candles[-1]
+        high, low = latest_candle.get("high"), latest_candle.get("low")
+
+        if high is None or low is None:
             return False
 
         side = position["side"]
         breakeven = position["breakeven_price"]
-        return current_price >= breakeven if side == "BUY" else current_price <= breakeven
+        return high >= breakeven if side == "BUY" else low <= breakeven
 
     @staticmethod
     def _dca_breakeven_confirmation(position, htf_candles, ltf_candles, cvd_snapshot, current_price):
@@ -2381,7 +2403,7 @@ class PositionManager:
             # smaller recovery that reaches breakeven but not that far.
             if (
                 dca_breakeven_candidate
-                and self._dca_breakeven_price_reached(position, current_price)
+                and self._dca_breakeven_price_reached_in_range(position, candles)
             ):
                 withhold, confirmed, detail = self._dca_breakeven_confirmation(
                     position, htf_candles, candles, cvd_snapshot, current_price
@@ -2988,10 +3010,19 @@ class PositionManager:
             # move already satisfied profit protection's much deeper
             # threshold, that arm already fired and returned above - this
             # only fires on its own for a smaller recovery.
-            if (
-                self._is_dca_breakeven_candidate(position)
-                and self._dca_breakeven_price_reached(position, latest_candle["close"])
-            ):
+            # Uses the high/low already extracted from latest_candle above
+            # (same as this function's own DCA-entry touch check just
+            # above) rather than _dca_breakeven_price_reached_in_range's
+            # `candles` param - candles is a separate, optional parameter
+            # here (only used by config.STRUCTURE_STOP_MANAGEMENT_ENABLED
+            # elsewhere), not guaranteed to be populated/in sync with
+            # latest_candle the way it is in poll_live.
+            touched_breakeven = (
+                high >= position["breakeven_price"] if side == "BUY"
+                else low <= position["breakeven_price"]
+            )
+
+            if self._is_dca_breakeven_candidate(position) and touched_breakeven:
                 withhold, confirmed, detail = self._dca_breakeven_confirmation(
                     position, htf_candles, candles, cvd_snapshot, latest_candle["close"]
                 )

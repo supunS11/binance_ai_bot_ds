@@ -824,7 +824,9 @@ class RegisterTests(unittest.TestCase):
         # risk_distance (98 -> 100.5, was 100 -> 98 = 2.0, now 2.5).
         manager = PositionManager()
         execution_result = {"shadow": False, "real_entry_price": 100.5}
-        position = manager.register(_plan(), execution_result)
+
+        with patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
+            position = manager.register(_plan(), execution_result)
 
         self.assertEqual(position["entry_price"], 100.5)
         self.assertEqual(position["sl_price"], 98)  # unshifted
@@ -1564,7 +1566,7 @@ class StructureStopCandidateTests(unittest.TestCase):
         self.assertAlmostEqual(candidate, 100.5)  # 100.5 > breakeven(~100.02)
 
     def test_buy_clamps_to_breakeven_when_swing_is_worse(self):
-        with patch.object(
+        with patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02), patch.object(
             market_structure, "structure_state",
             return_value={"available": True, "last_swing_low": 99.0},
         ):
@@ -1580,7 +1582,7 @@ class StructureStopCandidateTests(unittest.TestCase):
         self.assertAlmostEqual(candidate, 99.5)  # 99.5 < breakeven(~99.98)
 
     def test_sell_clamps_to_breakeven_when_swing_is_worse(self):
-        with patch.object(
+        with patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02), patch.object(
             market_structure, "structure_state",
             return_value={"available": True, "last_swing_high": 101.0},
         ):
@@ -2203,7 +2205,12 @@ class PollShadowTests(unittest.TestCase):
         # EARLY_BREAKEVEN_LOCK_R_MULTIPLE=0 preserves the original flat-
         # breakeven (fee-buffer-only) behavior exactly - compute_early_
         # breakeven_price falls through to compute_breakeven_price.
-        with patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0):
+        # BREAKEVEN_BUFFER_PCT pinned to _plan()'s own hardcoded fixture
+        # assumption (breakeven_price=100.02) - see the analogous note in
+        # PollLiveTests.test_early_breakeven_triggers_before_the_normal_
+        # tp1_check for why.
+        with patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0), \
+             patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
             manager = self._manager_with_position()
             manager.poll_shadow("BTCUSDT", _candle(high=103, low=99))  # promote to breakeven
             outcome = manager.poll_shadow(
@@ -2237,9 +2244,14 @@ class PollShadowTests(unittest.TestCase):
         # TP1 hit. Lock multiple forced to 0 here so this test stays
         # decoupled from the profit-lock pricing - see
         # EarlyBreakevenProfitLockTests for that.
+        # BREAKEVEN_BUFFER_PCT pinned to _plan()'s own hardcoded fixture
+        # assumption (breakeven_price=100.02) - see the analogous note in
+        # PollLiveTests.test_early_breakeven_triggers_before_the_normal_
+        # tp1_check for why.
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5), \
-             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0):
+             patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0), \
+             patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
             manager = self._manager_with_position()
             outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
 
@@ -2865,9 +2877,16 @@ class PollLiveTests(unittest.TestCase):
 
         # Lock multiple forced to 0 here so this test stays decoupled from
         # the profit-lock pricing itself - see EarlyBreakevenProfitLockTests.
+        # BREAKEVEN_BUFFER_PCT pinned to _plan()'s own hardcoded fixture
+        # assumption (breakeven_price=100.02) so the live recompute here
+        # matches it exactly - otherwise the live value (now 0.15% by
+        # default) would diverge from the fixture's stale flat value and
+        # register as a real profit lock instead of the flat scratch this
+        # test is actually about.
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
              patch.object(config, "EARLY_BREAKEVEN_LOCK_R_MULTIPLE", 0), \
+             patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02), \
              patch.object(exchange, "get_mark_price", return_value=102.0), \
              patch.object(exchange, "get_algo_order_status") as status_mock, \
              patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
@@ -4217,7 +4236,9 @@ class RegisterDcaPendingTests(unittest.TestCase):
         # structure level, independent of entry slippage) stays untouched.
         manager = PositionManager()
         execution_result = {"shadow": False, "real_entry_price": 100.5}
-        position = manager.register_dca_pending(_dca_plan(), execution_result)
+
+        with patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
+            position = manager.register_dca_pending(_dca_plan(), execution_result)
 
         self.assertEqual(position["entry_price"], 100.5)
         self.assertEqual(position["dca_price"], 96)  # unshifted
@@ -4321,6 +4342,38 @@ class DcaPriceReachedInRangeTests(unittest.TestCase):
             position, [{"high": 100}]))
         self.assertFalse(PositionManager._dca_price_reached_in_range(
             position, [{"low": 95}]))
+
+
+class DcaBreakevenPriceReachedInRangeTests(unittest.TestCase):
+    def test_buy_reached_when_the_candles_high_touches_or_crosses(self):
+        position = {"side": "BUY", "breakeven_price": 98.02}
+        self.assertTrue(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"high": 98.02, "low": 97.5}]))
+        self.assertTrue(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"high": 99.0, "low": 97.5}]))
+        self.assertFalse(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"high": 98.0, "low": 97.5}]))
+
+    def test_sell_reached_when_the_candles_low_touches_or_crosses(self):
+        position = {"side": "SELL", "breakeven_price": 97.98}
+        self.assertTrue(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"high": 98.5, "low": 97.98}]))
+        self.assertTrue(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"high": 98.5, "low": 97.0}]))
+        self.assertFalse(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"high": 98.5, "low": 98.0}]))
+
+    def test_none_or_empty_candles_is_never_reached(self):
+        position = {"side": "BUY", "breakeven_price": 98.02}
+        self.assertFalse(PositionManager._dca_breakeven_price_reached_in_range(position, None))
+        self.assertFalse(PositionManager._dca_breakeven_price_reached_in_range(position, []))
+
+    def test_candle_missing_high_or_low_is_never_reached(self):
+        position = {"side": "BUY", "breakeven_price": 98.02}
+        self.assertFalse(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"high": 99.0}]))
+        self.assertFalse(PositionManager._dca_breakeven_price_reached_in_range(
+            position, [{"low": 97.5}]))
 
 
 class ExecuteDcaShadowTests(unittest.TestCase):
@@ -5516,11 +5569,12 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         self.assertTrue(manager.has_open_position("BTCUSDT"))
 
     def test_dca_breakeven_arms_when_price_reaches_breakeven(self):
-        # entry=98, sl=94 (a real loss level) - mark price recovers to
-        # breakeven_price=98.02, the fix closes that gap by moving the SL
-        # there so the trade can no longer close as a full loss.
+        # entry=98, sl=94 (a real loss level) - the candle's high recovers
+        # to breakeven_price=98.02, the fix closes that gap by moving the
+        # SL there so the trade can no longer close as a full loss.
         manager = self._manager_with_dca_active()
         manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+        candles = [{"high": 98.02, "low": 97.5}]
 
         with patch.object(config, "DCA_BREAKEVEN_ENABLED", True), \
              patch.object(exchange, "get_mark_price", return_value=98.02), \
@@ -5529,7 +5583,7 @@ class PollLiveDcaActiveTests(unittest.TestCase):
              patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
-            outcome = manager.poll_live("BTCUSDT")
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
 
         self.assertIsNone(outcome)
         position = manager.positions["BTCUSDT"]
@@ -5537,6 +5591,32 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         cancel.assert_called_once_with("BTCUSDT", "sl_new")
         new_sl.assert_called_once_with("BTCUSDT", "BUY", 98.02)
         self.assertEqual(position["sl_order_id"], "sl_be")
+        self.assertEqual(position["sl_price"], 98.02)
+
+    def test_dca_breakeven_arms_on_a_wick_the_old_point_price_check_would_have_missed(self):
+        # The actual gap this fix closes: price wicked up to breakeven and
+        # back down between two poll ticks. By the time this poll runs,
+        # the mark price (97.5) has already dropped back below breakeven
+        # (98.02) - the OLD _dca_breakeven_price_reached(position,
+        # current_price=97.5) would have returned False here. The candle's
+        # high (98.1) still remembers the touch, so the range check must
+        # arm anyway.
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["breakeven_price"] = 98.02
+        candles = [{"high": 98.1, "low": 97.5}]
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=97.5), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}):
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["dca_breakeven_applied"])
         self.assertEqual(position["sl_price"], 98.02)
 
     def test_dca_breakeven_does_not_arm_below_breakeven(self):
@@ -5994,7 +6074,7 @@ class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
              patch.object(exchange, "cancel_algo_order"), \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}):
             outcome = manager.poll_live(
-                "BTCUSDT", htf_candles=["htf"],
+                "BTCUSDT", candles=[{"high": 98.5, "low": 97.5}], htf_candles=["htf"],
                 cvd_snapshot={"available": True, "cvd_score": 0.5},
             )
 
@@ -6018,7 +6098,7 @@ class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
             outcome = manager.poll_live(
-                "BTCUSDT", candles=["ltf"], htf_candles=["htf"],
+                "BTCUSDT", candles=[{"high": 98.5, "low": 97.5}], htf_candles=["htf"],
                 cvd_snapshot={"available": True, "cvd_score": 0.5},
             )
 
@@ -6042,7 +6122,7 @@ class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
              patch.object(exchange, "place_stop_loss") as new_sl, \
              patch.object(exchange, "cancel_algo_order") as cancel:
             outcome = manager.poll_live(
-                "BTCUSDT", candles=["ltf"], htf_candles=["htf"],
+                "BTCUSDT", candles=[{"high": 98.5, "low": 97.5}], htf_candles=["htf"],
                 cvd_snapshot={"available": True, "cvd_score": 0.5},
             )
 
@@ -6075,7 +6155,7 @@ class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
             outcome = manager.poll_live(
-                "BTCUSDT", candles=["ltf"], htf_candles=["htf"],
+                "BTCUSDT", candles=[{"high": 98.5, "low": 97.5}], htf_candles=["htf"],
                 cvd_snapshot={"available": True, "cvd_score": 0.5},
             )
 
@@ -6101,7 +6181,7 @@ class PollLiveDcaBreakevenConfirmationTests(unittest.TestCase):
              patch.object(exchange, "cancel_algo_order") as cancel, \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}) as new_sl:
             outcome = manager.poll_live(
-                "BTCUSDT", candles=["ltf"], htf_candles=None,
+                "BTCUSDT", candles=[{"high": 98.5, "low": 97.5}], htf_candles=None,
                 cvd_snapshot={"available": True, "cvd_score": 0.5},
             )
 
