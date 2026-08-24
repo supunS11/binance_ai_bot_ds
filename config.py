@@ -188,7 +188,17 @@ CHOP_FILTER_LOOKBACK_CANDLES = env_int("CHOP_FILTER_LOOKBACK_CANDLES", 14)
 # structure. Informational only: computed/journaled, not gated, same
 # evidence-first treatment as every other confluence field here.
 BTC_CORRELATION_ENABLED = env_bool("BTC_CORRELATION_ENABLED", "True")
-CORRELATION_LOOKBACK_CANDLES = env_int("CORRELATION_LOOKBACK_CANDLES", 20)
+# Same timeframe-mismatch fix as EMA_ALIGNMENT_PERIOD above, same evidence
+# (2026-08-24 underwater-duration audit) - at 20 (on 1h ltf_candles) this
+# was a 20-HOUR correlation/return window feeding btc_aligned, far slower
+# than the actual trade lifecycle (median 2.6h). Safe to recalibrate this
+# constant directly rather than add a parallel one: grep-confirmed, its
+# only consumers are btc_aligned and its own journaled/informational value
+# - no trigger, gate, or sizing logic reads it any other way. 4 (hours)
+# matches EMA_ALIGNMENT_PERIOD for the same "median trade duration" reason
+# - reasoned, not yet outcome-validated; revisit once enough trades
+# resolve under it.
+CORRELATION_LOOKBACK_CANDLES = env_int("CORRELATION_LOOKBACK_CANDLES", 4)
 CORRELATION_REFERENCE_SYMBOL = os.getenv("CORRELATION_REFERENCE_SYMBOL", "BTCUSDT").upper()
 # =========================
 # CRASH DETECTOR
@@ -278,6 +288,21 @@ REQUIRE_ORDER_BLOCK_OR_FVG = env_bool("REQUIRE_ORDER_BLOCK_OR_FVG", "True")
 # accumulate before this is ever turned into a hard gate.
 EMA_CONFIRMATION_ENABLED = env_bool("EMA_CONFIRMATION_ENABLED", "True")
 EMA_CONFIRMATION_PERIOD = env_int("EMA_CONFIRMATION_PERIOD", 20)
+# Separate, faster EMA used ONLY for the ema_aligned confluence field above
+# - independent of EMA_CONFIRMATION_PERIOD, which still drives ema_value
+# and therefore EMA_PULLBACK_TRIGGER_ENABLED's own live trigger detection
+# (market_structure.detect_ema_pullback) unchanged. Real evidence
+# (2026-08-24 underwater-duration audit, 80 resolved trades with real 1m
+# price paths): at EMA_CONFIRMATION_PERIOD=20 on the 1h ltf_candles, that's
+# a 20-HOUR EMA, while trades resolve on a 30min-5h scale (median 2.6h for
+# wins) - a 20h trend can stay fully intact through a multi-hour corrective
+# dip, so ema_aligned=True on 6 of 7 inspected non-CHOCH_RETEST losses and
+# showed no protective correlation with adverse-excursion duration (if
+# anything, aligned=True trades showed LONGER underwater streaks than
+# aligned=False ones). 4 (hours, on 1h candles) chosen to match the median
+# trade's own duration - reasoned, not yet outcome-validated against
+# trades entered under it; revisit once enough resolve.
+EMA_ALIGNMENT_PERIOD = env_int("EMA_ALIGNMENT_PERIOD", 4)
 # Open Interest - informational only, NOT a gate (same treatment as EMA
 # above). OI rising during a directional break points at fresh
 # positioning behind the move (new longs on a bullish break, new shorts

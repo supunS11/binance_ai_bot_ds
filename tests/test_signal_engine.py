@@ -86,6 +86,7 @@ class SignalEngineTests(unittest.TestCase):
         ema_pullback_level=None,
         ema_pullback_open_time=555,
         ema_value=85.0,
+        ema_alignment_value=85.0,
         htf_trend_ema=None,
         oi_snapshot=None,
         liquidation_snapshot=None,
@@ -161,16 +162,22 @@ class SignalEngineTests(unittest.TestCase):
         )
         btc_candles = ["btc_candle_placeholder"] if btc_candles == "default" else btc_candles
 
-        # Two distinct callers share this one mocked function: the
+        # Three distinct callers share this one mocked function: the
         # existing informational LTF ema_value (called with just
-        # ltf_candles, no period=) and the new HTF_TREND_FRESHNESS_ENABLED
-        # gate's htf_trend_ema (always called with an explicit period= -
-        # see signal_engine.py). Routing on whether period was passed
-        # keeps them independently controllable - htf_trend_ema defaults
-        # to None (gate is a no-op) so no existing test is affected
-        # unless it explicitly opts in.
+        # ltf_candles, no period=), the faster ema_alignment_value used
+        # only for ema_aligned (always called with period=
+        # config.EMA_ALIGNMENT_PERIOD), and the HTF_TREND_FRESHNESS_ENABLED
+        # gate's htf_trend_ema (always called with period=
+        # config.HTF_TREND_EMA_PERIOD - see signal_engine.py). Routing on
+        # the exact period value keeps all three independently
+        # controllable - htf_trend_ema defaults to None (gate is a no-op)
+        # so no existing test is affected unless it explicitly opts in.
         def _ema_side_effect(candles, period=None):
-            return htf_trend_ema if period is not None else ema_value
+            if period is None:
+                return ema_value
+            if period == config.EMA_ALIGNMENT_PERIOD:
+                return ema_alignment_value
+            return htf_trend_ema
 
         # OI_RISING_REJECT_ENABLED defaults True in config.py (real gate,
         # see its own comment) but oi_snapshot's own default above
@@ -529,11 +536,14 @@ class SignalEngineTests(unittest.TestCase):
         # ema_aligned=False, but must NOT reject the signal - an EMA is a
         # lagging indicator, so gating on it would delay real-time entries
         # on sharp moves without evidence it's actually worth the cost.
-        result = self._run(ema_value=95.0)  # ltf_close defaults to 93 < 95
+        # ema_aligned is driven by ema_alignment_value (EMA_ALIGNMENT_
+        # PERIOD), NOT ema_value (EMA_CONFIRMATION_PERIOD) - these are
+        # deliberately independent, see config.EMA_ALIGNMENT_PERIOD.
+        result = self._run(ema_alignment_value=95.0)  # ltf_close defaults to 93 < 95
 
         self.assertEqual(result["signal"], "BUY")
         self.assertFalse(result["ema_aligned"])
-        self.assertEqual(result["ema_value"], 95.0)
+        self.assertEqual(result["ema_alignment_value"], 95.0)
 
     def test_ema_aligned_true_for_sell_when_price_is_below_ema(self):
         result = self._run(
@@ -543,25 +553,42 @@ class SignalEngineTests(unittest.TestCase):
             htf_structure=HTF_BEARISH,
             ltf_analysis=LTF_BEARISH_BREAK,
             sweep_direction="BEARISH",
-            ema_value=115.0,  # 108 < 115 -> aligned for a SELL
+            ema_alignment_value=115.0,  # 108 < 115 -> aligned for a SELL
         )
 
         self.assertEqual(result["signal"], "SELL")
         self.assertTrue(result["ema_aligned"])
 
     def test_ema_unavailable_does_not_block_the_signal(self):
-        result = self._run(ema_value=None)
+        result = self._run(ema_value=None, ema_alignment_value=None)
 
         self.assertEqual(result["signal"], "BUY")
         self.assertIsNone(result["ema_aligned"])
         self.assertIsNone(result["ema_value"])
+        self.assertIsNone(result["ema_alignment_value"])
+
+    def test_ema_aligned_tracks_ema_alignment_value_not_ema_value(self):
+        # Deliberately set the two EMAs to DISAGREE: ema_value=90 says
+        # aligned (93 > 90), ema_alignment_value=99 says misaligned
+        # (93 < 99). ema_aligned must follow ema_alignment_value only -
+        # this is the actual fix for the EMA/BTC alignment timeframe
+        # mismatch (config.EMA_ALIGNMENT_PERIOD).
+        result = self._run(ema_value=90.0, ema_alignment_value=99.0)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["ema_value"], 90.0)
+        self.assertEqual(result["ema_alignment_value"], 99.0)
+        self.assertFalse(result["ema_aligned"])
 
     def test_ema_fields_are_none_when_confirmation_disabled(self):
+        # Both ema_value and ema_alignment_value are gated by the same
+        # EMA_CONFIRMATION_ENABLED toggle - see signal_engine.py.
         with patch.object(config, "EMA_CONFIRMATION_ENABLED", False):
-            result = self._run(ema_value=95.0)  # would be misaligned if computed
+            result = self._run(ema_value=95.0, ema_alignment_value=95.0)  # would be misaligned if computed
 
         self.assertEqual(result["signal"], "BUY")
         self.assertIsNone(result["ema_value"])
+        self.assertIsNone(result["ema_alignment_value"])
         self.assertIsNone(result["ema_aligned"])
 
     def test_oi_rising_is_recorded_when_the_reject_gate_is_off(self):
@@ -895,7 +922,7 @@ class SignalEngineTests(unittest.TestCase):
 
     def test_confluence_score_counts_only_disagreeing_fields_against_it(self):
         result = self._run(
-            ema_value=95.0,  # 93 < 95 -> misaligned for a BUY
+            ema_alignment_value=95.0,  # 93 < 95 -> misaligned for a BUY
             oi_snapshot={"available": True, "oi_change_pct": -3.0},  # falling
             liquidation_snapshot={
                 "available": True, "long_liquidation_notional": 1000,
@@ -911,6 +938,7 @@ class SignalEngineTests(unittest.TestCase):
     def test_unavailable_fields_are_excluded_from_the_denominator(self):
         result = self._run(
             ema_value=None,
+            ema_alignment_value=None,
             oi_snapshot={"available": False},
             liquidation_snapshot={"available": False},
         )

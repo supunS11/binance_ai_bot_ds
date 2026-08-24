@@ -198,6 +198,18 @@ def evaluate(
     if config.EMA_PULLBACK_TRIGGER_ENABLED:
         ema_pullback = market_structure.detect_ema_pullback(ltf_candles, ema_value)
 
+    # Separate, faster EMA used ONLY for the ema_aligned confluence field
+    # below - deliberately independent of ema_value/EMA_CONFIRMATION_PERIOD
+    # above (which still drives EMA_PULLBACK_TRIGGER_ENABLED's own trigger
+    # detection unchanged). See config.EMA_ALIGNMENT_PERIOD for the
+    # timeframe-mismatch evidence this fixes.
+    ema_alignment_value = None
+
+    if config.EMA_CONFIRMATION_ENABLED:
+        ema_alignment_value = market_structure.exponential_moving_average(
+            ltf_candles, period=config.EMA_ALIGNMENT_PERIOD
+        )
+
     btc_correlation = None
     btc_return = None
 
@@ -567,13 +579,16 @@ def evaluate(
         # its correct side can delay entry on a sharp move until price
         # has run further - a real cost against this bot's real-time
         # premise, and one not yet backed by evidence it's worth paying.
-        # ema_value itself is hoisted above (direction-independent) -
-        # only the alignment derived from it varies per direction.
+        # ema_alignment_value itself is hoisted above (direction-
+        # independent) - only the alignment derived from it varies per
+        # direction. Uses ema_alignment_value (EMA_ALIGNMENT_PERIOD), NOT
+        # ema_value (EMA_CONFIRMATION_PERIOD) - see config.
+        # EMA_ALIGNMENT_PERIOD for why these were split apart.
         ema_aligned = None
 
-        if ema_value is not None:
+        if ema_alignment_value is not None:
             ema_aligned = (
-                latest_price > ema_value if side == "BUY" else latest_price < ema_value
+                latest_price > ema_alignment_value if side == "BUY" else latest_price < ema_alignment_value
             )
 
         # Open Interest: informational only, NOT a gate - see
@@ -801,6 +816,7 @@ def evaluate(
             # above - see risk_manager.compute_retracement_price.
             "fair_value_gaps": ltf_analysis["fair_value_gaps"],
             "ema_value": ema_value,
+            "ema_alignment_value": ema_alignment_value,
             "ema_aligned": ema_aligned,
             "oi_change_pct": oi_change_pct,
             "oi_rising": oi_rising,

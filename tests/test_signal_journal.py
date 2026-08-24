@@ -117,6 +117,16 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["funding_favorable"], "False")
         self.assertEqual(rows[0]["long_short_favorable"], "True")
 
+    def test_append_signal_writes_ema_alignment_value(self):
+        # config.EMA_ALIGNMENT_PERIOD - the faster EMA used only for
+        # ema_aligned, deliberately separate from ema_value/
+        # EMA_CONFIRMATION_PERIOD (still journaled independently).
+        signal_journal.append_signal(_signal(ema_value=101.0, ema_alignment_value=99.5), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["ema_value"], "101.0")
+        self.assertEqual(rows[0]["ema_alignment_value"], "99.5")
+
     def test_append_signal_writes_entry_extension_r_from_the_plan(self):
         signal_journal.append_signal(_signal(), _plan(entry_extension_r=0.35))
         rows = self._read_rows()
