@@ -1392,6 +1392,101 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertIn("CVD_NOT_CONFIRMED", result["reason"])
 
+    # config.OB_FVG_RETEST_MIN_DEPTH_IMBALANCE - real evidence (2026-08-25
+    # signal-engine audit, 33 resolved OB_FVG_RETEST trades): depth_
+    # imbalance clearly favorable (signed >=0.10) won 90.0% (n=10) vs only
+    # 73.9% (n=23) when merely neutral. Trigger-scoped (only OB_FVG_
+    # RETEST's own candidacy), reject-only, fail-open on missing data -
+    # mirrors CHOCH_RETEST_MIN_DEPTH_IMBALANCE's own test shape.
+
+    def test_ob_fvg_retest_rejected_when_depth_imbalance_too_weak_buy(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+                depth={"available": True, "depth_imbalance": 0.05},  # below 0.10, but not opposing enough for DEPTH_OPPOSING
+            )
+
+        self.assertIn("OB_FVG_RETEST_DEPTH_WEAK", result["reason"])
+
+    def test_ob_fvg_retest_rejected_when_depth_imbalance_too_weak_sell(self):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.05},  # signed=0.05, below 0.10
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                fvg_retest_direction="BEARISH", fvg_retest_level=110,
+            )
+
+        self.assertIn("OB_FVG_RETEST_DEPTH_WEAK", result["reason"])
+
+    def test_ob_fvg_retest_accepted_when_depth_imbalance_meets_threshold(self):
+        # Boundary is inclusive (">=" not ">") - signed depth exactly equal
+        # to the threshold must still qualify.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+                depth={"available": True, "depth_imbalance": 0.10},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
+
+    def test_ob_fvg_retest_depth_requirement_disabled_lets_weak_depth_through(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+                depth={"available": True, "depth_imbalance": 0.01},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
+
+    def test_ob_fvg_retest_depth_unavailable_does_not_block(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                fvg_retest_direction="BULLISH", fvg_retest_level=90,
+                depth={"available": False},
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "OB_FVG_RETEST")
+
+    def test_ob_fvg_retest_depth_requirement_does_not_affect_other_triggers(self):
+        # Weak depth (0.05, below the 0.10 OB_FVG_RETEST-specific
+        # threshold) must not block a DIFFERENT trigger (STRUCTURE_BREAK,
+        # _run()'s own default) evaluated for the same direction/tick -
+        # this check is trigger-scoped, not direction-scoped.
+        with patch.object(config, "OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0.10):
+            result = self._run(depth={"available": True, "depth_imbalance": 0.05})
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+
     # config.CHOCH_RETEST_TRIGGER_ENABLED - an already-CONFIRMED reversal
     # (last_event type CHoCH), retested within CHOCH_TRIGGER_MAX_AGE_CANDLES.
     # Ranked last in priority: STRUCTURE_BREAK > OB_FVG_RETEST >

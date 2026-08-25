@@ -736,6 +736,28 @@ def evaluate(
             if signed_depth < config.CHOCH_RETEST_MIN_DEPTH_IMBALANCE:
                 return _reject("CHOCH_RETEST_DEPTH_WEAK")
 
+        # config.OB_FVG_RETEST_MIN_DEPTH_IMBALANCE - real evidence
+        # (2026-08-25 signal-engine audit, 33 resolved OB_FVG_RETEST
+        # trades): depth_imbalance clearly favorable (signed >=0.10 toward
+        # the trade's own side) won 90.0% (n=10) vs only 73.9% (n=23) when
+        # merely neutral - same confirmed pattern as CHOCH_RETEST above,
+        # found while auditing DEPTH_OPPOSING's aggregate (which looked
+        # flat only because it was averaging three opposite-signed,
+        # trigger-specific effects together). See config.py's own comment
+        # for the full reasoning, including why EMA_PULLBACK must NOT
+        # reuse this threshold (its own depth_imbalance relationship runs
+        # the other way on a thin sample). Reject-only, trigger-scoped,
+        # same fail-open convention as DEPTH_OPPOSING/CHOCH_RETEST above.
+        if (
+            trigger == "OB_FVG_RETEST"
+            and depth_imbalance is not None
+            and config.OB_FVG_RETEST_MIN_DEPTH_IMBALANCE > 0
+        ):
+            signed_depth = depth_imbalance if side == "BUY" else -depth_imbalance
+
+            if signed_depth < config.OB_FVG_RETEST_MIN_DEPTH_IMBALANCE:
+                return _reject("OB_FVG_RETEST_DEPTH_WEAK")
+
         if pools is None:
             # Not already computed above - either
             # LIQUIDITY_SWEEP_TRIGGER_ENABLED is off, or it's on but the

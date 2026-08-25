@@ -505,6 +505,22 @@ CHOCH_TRIGGER_MIN_AGE_CANDLES = env_int("CHOCH_TRIGGER_MIN_AGE_CANDLES", 9)
 # AGE_CANDLES above. 0 (or negative) disables, same convention as
 # MIN_TP1_R_MULTIPLE/DCA_MIN_TP_R_MULTIPLE.
 CHOCH_RETEST_MIN_DEPTH_IMBALANCE = env_float("CHOCH_RETEST_MIN_DEPTH_IMBALANCE", 0.10)
+# Real evidence (2026-08-25 signal-engine audit, 33 resolved OB_FVG_RETEST
+# trades, re-validated against a fresh VPS pull the same day with zero new
+# trades in between): depth_imbalance clearly favorable (signed >=0.10
+# toward the trade's own side) won 90.0% (n=10) vs only 73.9% (n=23) when
+# merely neutral (-0.10..0.10 - already clearing the universal
+# DEPTH_OPPOSING gate, which only rejects CLEARLY opposing depth, not "not
+# yet favorable"). Same shape and comparable sample/effect size to
+# CHOCH_RETEST_MIN_DEPTH_IMBALANCE above - the audit found this split held
+# up specifically for OB_FVG_RETEST while the same aggregate looked flat
+# (a trigger-mix confound: EMA_PULLBACK shows the OPPOSITE relationship on
+# a thin n=5 sample and must NOT reuse this threshold). Reject-only (can
+# only make OB_FVG_RETEST fire LESS often than today, never more) - same
+# "safe to ship on real evidence immediately" precedent as the CHOCH
+# version. 0 (or negative) disables, same convention as
+# CHOCH_RETEST_MIN_DEPTH_IMBALANCE.
+OB_FVG_RETEST_MIN_DEPTH_IMBALANCE = env_float("OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0.10)
 # Fourth entry trigger: a fresh rejection wick into an UNMITIGATED fair
 # value gap (market_structure.find_fvg_retest) - independent of any live
 # break right now, the classic OB/FVG "retest" entry. Scoped to FVGs only
