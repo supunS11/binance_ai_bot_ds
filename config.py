@@ -1411,6 +1411,51 @@ DCA_PRESSURE_SIZE_MULTIPLIER = env_float("DCA_PRESSURE_SIZE_MULTIPLIER", 0.5)
 # again" reasoning as the size cut above. Starting value (half of
 # DCA_STRUCTURE_STOP_ATR_BUFFER's own 0.5 default), not calibrated.
 DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER = env_float("DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER", 0.25)
+# Real gap named by this project's own founding design (see DCA_ENABLED's
+# comment above): a DCA_PENDING position's add-in is detected by the poll
+# loop watching candle ranges, not a resting exchange order - a gap or
+# violent single-candle move through dca_price before the next poll tick
+# has no circuit breaker at all. Real incident this connects to
+# (2026-08-22, see CRASH_DETECTOR_ENABLED's comment): a DCA fired
+# correctly but the SUBSEQUENT SL placement was REJECTED ("would
+# immediately trigger") because price had already blown through the new
+# level by the time the poll-driven code got to it.
+#
+# When on: the DCA add itself is placed as a real resting LIMIT order at
+# dca_price the moment a position enters DCA_PENDING (see execution.
+# place_dca_protection_orders), so Binance's own matching engine
+# protects it continuously instead of once per
+# POSITION_POLL_INTERVAL_SECONDS. poll_live then detects the FILL via
+# exchange.get_order_status instead of watching candle ranges for the
+# trigger - the candle-range check (position_manager.
+# _dca_price_reached_in_range) stays as the fallback for any position
+# without a resting order (flag off, or registered before it was turned
+# on).
+#
+# Sizing (operator-confirmed, 2026-08-25): the resting order can't do
+# DCA_PRESSURE_CHECK_ENABLED's real-time "last look" before filling -
+# whatever size is resting fills unconditionally the instant price
+# reaches it. Always rests at DCA_PRESSURE_SIZE_MULTIPLIER (the pressure
+# check's existing "not confirmed" size) with DCA_PRESSURE_TIGHT_STOP_
+# ATR_BUFFER (its existing tighter stop) - never the full DCA_SIZE_
+# MULTIPLIER size, even when order flow would have confirmed. Consistent
+# with the pressure check's own stated principle ("can only make DCA
+# more conservative than today, never less") and with the real evidence
+# that dca_applied=True trades already skew losing system-wide (~6.5%
+# win rate, 2026-08-25 signal-engine audit) - the "full size when
+# confirmed" upside is rarely realized anyway, so it isn't worth keeping
+# at the cost of leaving the resting order at full size during a real
+# gap. position_manager._execute_dca's own DCA_PRESSURE_CHECK_ENABLED
+# block is skipped entirely when a resting-order fill is what triggered
+# it (sizing already happened at placement time) - unaffected for the
+# candle-range fallback path, which still runs the real-time check
+# exactly as before.
+#
+# Default False: new, unvalidated mechanism touching real order
+# placement - same "earns a live default only after real data" rule as
+# DCA_PRESSURE_CHECK_ENABLED itself and every other unvalidated
+# mechanism here.
+DCA_RESTING_ORDER_ENABLED = env_bool("DCA_RESTING_ORDER_ENABLED", "False")
 # Real gap found live (2026-08-17, operator observation): a DCA_ACTIVE
 # position's only two protection mechanisms are PROFIT_PROTECTION_ENABLED
 # (needs PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 of the way to the single,

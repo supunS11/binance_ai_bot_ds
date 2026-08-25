@@ -408,7 +408,14 @@ class PositionManager:
         risk_manager.build_trade_plan's own dca_price/dca_quantity
         fields. dca_applied mirrors early_breakeven_applied's role: set
         True the moment _execute_dca actually fires, so it can never be
-        attempted twice for the same position."""
+        attempted twice for the same position.
+
+        config.DCA_RESTING_ORDER_ENABLED - dca_order_id is the resting
+        LIMIT order's id (None when the flag is off, shadow, or
+        placement failed - see execution.place_dca_protection_orders).
+        poll_live's DCA_PENDING branch uses its presence to decide
+        whether to poll real order status (exchange.get_order_status)
+        instead of the candle-range check for this specific position."""
         symbol = plan["symbol"]
         shadow = execution_result.get("shadow", True)
         entry_price, breakeven_price, risk_distance = _resolve_real_entry(
@@ -445,6 +452,10 @@ class PositionManager:
             ),
             "tp_order_id": (
                 exchange._accepted_order_id(execution_result.get("tp_order"))
+                if not shadow else None
+            ),
+            "dca_order_id": (
+                exchange._accepted_order_id(execution_result.get("dca_order"))
                 if not shadow else None
             ),
             "stage": DCA_PENDING,
@@ -655,11 +666,33 @@ class PositionManager:
         "no recoverable plan, cancel and re-evaluate fresh" treatment.
         This is what actually closes the "orphaned resting order" risk
         RETRACEMENT_ENTRY_ENABLED's own config.py comment describes -
-        bounded to at most one poll cycle after a restart, not open-ended."""
-        if not config.LIMIT_ENTRY_MODE_ENABLED and not config.RETRACEMENT_ENTRY_ENABLED:
+        bounded to at most one poll cycle after a restart, not open-ended.
+
+        config.DCA_RESTING_ORDER_ENABLED is the one deliberate exception
+        to "cancel outright": unlike a pending ENTRY (no real position
+        exists yet, nothing recoverable), a resting DCA-add order belongs
+        to an already-open, real exchange position - blanket-cancelling
+        it here would silently strip the exact protection this feature
+        exists to provide, on every single restart (this bot restarts
+        often - see config.DCA_RESTING_ORDER_ENABLED's own comment).
+        Tagged orders (execution.DCA_ADD_CLIENT_ORDER_ID_PREFIX) are
+        recognized via their clientOrderId and re-attached to a matching,
+        already-recovered DCA_PENDING position's dca_order_id instead -
+        must run AFTER reconcile_on_startup() (already required above)
+        so self.positions is populated by the time this checks it. A
+        tagged order with NO matching tracked DCA_PENDING position
+        (state lost/corrupt, or genuinely stale) still falls through to
+        the same cancel-and-re-evaluate treatment as everything else -
+        the exception is narrow, not a blanket exemption for the tag."""
+        if (
+            not config.LIMIT_ENTRY_MODE_ENABLED
+            and not config.RETRACEMENT_ENTRY_ENABLED
+            and not config.DCA_RESTING_ORDER_ENABLED
+        ):
             return
 
         cancelled = 0
+        preserved = 0
 
         for order in exchange.get_all_open_orders():
             if str(order.get("type") or "").upper() != "LIMIT":
@@ -671,6 +704,29 @@ class PositionManager:
             if not symbol or not order_id:
                 continue
 
+            client_id = str(order.get("clientOrderId") or "")
+
+            if client_id.startswith(execution.DCA_ADD_CLIENT_ORDER_ID_PREFIX):
+                position = self.positions.get(symbol)
+
+                if (
+                    position
+                    and position.get("stage") == DCA_PENDING
+                    and not position.get("dca_order_id")
+                ):
+                    position["dca_order_id"] = order_id
+                    preserved += 1
+                    log_info(
+                        f"{symbol} recovered a resting DCA order on restart "
+                        f"(order_id={order_id}) - preserved, not cancelled"
+                    )
+                    continue
+                # No matching tracked DCA_PENDING position - genuinely
+                # stray despite the tag (state lost/corrupt, or the
+                # position resolved some other way before this ran) -
+                # falls through to the same cancel below as everything
+                # else.
+
             exchange.cancel_order(symbol, order_id)
             cancelled += 1
             log_warning(
@@ -679,10 +735,11 @@ class PositionManager:
                 f"entry plan survives a restart, re-evaluating fresh instead"
             )
 
-        if cancelled:
+        if cancelled or preserved:
             log_info(
                 f"Startup reconciliation | {cancelled} resting limit "
-                f"entry order(s) cancelled"
+                f"entry order(s) cancelled, {preserved} resting DCA "
+                f"order(s) preserved"
             )
 
     def _try_restore_from_saved_state(self, symbol, live_position, saved_state):
@@ -1391,8 +1448,29 @@ class PositionManager:
         `target_price` defaults to the flat (fee-buffer-only) breakeven
         price for a genuine TP1 fill; the early-breakeven caller passes a
         real locked-profit price instead (see
-        _early_breakeven_lock_price)."""
+        _early_breakeven_lock_price).
+
+        config.DCA_RESTING_ORDER_ENABLED - a genuine promotion means DCA
+        will never be needed for this position (TP1/early-breakeven both
+        only ever happen from favorable movement) - a still-resting DCA
+        add order must not keep resting past this point, mirroring
+        _execute_dca's own symmetric cleanup of TP1/TP2 when DCA fires
+        first instead. .get() is safe/always None for a TP1_PENDING
+        position (this function is shared by both stages), which never
+        has this key at all."""
         target_price = position["breakeven_price"] if target_price is None else target_price
+
+        dca_order_id = position.get("dca_order_id")
+
+        if dca_order_id:
+            try:
+                exchange.cancel_order(position["symbol"], dca_order_id)
+            except Exception as exc:
+                log_warning(
+                    f"{position['symbol']} resting DCA order cleanup cancel "
+                    f"failed on promotion (likely already gone): {exc}"
+                )
+            position["dca_order_id"] = None
 
         if not config.MOVE_SL_TO_BREAKEVEN_AFTER_TP1:
             position["stage"] = BREAKEVEN_ACTIVE
@@ -1656,9 +1734,69 @@ class PositionManager:
         dca_price = position["dca_price"]
         return low <= dca_price if side == "BUY" else high >= dca_price
 
+    def _poll_dca_resting_order(
+        self, position, candles=None, htf_candles=None, cvd_snapshot=None,
+        current_price=None, crash_snapshot=None,
+    ):
+        """config.DCA_RESTING_ORDER_ENABLED - polls the resting DCA LIMIT
+        order's real status instead of watching candle ranges for the
+        trigger (_dca_price_reached_in_range stays the fallback for any
+        position with no dca_order_id). A plain order, not algo, so
+        exchange.get_order_status is the right primitive - same one
+        poll_retracement_pending already uses, and the one that reports
+        partial fills via executed_qty. That function never raises - a
+        transient failure or a genuinely gone order both come back with
+        executed_qty=0.0, handled the same as "still resting" below.
+
+        Returns (fired, outcome): `fired` is False when nothing has
+        changed yet (still resting, transient lookup failure, or the
+        order is gone with zero fill) - the caller must fall through to
+        the early-promotion checks exactly like the "not yet reached"
+        case on the candle-range path. `fired` is True the moment ANY
+        fill is detected, mirroring the candle-range path's own
+        unconditional `return self._execute_dca(...)` - `outcome` is
+        then whatever _execute_dca itself returned (None on success,
+        since position["stage"] is DCA_ACTIVE by then and must not be
+        treated by TP1_PENDING/DCA_PENDING-shaped checks further down
+        this tick; a close-outcome string if the post-DCA SL placement
+        failed)."""
+        symbol = position["symbol"]
+        order_id = position["dca_order_id"]
+        order = exchange.get_order_status(symbol, order_id)
+
+        if order["executed_qty"] <= 0:
+            return False, None
+
+        outcome = self._execute_dca(
+            position, candles=candles, htf_candles=htf_candles,
+            cvd_snapshot=cvd_snapshot, current_price=current_price,
+            crash_snapshot=crash_snapshot,
+            resting_fill={"quantity": order["executed_qty"], "price": order["avg_price"]},
+        )
+
+        # Any unfilled remainder must not keep resting once the position
+        # has already moved to the new post-DCA plan (or closed outright)
+        # - best-effort, same treatment as every other post-fill cleanup
+        # in this class; a harmless no-op if the order was already fully
+        # filled or is already gone. Deliberately not a re-check-after-
+        # cancel loop the way poll_retracement_pending's cancel-race
+        # handling is - any fill that races this specific cancel is a
+        # small, bounded imprecision (a slightly larger real add than the
+        # blend math above already used), not the open-ended gap this
+        # whole feature exists to close.
+        try:
+            exchange.cancel_order(symbol, order_id)
+        except Exception as exc:
+            log_warning(
+                f"{symbol} DCA resting order cleanup cancel failed "
+                f"(likely already fully filled or gone): {exc}"
+            )
+
+        return True, outcome
+
     def _execute_dca(
         self, position, candles=None, htf_candles=None, cvd_snapshot=None, current_price=None,
-        crash_snapshot=None,
+        crash_snapshot=None, resting_fill=None,
     ):
         """config.DCA_ENABLED - price reached position["dca_price"]
         before TP1 ever filled. Adds position["dca_quantity"] at that
@@ -1697,7 +1835,23 @@ class PositionManager:
         Returns a close-outcome string only if the post-DCA SL placement
         failed badly enough to force closing the position; otherwise
         None (including the ordinary case where DCA succeeded and the
-        position lives on as DCA_ACTIVE)."""
+        position lives on as DCA_ACTIVE).
+
+        config.DCA_RESTING_ORDER_ENABLED - `resting_fill` (optional
+        {"quantity", "price"}) is passed when poll_live already detected
+        a real fill on the resting DCA LIMIT order (see poll_live's
+        DCA_PENDING branch). When given, this skips the DCA_PRESSURE_
+        CHECK_ENABLED block entirely - sizing already happened at
+        placement time, always the conservative DCA_PRESSURE_SIZE_
+        MULTIPLIER/DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER branch (see
+        config.DCA_RESTING_ORDER_ENABLED's own comment for why) - and
+        skips place_market_order below, since the fill already happened
+        via the resting order. Everything after that (build_dca_plan,
+        cancel TP1/TP2, place new TP/SL, atomic-SL-failure handling,
+        DCA_ACTIVE transition) is unchanged - this is exactly why the
+        fill is threaded through as a parameter rather than duplicating
+        the function: the "SL must be atomic" safety discipline below is
+        inherited for free either way."""
         symbol = position["symbol"]
         side = position["side"]
         shadow = position["shadow"]
@@ -1707,7 +1861,11 @@ class PositionManager:
         pressure_confirmed = None
         pressure_detail = None
 
-        if config.DCA_PRESSURE_CHECK_ENABLED:
+        if resting_fill is not None:
+            dca_quantity = resting_fill["quantity"]
+            dca_fill_price = resting_fill["price"]
+            buffer_atr_multiple = max(float(config.DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER), 0)
+        elif config.DCA_PRESSURE_CHECK_ENABLED:
             pressure_confirmed, pressure_detail = signal_engine.direction_still_confirmed(
                 side, htf_candles, candles, cvd_snapshot, current_price
             )
@@ -1744,7 +1902,7 @@ class PositionManager:
 
         position["dca_pressure_confirmed"] = pressure_confirmed
 
-        if not shadow:
+        if resting_fill is None and not shadow:
             try:
                 dca_order = exchange.place_market_order(symbol, side, dca_quantity)
             except Exception as exc:
@@ -1856,6 +2014,12 @@ class PositionManager:
         # DCA_ACTIVE code path (those key off stage directly), set here
         # only for cross-stage consistency.
         position["single_tp"] = True
+        # config.DCA_RESTING_ORDER_ENABLED - whatever was resting (fully
+        # consumed, or its remainder already cancelled by poll_live's
+        # DCA_PENDING branch before calling here) no longer applies once
+        # DCA_ACTIVE - cleared so nothing downstream mistakes a stale id
+        # for a still-live order.
+        position["dca_order_id"] = None
         position["stage"] = DCA_ACTIVE
         log_info(
             f"{symbol}{' [SHADOW]' if shadow else ''} DCA fired | "
@@ -2306,17 +2470,32 @@ class PositionManager:
         if position["stage"] == DCA_PENDING:
             # DCA (adverse) checked before the early-promotion (favorable)
             # checks - same conservative "adverse event wins ties" bias
-            # poll_shadow's own docstring already applies. Checked against
-            # the current candle's full high/low range (not current_price,
-            # a single point-in-time sample) - see
-            # _dca_price_reached_in_range's own docstring for the real
-            # gap this closes.
-            if dca_candidate and self._dca_price_reached_in_range(position, candles):
-                return self._execute_dca(
-                    position, candles=candles, htf_candles=htf_candles,
-                    cvd_snapshot=cvd_snapshot, current_price=current_price,
-                    crash_snapshot=crash_snapshot,
-                )
+            # poll_shadow's own docstring already applies.
+            #
+            # config.DCA_RESTING_ORDER_ENABLED - a position with a real
+            # resting DCA order polls that order's own status
+            # (_poll_dca_resting_order) instead of watching candle ranges
+            # for the trigger; a position without one (flag off, or
+            # registered before it was turned on) falls back to the
+            # existing candle-range check against the current candle's
+            # full high/low range (not current_price, a single point-in-
+            # time sample) - see _dca_price_reached_in_range's own
+            # docstring for the real gap that closes.
+            if dca_candidate:
+                if config.DCA_RESTING_ORDER_ENABLED and position.get("dca_order_id"):
+                    fired, outcome = self._poll_dca_resting_order(
+                        position, candles=candles, htf_candles=htf_candles,
+                        cvd_snapshot=cvd_snapshot, current_price=current_price,
+                        crash_snapshot=crash_snapshot,
+                    )
+                    if fired:
+                        return outcome
+                elif self._dca_price_reached_in_range(position, candles):
+                    return self._execute_dca(
+                        position, candles=candles, htf_candles=htf_candles,
+                        cvd_snapshot=cvd_snapshot, current_price=current_price,
+                        crash_snapshot=crash_snapshot,
+                    )
 
             if self._try_early_promotions(
                 position, current_price, candles, profit_protection_candidate, early_breakeven_candidate,
@@ -3529,14 +3708,16 @@ class PositionManager:
             execution_result = {
                 "ok": True, "shadow": True, "entry_order": None,
                 "sl_order": None, "tp1_order": None, "tp2_order": None, "tp_order": None,
+                "dca_order": None,
             }
         elif is_dca:
-            tp1_order, tp2_order, tp_order = execution.place_dca_protection_orders(
+            tp1_order, tp2_order, tp_order, dca_order = execution.place_dca_protection_orders(
                 symbol, side, settled_plan
             )
             execution_result = {
                 "ok": True, "shadow": False, "entry_order": None,
                 "tp1_order": tp1_order, "tp2_order": tp2_order, "tp_order": tp_order,
+                "dca_order": dca_order,
                 "real_entry_price": entry_price,
             }
         else:

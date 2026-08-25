@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import config
 import exchange
+import execution
 import market_structure
 import risk_manager
 import signal_engine
@@ -3673,6 +3674,95 @@ class ReconcilePendingEntriesOnStartupTests(unittest.TestCase):
 
         cancel_order.assert_not_called()
 
+    # config.DCA_RESTING_ORDER_ENABLED - a resting DCA-add order belongs
+    # to an already-open, real exchange position, unlike a pending ENTRY
+    # (nothing recoverable). The blanket "cancel every resting LIMIT
+    # order" behavior above would silently strip that protection on
+    # every restart without this exception.
+
+    def test_dca_flag_alone_still_sweeps(self):
+        # Neither LIMIT_ENTRY_MODE_ENABLED nor RETRACEMENT_ENTRY_ENABLED -
+        # DCA_RESTING_ORDER_ENABLED alone must still trigger the sweep
+        # (an untagged stray still gets cancelled either way).
+        manager = PositionManager()
+        open_orders = [{"symbol": "ETHUSDT", "orderId": "limit9", "type": "LIMIT"}]
+
+        with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", False), \
+             patch.object(config, "RETRACEMENT_ENTRY_ENABLED", False), \
+             patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_all_open_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_order") as cancel_order:
+            manager.reconcile_pending_entries_on_startup()
+
+        cancel_order.assert_called_once_with("ETHUSDT", "limit9")
+
+    def test_tagged_dca_order_matching_a_tracked_position_is_preserved(self):
+        manager = PositionManager()
+        manager.register_dca_pending(_dca_plan(), {"shadow": False})
+        open_orders = [{
+            "symbol": "BTCUSDT", "orderId": "dca_real_1", "type": "LIMIT",
+            "clientOrderId": f"{execution.DCA_ADD_CLIENT_ORDER_ID_PREFIX}1787600000000",
+        }]
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_all_open_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_order") as cancel_order:
+            manager.reconcile_pending_entries_on_startup()
+
+        cancel_order.assert_not_called()
+        self.assertEqual(manager.positions["BTCUSDT"]["dca_order_id"], "dca_real_1")
+
+    def test_tagged_dca_order_with_no_matching_position_is_still_cancelled(self):
+        # State lost/corrupt, or the position resolved some other way
+        # before this ran - the tag alone isn't a blanket exemption.
+        manager = PositionManager()
+        open_orders = [{
+            "symbol": "BTCUSDT", "orderId": "dca_orphan_1", "type": "LIMIT",
+            "clientOrderId": f"{execution.DCA_ADD_CLIENT_ORDER_ID_PREFIX}1787600000000",
+        }]
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_all_open_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_order") as cancel_order:
+            manager.reconcile_pending_entries_on_startup()
+
+        cancel_order.assert_called_once_with("BTCUSDT", "dca_orphan_1")
+
+    def test_tagged_dca_order_matching_a_non_dca_pending_position_is_cancelled(self):
+        # A tagged order matching a symbol that's tracked but NOT
+        # DCA_PENDING (e.g. already promoted to BREAKEVEN_ACTIVE) is not
+        # a legitimate match either - falls through to cancel.
+        manager = PositionManager()
+        manager.register_dca_pending(_dca_plan(), {"shadow": False})
+        manager.positions["BTCUSDT"]["stage"] = BREAKEVEN_ACTIVE
+        open_orders = [{
+            "symbol": "BTCUSDT", "orderId": "dca_stale_1", "type": "LIMIT",
+            "clientOrderId": f"{execution.DCA_ADD_CLIENT_ORDER_ID_PREFIX}1787600000000",
+        }]
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_all_open_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_order") as cancel_order:
+            manager.reconcile_pending_entries_on_startup()
+
+        cancel_order.assert_called_once_with("BTCUSDT", "dca_stale_1")
+
+    def test_untagged_order_for_a_dca_pending_symbol_is_still_cancelled(self):
+        # Only the tag identifies a legitimate DCA-add order - an
+        # ordinary pending-entry LIMIT order that happens to share a
+        # symbol with a DCA_PENDING position gets no special treatment.
+        manager = PositionManager()
+        manager.register_dca_pending(_dca_plan(), {"shadow": False})
+        open_orders = [{"symbol": "BTCUSDT", "orderId": "limit9", "type": "LIMIT"}]
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_all_open_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_order") as cancel_order:
+            manager.reconcile_pending_entries_on_startup()
+
+        cancel_order.assert_called_once_with("BTCUSDT", "limit9")
+        self.assertFalse(manager.positions["BTCUSDT"]["dca_order_id"])
+
 
 def _retracement_plan(side="BUY", dca=True, single_tp=False):
     plan = dict(_plan(side))
@@ -4225,6 +4315,32 @@ class RegisterDcaPendingTests(unittest.TestCase):
         self.assertIsNone(position["sl_order_id"])
         self.assertEqual(position["tp1_order_id"], "tp1_1")
         self.assertEqual(position["tp2_order_id"], "tp2_1")
+
+    # config.DCA_RESTING_ORDER_ENABLED - dca_order_id, same treatment as
+    # tp1_order_id/tp2_order_id/tp_order_id above.
+
+    def test_live_registration_stores_dca_order_id_when_present(self):
+        manager = PositionManager()
+        execution_result = {"shadow": False, "dca_order": {"orderId": 555}}
+        position = manager.register_dca_pending(_dca_plan(), execution_result)
+
+        self.assertEqual(position["dca_order_id"], 555)
+
+    def test_shadow_registration_dca_order_id_is_none(self):
+        manager = PositionManager()
+        position = manager.register_dca_pending(
+            _dca_plan(), {"shadow": True, "dca_order": {"orderId": 555}},
+        )
+
+        self.assertIsNone(position["dca_order_id"])
+
+    def test_live_registration_dca_order_id_none_when_absent(self):
+        # config.DCA_RESTING_ORDER_ENABLED off, or placement failed -
+        # execution_result never carries a "dca_order" key at all.
+        manager = PositionManager()
+        position = manager.register_dca_pending(_dca_plan(), {"shadow": False})
+
+        self.assertFalse(position["dca_order_id"])
 
     def test_atr_is_carried_from_the_plan(self):
         manager = PositionManager()
@@ -5394,6 +5510,305 @@ class PollLiveDcaPendingTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+
+class PollLiveDcaRestingOrderTests(unittest.TestCase):
+    """config.DCA_RESTING_ORDER_ENABLED - a position with a real resting
+    DCA order polls exchange.get_order_status (a plain order, reports
+    partial fills via executed_qty) instead of watching candle ranges."""
+
+    def setUp(self):
+        for name, value in (
+            ("MAE_TRACKING_ENABLED", False),
+            ("PROFIT_PROTECTION_ENABLED", False),
+            ("EARLY_BREAKEVEN_ENABLED", False),
+            ("DCA_PRESSURE_CHECK_ENABLED", False),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _manager_with_resting_dca(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+            "dca_order": {"orderId": "dca_resting_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        return manager
+
+    def test_unfilled_resting_order_falls_through_to_no_op(self):
+        # No candle-range check at all for this position - a resting
+        # order that simply hasn't filled yet must not fire.
+        manager = self._manager_with_resting_dca()
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "NEW", "executed_qty": 0.0, "avg_price": 0.0},
+             ) as status, \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        status.assert_called_once_with("BTCUSDT", "dca_resting_1")
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+
+    def test_unknown_status_falls_through_to_no_op(self):
+        manager = self._manager_with_resting_dca()
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "UNKNOWN", "executed_qty": 0.0, "avg_price": 0.0},
+             ), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+
+    def test_full_fill_executes_dca_with_the_real_fill_price_and_quantity(self):
+        manager = self._manager_with_resting_dca()
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=96.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "FILLED", "executed_qty": 1.0, "avg_price": 95.8},
+             ), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_market_order") as market_order, \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            outcome = manager.poll_live("BTCUSDT")
+
+        # No reactive market order - the fill already happened via the
+        # resting order.
+        market_order.assert_not_called()
+        build_plan.assert_called_once()
+        _, kwargs = build_plan.call_args
+        args = build_plan.call_args.args
+        self.assertEqual(args[2], 95.8)  # dca_fill_price = real avg_price
+        self.assertEqual(args[3], 1.0)   # dca_quantity = real executed_qty
+        # Unfilled remainder cleanup attempted regardless (harmless no-op
+        # on a fully-filled order).
+        cancel_order.assert_called_once_with("BTCUSDT", "dca_resting_1")
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+        self.assertIsNone(manager.positions["BTCUSDT"]["dca_order_id"])
+
+    def test_partial_fill_uses_the_real_partial_quantity_not_the_planned_one(self):
+        manager = self._manager_with_resting_dca()
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=96.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "PARTIALLY_FILLED", "executed_qty": 0.4, "avg_price": 95.9},
+             ), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_market_order") as market_order, \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            outcome = manager.poll_live("BTCUSDT")
+
+        market_order.assert_not_called()
+        args = build_plan.call_args.args
+        self.assertEqual(args[2], 95.9)
+        self.assertEqual(args[3], 0.4)
+        # The still-unfilled remainder must not keep resting once the
+        # position has moved to the new post-DCA plan.
+        cancel_order.assert_called_once_with("BTCUSDT", "dca_resting_1")
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_remainder_cancel_failure_does_not_raise(self):
+        # A fully-filled order rejecting the cleanup cancel (already gone)
+        # must not prevent the DCA from completing successfully.
+        manager = self._manager_with_resting_dca()
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=96.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "FILLED", "executed_qty": 1.0, "avg_price": 95.8},
+             ), \
+             patch.object(exchange, "cancel_order", side_effect=RuntimeError("order does not exist")), \
+             patch.object(exchange, "place_market_order") as market_order, \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_live("BTCUSDT")
+
+        market_order.assert_not_called()
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_sl_placement_failure_still_closes_the_position(self):
+        # The atomic "SL must exist" discipline is inherited unchanged -
+        # a resting-order fill is not a special case for this failure path.
+        manager = self._manager_with_resting_dca()
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=96.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "FILLED", "executed_qty": 1.0, "avg_price": 95.8},
+             ), \
+             patch.object(exchange, "cancel_order"), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
+             patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "cancel_all_open_orders"), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "DCA_SL_PLACEMENT_FAILED")
+        close_market.assert_called_once()
+
+    def test_flag_off_falls_back_to_candle_range_even_with_a_stored_order_id(self):
+        # A position registered while the flag was on, then the flag
+        # turned back off - must not poll order status, must use the
+        # existing candle-range fallback unchanged.
+        manager = self._manager_with_resting_dca()
+        candles = [{"high": 100.0, "low": 95.0}]
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", False), \
+             patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "get_order_status") as status, \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        status.assert_not_called()
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_no_stored_order_id_falls_back_to_candle_range_even_with_flag_on(self):
+        # config.DCA_RESTING_ORDER_ENABLED on, but this position has no
+        # dca_order_id (registered before the flag was turned on, or
+        # placement failed) - must fall back, not crash on a missing id.
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"}, "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        candles = [{"high": 100.0, "low": 95.0}]
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "get_order_status") as status, \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        status.assert_not_called()
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_tp1_fills_first_cancels_the_still_resting_dca_order(self):
+        # DCA is never needed once TP1 fills - a still-resting DCA-add
+        # order must not keep resting past this point (mirrors
+        # _execute_dca's own symmetric cleanup of TP1/TP2 when DCA fires
+        # first instead).
+        manager = self._manager_with_resting_dca()
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp1_1" else "NEW"
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=101.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "NEW", "executed_qty": 0.0, "avg_price": 0.0},
+             ), \
+             patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.5}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], BREAKEVEN_ACTIVE)
+        cancel_order.assert_called_once_with("BTCUSDT", "dca_resting_1")
+        self.assertIsNone(manager.positions["BTCUSDT"]["dca_order_id"])
+
+    def test_tp1_fill_cancel_failure_does_not_block_promotion(self):
+        manager = self._manager_with_resting_dca()
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp1_1" else "NEW"
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=101.0), \
+             patch.object(
+                 exchange, "get_order_status",
+                 return_value={"status": "NEW", "executed_qty": 0.0, "avg_price": 0.0},
+             ), \
+             patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.5}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "cancel_order", side_effect=RuntimeError("gone")), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], BREAKEVEN_ACTIVE)
+
+    def test_tp1_pending_position_without_a_dca_order_id_is_unaffected(self):
+        # _promote_to_breakeven is shared with plain TP1_PENDING positions
+        # (register(), not register_dca_pending()) - .get("dca_order_id")
+        # must be a safe no-op for a position dict that never has the key.
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False, "sl_order": {"algoId": "sl_1"},
+            "tp1_order": {"algoId": "tp1_1"}, "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register(_plan(), execution_result)
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "tp1_1" else "NEW"
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=101.0), \
+             patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 0.5}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_be"}):
+            outcome = manager.poll_live("BTCUSDT")
+
+        cancel_order.assert_not_called()
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], BREAKEVEN_ACTIVE)
 
 
 class EnsureProtectionOrdersSingleTpDcaPendingTests(unittest.TestCase):

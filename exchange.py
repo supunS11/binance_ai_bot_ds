@@ -1047,14 +1047,25 @@ def close_position_market(symbol, position_side, quantity):
     )
 
 
-def place_limit_order(symbol, side, quantity, price):
+def place_limit_order(symbol, side, quantity, price, client_order_id=None):
     """Plain resting GTC LIMIT entry - config.LIMIT_ENTRY_MODE_ENABLED.
     Unlike place_market_order this does NOT fill synchronously: it can sit
     unfilled indefinitely, so callers must track and expire/cancel it
     themselves (see position_manager.poll_pending_entry) rather than
     assume a position exists once this call returns. Stays on the plain
     order endpoint (python-binance does not auto-route "LIMIT" to the algo
-    namespace the way it does STOP_MARKET/TAKE_PROFIT_MARKET)."""
+    namespace the way it does STOP_MARKET/TAKE_PROFIT_MARKET).
+
+    `client_order_id` (optional) tags the real exchange order with a
+    caller-chosen newClientOrderId - see config.DCA_RESTING_ORDER_ENABLED
+    and position_manager.reconcile_pending_entries_on_startup's own use of
+    this (a "dcaAdd..." prefix): a resting DCA-add order for an already-
+    open, bot-tracked position is otherwise indistinguishable on Binance's
+    account-wide open-orders endpoint from a genuinely orphaned pending-
+    entry LIMIT order, which that startup-recovery routine would otherwise
+    cancel outright. Mirrors place_stop_loss/place_take_profit_full's own
+    client_algo_id tagging, applied here via the plain-order endpoint's
+    own distinct param name (clientOrderId, not clientAlgoId)."""
     quantity = normalize_order_quantity(symbol, quantity, order_type="LIMIT")
 
     if quantity <= 0:
@@ -1071,15 +1082,22 @@ def place_limit_order(symbol, side, quantity, price):
 
     price = _format_price_for_api(symbol, price)
 
-    return _private_rest_call(
-        f"futures_create_order:{symbol}:limit",
-        client.futures_create_order,
+    params = dict(
         symbol=symbol,
         side=side,
         type="LIMIT",
         quantity=quantity,
         price=price,
         timeInForce="GTC",
+    )
+
+    if client_order_id:
+        params["newClientOrderId"] = client_order_id
+
+    return _private_rest_call(
+        f"futures_create_order:{symbol}:limit",
+        client.futures_create_order,
+        **params,
     )
 
 

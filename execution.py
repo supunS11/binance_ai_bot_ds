@@ -8,10 +8,26 @@ Defaults to SHADOW mode (config.EXECUTION_MODE) - real order placement
 only happens once that's explicitly switched to LIVE, so the very first
 run of this bot cannot place a real order by accident.
 """
+import time
+
 import config
 import exchange
 import risk_manager
 from logger import log_error, log_info, log_warning
+
+# config.DCA_RESTING_ORDER_ENABLED - tags the resting LIMIT order placed
+# for the DCA add itself (a plain order, not algo - see exchange.
+# place_limit_order's own client_order_id docstring), so position_manager.
+# reconcile_pending_entries_on_startup can tell a legitimate DCA-add order
+# for an already-open, tracked position apart from a genuinely orphaned
+# pending-entry LIMIT order - otherwise indistinguishable on Binance's
+# account-wide open-orders endpoint, and that routine's default behavior
+# is to cancel every resting plain LIMIT order it finds. Lives here (not
+# position_manager.py, alongside the analogous _DCA_SL_CLIENT_ALGO_ID_
+# PREFIX/_DCA_TP_CLIENT_ALGO_ID_PREFIX) because this is where the order
+# is actually placed, and position_manager already imports this module -
+# importing the other way around would be circular.
+DCA_ADD_CLIENT_ORDER_ID_PREFIX = "dcaAdd"
 
 
 def place_protection_orders(symbol, side, plan):
@@ -69,16 +85,57 @@ def place_protection_orders(symbol, side, plan):
     return sl_order, tp1_order, tp2_order, None
 
 
+def _place_dca_resting_order(symbol, side, plan):
+    """config.DCA_RESTING_ORDER_ENABLED - see its own config.py comment
+    for the full rationale. Best-effort, same treatment as TP1/TP2/TP
+    above: a failed resting-order placement leaves the position exactly
+    as protected as it is today (candle-range detection + reactive
+    market order, position_manager._dca_price_reached_in_range), not
+    worse - never escalates to an emergency close the way a failed SL
+    placement does elsewhere.
+
+    Always sized at DCA_PRESSURE_SIZE_MULTIPLIER (the pressure check's
+    own "not confirmed"/conservative branch), never the full
+    DCA_SIZE_MULTIPLIER size - see config.DCA_RESTING_ORDER_ENABLED's
+    comment for why this is the right default even on the "confirmed"
+    fraction of fires. Returns None if the flag is off or placement
+    failed; position_manager.register_dca_pending stores None for
+    dca_order_id either way, which is exactly what makes it fall back to
+    the existing candle-range detection path."""
+    if not config.DCA_RESTING_ORDER_ENABLED:
+        return None
+
+    resting_quantity = round(
+        plan["quantity"] * max(float(config.DCA_PRESSURE_SIZE_MULTIPLIER), 0), 8
+    )
+
+    if resting_quantity <= 0 or plan.get("dca_price") is None:
+        return None
+
+    try:
+        return exchange.place_limit_order(
+            symbol, side, resting_quantity, plan["dca_price"],
+            client_order_id=f"{DCA_ADD_CLIENT_ORDER_ID_PREFIX}{int(time.time() * 1000)}",
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} DCA resting order placement failed: {exc}")
+        return None
+
+
 def place_dca_protection_orders(symbol, side, plan):
     """No SL (matches enter_trade_dca_pending's own no-SL-before-DCA
     design) - a single full-position TP (plan["single_tp"]) or TP1
-    (partial) + TP2 (full), both best-effort. Extracted out of
+    (partial) + TP2 (full), both best-effort, plus (config.
+    DCA_RESTING_ORDER_ENABLED) a resting LIMIT order for the DCA add
+    itself - see _place_dca_resting_order. Extracted out of
     enter_trade_dca_pending's tail for the same reason place_protection_
     orders was: config.RETRACEMENT_ENTRY_ENABLED's settle path needs to
     place DCA-shaped protection for a fill that already happened, without
-    placing a second entry order. Returns (tp1_order, tp2_order, tp_order) -
-    exactly one of (tp_order) or (tp1_order, tp2_order) is ever non-None
-    depending on plan["single_tp"], the other pair stays None."""
+    placing a second entry order. Returns (tp1_order, tp2_order, tp_order,
+    dca_order) - exactly one of (tp_order) or (tp1_order, tp2_order) is
+    ever non-None depending on plan["single_tp"], the other pair stays
+    None; dca_order is None whenever the flag is off, shadow, or
+    placement failed."""
     if plan.get("single_tp"):
         tp_order = None
 
@@ -87,7 +144,7 @@ def place_dca_protection_orders(symbol, side, plan):
         except Exception as exc:
             log_warning(f"{symbol} TP placement failed: {exc}")
 
-        return None, None, tp_order
+        return None, None, tp_order, _place_dca_resting_order(symbol, side, plan)
 
     tp1_order = None
     tp2_order = None
@@ -104,7 +161,7 @@ def place_dca_protection_orders(symbol, side, plan):
     except Exception as exc:
         log_warning(f"{symbol} TP2 placement failed: {exc}")
 
-    return tp1_order, tp2_order, None
+    return tp1_order, tp2_order, None, _place_dca_resting_order(symbol, side, plan)
 
 
 def enter_trade(plan):
@@ -213,6 +270,7 @@ def enter_trade_dca_pending(plan):
             "tp1_order": None,
             "tp2_order": None,
             "tp_order": None,
+            "dca_order": None,
         }
 
     # Same abort-before-any-order-attempt discipline as enter_trade.
@@ -233,8 +291,9 @@ def enter_trade_dca_pending(plan):
     # missing TP here is a degraded outcome (the trade still resolves via
     # DCA-or-TP1/TP either way), not a naked-position risk on its own, so
     # it doesn't trigger the emergency-close path enter_trade's SL step
-    # does.
-    tp1_order, tp2_order, tp_order = place_dca_protection_orders(symbol, side, plan)
+    # does. dca_order (config.DCA_RESTING_ORDER_ENABLED) is the same
+    # best-effort treatment - see _place_dca_resting_order.
+    tp1_order, tp2_order, tp_order, dca_order = place_dca_protection_orders(symbol, side, plan)
 
     if single_tp:
         log_info(
@@ -254,6 +313,7 @@ def enter_trade_dca_pending(plan):
         "tp1_order": tp1_order,
         "tp2_order": tp2_order,
         "tp_order": tp_order,
+        "dca_order": dca_order,
         "real_entry_price": real_entry_price,
     }
 

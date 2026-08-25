@@ -731,6 +731,35 @@ class LimitOrderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
 
+    # config.DCA_RESTING_ORDER_ENABLED - client_order_id tags the real
+    # order so position_manager.reconcile_pending_entries_on_startup can
+    # tell a legitimate DCA-add order apart from a genuinely orphaned
+    # pending-entry LIMIT order on restart.
+
+    def test_client_order_id_passed_through_when_given(self):
+        with patch.object(exchange, "normalize_order_quantity", return_value=1.0), \
+             patch.object(exchange, "normalize_order_price", return_value=100.0), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v), \
+             patch.object(exchange.client, "futures_create_order", return_value={}) as mock_order:
+            exchange.place_limit_order(
+                "BTCUSDT", "BUY", 1.0, 100.0, client_order_id="dcaAdd12345",
+            )
+
+        _, kwargs = mock_order.call_args
+        self.assertEqual(kwargs["newClientOrderId"], "dcaAdd12345")
+
+    def test_client_order_id_omitted_when_not_given(self):
+        # Existing callers (LIMIT_ENTRY_MODE_ENABLED/RETRACEMENT_ENTRY_
+        # ENABLED) never pass this - must stay byte-identical for them.
+        with patch.object(exchange, "normalize_order_quantity", return_value=1.0), \
+             patch.object(exchange, "normalize_order_price", return_value=100.0), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v), \
+             patch.object(exchange.client, "futures_create_order", return_value={}) as mock_order:
+            exchange.place_limit_order("BTCUSDT", "BUY", 1.0, 100.0)
+
+        _, kwargs = mock_order.call_args
+        self.assertNotIn("newClientOrderId", kwargs)
+
 
 class GetOrderStatusTests(unittest.TestCase):
     """Ground truth for a plain (non-algo) order - config.LIMIT_ENTRY_MODE_ENABLED's
