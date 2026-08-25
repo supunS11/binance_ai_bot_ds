@@ -808,8 +808,11 @@ class SignalEngineTests(unittest.TestCase):
     def test_btc_aligned_counts_toward_confluence_score(self):
         result = self._run(symbol="ETHUSDT", btc_return=0.05)  # aligned
 
-        self.assertEqual(result["confluence_score"], 5)
-        self.assertEqual(result["confluence_total"], 5)
+        # confluence_fields is [ema_aligned, oi_rising, btc_aligned] -
+        # sweep_confluence/liquidation_aligned removed 2026-08-25 (see
+        # signal_engine.py's own comment). All 3 remaining defaults agree.
+        self.assertEqual(result["confluence_score"], 3)
+        self.assertEqual(result["confluence_total"], 3)
 
     def test_funding_rate_is_carried_through(self):
         result = self._run(funding_rate=0.0003)
@@ -904,55 +907,67 @@ class SignalEngineTests(unittest.TestCase):
         self.assertTrue(result["efficiency_favorable"])
         self.assertTrue(result["funding_favorable"])
         # Same confluence_total as test_confluence_score_full_agreement_
-        # gives_ratio_one below (4: sweep/ema/oi/liquidation - default
-        # symbol is the BTC reference symbol itself, so btc_aligned is
-        # skipped) - unaffected by either new favorable boolean being true.
-        self.assertEqual(result["confluence_total"], 4)
+        # gives_ratio_one below (2: ema/oi - default symbol is the BTC
+        # reference symbol itself, so btc_aligned is skipped, and
+        # sweep_confluence/liquidation_aligned are no longer confluence
+        # inputs - see signal_engine.py's own comment) - unaffected by
+        # either new favorable boolean being true.
+        self.assertEqual(result["confluence_total"], 2)
 
 
     def test_confluence_score_full_agreement_gives_ratio_one(self):
-        # Defaults: sweep=BULLISH (matches direction), ema_value=85 <
-        # ltf_close=93 (aligned for BUY), OI_RISING, LIQUIDATION_LONG_CLUSTER
-        # (net positive, aligned for a BULLISH break) - all four agree.
+        # confluence_fields is [ema_aligned, oi_rising, btc_aligned] -
+        # sweep_confluence/liquidation_aligned removed 2026-08-25, no
+        # longer confluence inputs (see signal_engine.py's own comment).
+        # Defaults: ema_value=85 < ltf_close=93 (aligned for BUY),
+        # OI_RISING - both agree; btc_aligned skipped (default symbol is
+        # the BTC reference symbol itself).
         result = self._run()
 
-        self.assertEqual(result["confluence_score"], 4)
-        self.assertEqual(result["confluence_total"], 4)
+        self.assertEqual(result["confluence_score"], 2)
+        self.assertEqual(result["confluence_total"], 2)
         self.assertAlmostEqual(result["confluence_ratio"], 1.0)
 
     def test_confluence_score_counts_only_disagreeing_fields_against_it(self):
+        # symbol="ETHUSDT" brings btc_aligned into play (default symbol
+        # skips it as a self-correlation) so there's a genuine mix: ema/oi
+        # both disagree, only btc agrees.
         result = self._run(
+            symbol="ETHUSDT", btc_return=0.05,  # aligned for a BUY
             ema_alignment_value=95.0,  # 93 < 95 -> misaligned for a BUY
             oi_snapshot={"available": True, "oi_change_pct": -3.0},  # falling
-            liquidation_snapshot={
-                "available": True, "long_liquidation_notional": 1000,
-                "short_liquidation_notional": 9000, "net_liquidation_notional": -8000,
-            },  # short-dominant during a BULLISH break -> not aligned
         )
 
         self.assertEqual(result["signal"], "BUY")
-        self.assertEqual(result["confluence_score"], 1)  # only sweep agrees
-        self.assertEqual(result["confluence_total"], 4)
-        self.assertAlmostEqual(result["confluence_ratio"], 0.25)
+        self.assertEqual(result["confluence_score"], 1)  # only btc agrees
+        self.assertEqual(result["confluence_total"], 3)
+        self.assertAlmostEqual(result["confluence_ratio"], 1 / 3)
 
     def test_unavailable_fields_are_excluded_from_the_denominator(self):
+        # symbol="ETHUSDT" keeps btc_aligned available/agreeing so the test
+        # can show ema/oi being excluded without emptying the denominator
+        # entirely.
         result = self._run(
+            symbol="ETHUSDT",  # btc_return defaults to 0.02 -> aligned for BUY
             ema_value=None,
             ema_alignment_value=None,
             oi_snapshot={"available": False},
-            liquidation_snapshot={"available": False},
         )
 
         self.assertEqual(result["signal"], "BUY")
-        self.assertEqual(result["confluence_score"], 1)  # sweep only
+        self.assertEqual(result["confluence_score"], 1)  # btc only
         self.assertEqual(result["confluence_total"], 1)
         self.assertAlmostEqual(result["confluence_ratio"], 1.0)
 
     def test_disabled_confirmations_shrink_the_denominator_not_the_score(self):
+        # symbol="ETHUSDT": btc_aligned isn't gated by any of these three
+        # flags (BTC_CORRELATION_ENABLED is separate), so it's the one
+        # field left to show the denominator shrinking without also
+        # dropping the score.
         with patch.object(config, "EMA_CONFIRMATION_ENABLED", False), \
              patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
              patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False):
-            result = self._run()
+            result = self._run(symbol="ETHUSDT")  # btc_return default 0.02 -> aligned
 
         self.assertEqual(result["signal"], "BUY")
         self.assertEqual(result["confluence_score"], 1)

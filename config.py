@@ -977,8 +977,11 @@ MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
 # default.
 MAX_SL_ROI_PCT = env_float("MAX_SL_ROI_PCT", 30)
 # Confluence-weighted position sizing - see signal_engine.py's
-# confluence_ratio (how many of sweep/EMA/OI/liquidation agree with the
-# signal, out of how many were actually available to check). Scales the
+# confluence_ratio (how many of EMA/OI/BTC agree with the signal, out of
+# how many were actually available to check - sweep_confluence and
+# liquidation_aligned were removed from this list 2026-08-25, see
+# signal_engine.py's own comment on confluence_fields for the evidence).
+# Scales the
 # risk taken per trade instead of gating entry on any of these
 # individually: every signal that qualifies today still trades, a
 # 0-confluence one just risks less and a fully-aligned one risks more.

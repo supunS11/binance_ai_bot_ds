@@ -848,9 +848,21 @@ def evaluate(
         # gating entry on any of these individually - every signal that
         # reaches here still trades, only the size adapts. See
         # config.CONFLUENCE_SIZING_ENABLED.
-        confluence_fields = [
-            sweep_confluence, ema_aligned, oi_rising, liquidation_aligned, btc_aligned,
-        ]
+        #
+        # sweep_confluence and liquidation_aligned deliberately excluded
+        # (2026-08-25 signal-engine audit): sweep_confluence's split was
+        # flat overall and flat within CHOCH_RETEST specifically (the only
+        # trigger with enough of a split to check) - no measurable value
+        # as a confluence input. liquidation_aligned is essentially never
+        # populated for this bot's actual symbol set (liquidation_snapshot
+        # rarely available - see the separate LIQUIDATION_SWEEP_CONFIRMED
+        # diagnostic-logging investigation), so it was already contributing
+        # almost nothing to confluence_total's denominator. Both remain
+        # computed and journaled below as standalone informational fields -
+        # only their role as a confluence-score input is removed. Zero live
+        # behavior change either way today: CONFLUENCE_SIZING_ENABLED is
+        # False, so confluence_ratio doesn't feed anything live yet.
+        confluence_fields = [ema_aligned, oi_rising, btc_aligned]
         confluence_available = [value for value in confluence_fields if value is not None]
         confluence_total = len(confluence_available)
         confluence_score = sum(1 for value in confluence_available if value)
