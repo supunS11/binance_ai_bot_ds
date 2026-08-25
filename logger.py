@@ -21,6 +21,6 @@ def log_warning(message):
     print(Fore.YELLOW + message)
     logging.warning(message)
 
-def log_error(message):
+def log_error(message, exc_info=False):
     print(Fore.RED + message)
-    logging.error(message)
+    logging.error(message, exc_info=exc_info)

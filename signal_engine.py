@@ -17,6 +17,7 @@ import cvd_divergence
 import liquidity_sweep
 import market_structure
 import oi_divergence
+from logger import log_info
 
 
 _BULLISH_TO_SIDE = {"BULLISH": "BUY", "BEARISH": "SELL"}
@@ -176,6 +177,28 @@ def evaluate(
         liquidation_confirmed_sweep = liquidity_sweep.detect_liquidation_confirmed_sweep(
             sweep, liquidation_snapshot
         )
+
+        # config.LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED - see its own
+        # config.py comment. Read-only: fires at most once per symbol per
+        # eval tick (only when a real sweep just happened), never touches
+        # liquidation_confirmed_sweep or any returned field.
+        if (
+            config.LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED
+            and sweep is not None
+            and liquidation_snapshot
+            and liquidation_snapshot.get("available")
+        ):
+            total_notional = (
+                liquidation_snapshot.get("long_liquidation_notional", 0)
+                + liquidation_snapshot.get("short_liquidation_notional", 0)
+            )
+            log_info(
+                f"LIQUIDATION_SWEEP_DIAGNOSTIC symbol={symbol} "
+                f"sweep_direction={sweep['direction']} "
+                f"total_notional={total_notional:.0f} "
+                f"net_notional={liquidation_snapshot.get('net_liquidation_notional')} "
+                f"confirmed={liquidation_confirmed_sweep is not None}"
+            )
 
     # ema_value/btc_correlation/btc_return hoisted here (same gating as
     # before) because neither depends on direction - only the derived

@@ -645,6 +645,26 @@ def main():
     except KeyboardInterrupt:
         log_warning("Shutdown requested (KeyboardInterrupt)")
 
+    except Exception as exc:
+        # Real evidence (2026-08-25, investigating why CVD_DIVERGENCE/
+        # OI_DIVERGENCE never fire): no systemd/cron/supervisor restarts
+        # this process on the VPS - confirmed directly. Of 45 restarts
+        # found in the current log, only 5 followed a deliberate
+        # KeyboardInterrupt and 12 had no diagnostic marker anywhere in
+        # the log right before they happened. Root cause: this except
+        # block previously only caught KeyboardInterrupt, so any OTHER
+        # unhandled exception here propagated to the interpreter's
+        # default excepthook, which prints to stderr only - never
+        # reaching logs/bot.log (logger.py's logging.basicConfig writes
+        # to that file only, no stderr capture). This doesn't fix
+        # whatever is actually crashing the process, but ensures the
+        # next crash leaves a real, diagnosable traceback in the log
+        # instead of another silent restart. Re-raises unchanged - same
+        # "process exits" behavior as today, just now with the reason
+        # captured first.
+        log_error(f"Fatal error in main loop, exiting: {exc!r}", exc_info=True)
+        raise
+
     finally:
         shutdown_event.set()
         feed.stop()

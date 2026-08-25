@@ -2261,6 +2261,61 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(status, "OK")
         self.assertGreater(plan["sl_price"], plan["entry_price"])
 
+    # config.LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED - real-magnitude
+    # observability for the 2026-08-25 finding that LIQUIDATION_SWEEP_
+    # CONFIRMED has never produced a trade. Read-only: must never affect
+    # `result` itself, only whether log_info gets called.
+
+    def test_liquidation_sweep_diagnostic_logs_on_a_real_sweep_with_available_snapshot(self):
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run(sweep_direction="BULLISH")
+
+        mock_log.assert_called_once()
+        self.assertIn("LIQUIDATION_SWEEP_DIAGNOSTIC", mock_log.call_args[0][0])
+        self.assertIn("total_notional=90000", mock_log.call_args[0][0])
+
+    def test_liquidation_sweep_diagnostic_silent_when_disabled(self):
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", False), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run(sweep_direction="BULLISH")
+
+        mock_log.assert_not_called()
+
+    def test_liquidation_sweep_diagnostic_silent_when_no_sweep_occurred(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        mock_log.assert_not_called()
+
+    def test_liquidation_sweep_diagnostic_silent_when_snapshot_unavailable(self):
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run(sweep_direction="BULLISH", liquidation_snapshot={"available": False})
+
+        mock_log.assert_not_called()
+
+    def test_liquidation_sweep_diagnostic_never_changes_the_returned_result(self):
+        # Same candidate/result whether the diagnostic is on or off -
+        # purely observational, never a side channel into the real signal.
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", True):
+            result_on = self._run(sweep_direction="BULLISH")
+
+        with patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", False):
+            result_off = self._run(sweep_direction="BULLISH")
+
+        self.assertEqual(result_on, result_off)
+
     # config.EMA_PULLBACK_TRIGGER_ENABLED - a pullback to the EMA
     # followed by a same-candle reclaim. Ranked last of all 9 triggers.
     # market_structure.detect_ema_pullback itself is mocked (see _run()'s

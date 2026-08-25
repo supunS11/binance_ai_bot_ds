@@ -415,7 +415,22 @@ EFFICIENCY_RATIO_CHOP_THRESHOLD = env_float("EFFICIENCY_RATIO_CHOP_THRESHOLD", 0
 # rejects) so ships live immediately, same precedent as
 # HTF_TREND_FRESHNESS_ENABLED/MIN_STOP_DISTANCE_ATR_MULTIPLE.
 EFFICIENCY_RATIO_GATE_ENABLED = env_bool("EFFICIENCY_RATIO_GATE_ENABLED", "True")
-FUNDING_RATE_ADVERSE_THRESHOLD = env_float("FUNDING_RATE_ADVERSE_THRESHOLD", 0.0005)
+# Real evidence (2026-08-25 signal-engine audit + direct re-check): the old
+# default (0.0005) was measured against journaled outcomes and found to
+# almost never vary - only 3 of 118 resolved trades ever read "unfavorable"
+# under it, so the informational funding_favorable field wasn't measuring
+# anything. Pulled the actual signed funding_rate (toward each trade's own
+# side, same transformation signal_engine.py already applies below)
+# distribution across all 118 resolved trades directly from the journal:
+# p50=0.000043, p90=0.000100, p95=0.000245, max=0.000884. Recalibrated to
+# 0.0001 - the real p90 of this bot's own trading conditions, not a guess -
+# so ~10% of trades now land on the "unfavorable" side (n=11 today) instead
+# of ~2.5% (n=3), enough variance to actually evaluate this field once more
+# data accumulates. Purely a measurement fix: funding_favorable is
+# informational-only (FUNDING_RATE_ENABLED/journaled, never gates a trade -
+# see FUNDING_RATE_ENABLED's own comment), so this changes nothing about
+# live trading behavior, only what gets recorded for future evaluation.
+FUNDING_RATE_ADVERSE_THRESHOLD = env_float("FUNDING_RATE_ADVERSE_THRESHOLD", 0.0001)
 LONG_SHORT_RATIO_CROWD_THRESHOLD = env_float("LONG_SHORT_RATIO_CROWD_THRESHOLD", 2.0)
 # Require the LTF candle that broke structure to have actually CLOSED
 # beyond the level before entering, instead of reacting to a still-forming
@@ -834,6 +849,21 @@ OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES = env_int("OI_DIVERGENCE_TRIGGER_MAX_AGE_C
 # other trigger.
 LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED = env_bool(
     "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", "False"
+)
+# Temporary, read-only diagnostic (2026-08-25 signal-engine audit finding:
+# LIQUIDATION_SWEEP_CONFIRMED has never produced a single trade).
+# LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT=50000 within a 120s window
+# (LIQUIDATION_WINDOW_SECONDS) is realistic for BTCUSDT/ETHUSDT but may be
+# unrealistic for this bot's actual (mostly small/mid-cap) symbol set -
+# but there's no historical liquidation-notional data to check that
+# against without guessing a new number. Logs the REAL notional magnitude
+# seen at every genuine LIQUIDITY_SWEEP event (whether or not it clears
+# the threshold), so a future recalibration is evidence-based. Never
+# gates anything, never changes any returned field - default True purely
+# because it's observability-only; turn off once enough evidence has
+# accumulated to decide.
+LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED = env_bool(
+    "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", "True"
 )
 # Ninth entry trigger: a pullback to the EMA within an established trend,
 # followed by a same-candle reclaim (see market_structure.
