@@ -196,6 +196,94 @@ ABSORPTION_MIN_CVD_RATIO = env_float("ABSORPTION_MIN_CVD_RATIO", 0.5)
 ABSORPTION_MAX_PRICE_MOVE_PCT = env_float("ABSORPTION_MAX_PRICE_MOVE_PCT", 0.05)
 
 # =========================
+# CROSS-EXCHANGE OPEN INTEREST (informational)
+# =========================
+# 2026-08-26: OI_RISING (above) is a real, evidence-backed gate, but it
+# only ever sees Binance's own OI - if the rest of the market is closing
+# out while Binance-only positioning looks fresh, that's invisible today.
+# No diagnosed problem behind this (unlike CROSS_EXCHANGE liquidation
+# data, which fixes a proven data-sparsity gap) - this is a speculative
+# corroboration signal, informational/journaled only, same "evidence
+# before gate" convention as absorption_signal/btc_aligned. Confirmed
+# buildable without a paid vendor: Bybit's /v5/market/open-interest and
+# OKX's /api/v5/public/open-interest are both public, unauthenticated,
+# generously rate-limited REST endpoints (see cross_exchange_oi.py).
+# Default OFF (unlike ABSORPTION_TRACKING_ENABLED's default True) -
+# unlike absorption, this is genuinely NEW outbound network I/O to two
+# hosts the bot has never talked to before (new failure modes, new
+# latency, new third-party uptime dependency), not a read-only
+# computation over data already flowing locally. Ships gated off, same
+# rollout convention as DCA_BREAKEVEN_TRAILING_STOP_ENABLED - turned on
+# deliberately once ready to add live network load.
+CROSS_EXCHANGE_OI_TRACKING_ENABLED = env_bool("CROSS_EXCHANGE_OI_TRACKING_ENABLED", "False")
+# Mirrors OI_POLL_INTERVAL_SECONDS - kept as its own knob since Bybit/OKX
+# have their own independent rate limits, not tied to Binance's.
+CROSS_EXCHANGE_OI_POLL_INTERVAL_SECONDS = env_int("CROSS_EXCHANGE_OI_POLL_INTERVAL_SECONDS", 60)
+# Mirrors OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS's own rationale - a
+# symbol simply not listed on Bybit/OKX (common for Binance-only small
+# caps) shouldn't be retried every poll cycle forever.
+CROSS_EXCHANGE_OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS = env_int("CROSS_EXCHANGE_OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS", 3600)
+CROSS_EXCHANGE_OI_REQUEST_TIMEOUT_SECONDS = env_float("CROSS_EXCHANGE_OI_REQUEST_TIMEOUT_SECONDS", 5.0)
+# Minimum gap between successive requests to the SAME host - simple
+# pacing, not a weight budget (both venues' public OI endpoints are cheap
+# / ungated by weight, unlike Binance's - see cross_exchange_oi.py's own
+# docstring for why exchange.py's Binance-specific rate/backoff globals
+# are deliberately NOT reused here).
+CROSS_EXCHANGE_OI_MIN_REQUEST_GAP_SECONDS = env_float("CROSS_EXCHANGE_OI_MIN_REQUEST_GAP_SECONDS", 0.2)
+# EXPLICIT LIVE TEST (2026-08-26) - zero resolved-trade evidence behind
+# this, unlike every other reject gate in signal_engine.py. User's own
+# choice, made with that tradeoff explained - see this flag's use in
+# signal_engine.py for the exact reject condition. Implicitly a no-op
+# unless CROSS_EXCHANGE_OI_TRACKING_ENABLED is also True (cross_exchange_
+# oi_agree only ever computes when that's on).
+CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED = env_bool("CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", "False")
+
+# =========================
+# VOLUME PROFILE (informational)
+# =========================
+# 2026-08-26 signal-engine "next level" audit: no diagnosed problem
+# behind this either - a speculative structural read (where has the most
+# volume actually traded recently) that nothing here has validated yet.
+# Built from data already flowing (the aggTrade stream orderbook.py/
+# order_flow.py already consume) - no new market-data subscription,
+# unlike CROSS_EXCHANGE_OI_TRACKING_ENABLED above. volume_profile.py is
+# the first thing in this codebase to retain raw per-trade PRICE (CVDEngine
+# reduces straight to notional and discards it) - a new, small per-tick
+# cost (append + occasional prune), same cost class CVDEngine already
+# pays on every trade. Default True, same reasoning as
+# ABSORPTION_TRACKING_ENABLED: read-only computation, never changes
+# entry/exit behavior. Purely descriptive fields only (poc/value-area/
+# position) - deliberately NOT inventing a directional "aligned" boolean
+# the way absorption_aligned has one, since there's no evidence-backed
+# hypothesis yet for which position implies which trade direction.
+VOLUME_PROFILE_TRACKING_ENABLED = env_bool("VOLUME_PROFILE_TRACKING_ENABLED", "True")
+# Rolling window of raw trades volume_profile.py buckets into a histogram
+# - 4h, a reasoned starting point (long enough to span more than one LTF
+# swing, short enough to describe "recent" positioning rather than a
+# stale multi-day profile), not calibrated against real trade data.
+VOLUME_PROFILE_LOOKBACK_SECONDS = env_int("VOLUME_PROFILE_LOOKBACK_SECONDS", 14400)
+# Hard per-symbol cap on retained raw trade samples regardless of
+# lookback - memory safety valve for a very high-frequency symbol (e.g.
+# BTC), mirrors OI_HISTORY_MAX_SAMPLES's own purpose.
+VOLUME_PROFILE_MAX_SAMPLES = env_int("VOLUME_PROFILE_MAX_SAMPLES", 20000)
+# Bucket width as a % of price, not a fixed $ tick - a fixed tick would be
+# meaningless across this bot's symbol range (BTC ~$100k vs a sub-cent
+# altcoin). Starting value, not yet calibrated against real trade data.
+VOLUME_PROFILE_BUCKET_PCT = env_float("VOLUME_PROFILE_BUCKET_PCT", 0.05)
+# % of total windowed notional the "value area" must cover, expanding
+# outward from the point of control (POC) by descending bucket notional -
+# 70% is the standard volume-profile convention (roughly one standard
+# deviation), not something calibrated against this bot's own data.
+VOLUME_PROFILE_VALUE_AREA_PCT = env_float("VOLUME_PROFILE_VALUE_AREA_PCT", 70.0)
+# EXPLICIT LIVE TEST (2026-08-26) - zero resolved-trade evidence, same as
+# CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED above. Mean-reversion hypothesis
+# (user's choice): price already outside the value area in the trade's
+# own direction reads as "already ran, don't chase" - same spirit as the
+# evidence-backed MAX_ENTRY_EXTENSION_R reject, but unproven here.
+# Implicitly a no-op unless VOLUME_PROFILE_TRACKING_ENABLED is also True.
+VP_EXTENSION_REJECT_ENABLED = env_bool("VP_EXTENSION_REJECT_ENABLED", "False")
+
+# =========================
 # MARKET STRUCTURE (ICT/SMC)
 # =========================
 SWING_LEFT = env_int("SWING_LEFT", 2)

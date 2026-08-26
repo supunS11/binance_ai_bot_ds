@@ -97,6 +97,9 @@ class SignalEngineTests(unittest.TestCase):
         funding_rate=None,
         oi_rising_reject_enabled=False,
         crash_snapshot=None,
+        oi_snapshot_bybit=None,
+        oi_snapshot_okx=None,
+        volume_profile_snapshot=None,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -210,6 +213,8 @@ class SignalEngineTests(unittest.TestCase):
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
                 quote_volume_usdt=quote_volume_usdt, btc_candles=btc_candles,
                 funding_rate=funding_rate, crash_snapshot=crash_snapshot,
+                oi_snapshot_bybit=oi_snapshot_bybit, oi_snapshot_okx=oi_snapshot_okx,
+                volume_profile_snapshot=volume_profile_snapshot,
             )
 
     def test_full_buy_signal_when_everything_aligns(self):
@@ -899,6 +904,233 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(with_absorption["confluence_total"], without_absorption["confluence_total"])
         self.assertEqual(with_absorption["confluence_score"], without_absorption["confluence_score"])
+
+    # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED - informational only.
+    # cross_exchange_oi.compute_agreement() itself is covered directly in
+    # test_cross_exchange_oi.py; these only prove signal_engine wires the
+    # real oi_snapshot/oi_snapshot_bybit/oi_snapshot_okx data through.
+
+    def test_cross_exchange_oi_agree_true_when_both_venues_confirm(self):
+        # Default oi_snapshot (OI_RISING) has oi_change_pct=5.0 (rising).
+        bybit = {"available": True, "oi_change_pct": 2.0}
+        okx = {"available": True, "oi_change_pct": 1.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True):
+            result = self._run(oi_snapshot_bybit=bybit, oi_snapshot_okx=okx)
+
+        self.assertEqual(result["oi_change_pct_bybit"], 2.0)
+        self.assertEqual(result["oi_change_pct_okx"], 1.0)
+        self.assertTrue(result["cross_exchange_oi_agree"])
+
+    def test_cross_exchange_oi_agree_false_when_a_venue_disagrees(self):
+        bybit = {"available": True, "oi_change_pct": -2.0}
+        okx = {"available": True, "oi_change_pct": 1.0}
+
+        # CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED patched off explicitly -
+        # this test wants a real disagreement reading WITHOUT the reject
+        # gate (added later, see the reject-path tests below) turning
+        # this into a rejected signal instead.
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", False):
+            result = self._run(oi_snapshot_bybit=bybit, oi_snapshot_okx=okx)
+
+        self.assertFalse(result["cross_exchange_oi_agree"])
+
+    def test_cross_exchange_oi_unavailable_snapshot_reads_as_none(self):
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True):
+            result = self._run(
+                oi_snapshot_bybit={"available": False}, oi_snapshot_okx={"available": False},
+            )
+
+        self.assertIsNone(result["oi_change_pct_bybit"])
+        self.assertIsNone(result["oi_change_pct_okx"])
+        self.assertIsNone(result["cross_exchange_oi_agree"])
+
+    def test_cross_exchange_oi_disabled_by_config(self):
+        bybit = {"available": True, "oi_change_pct": 2.0}
+        okx = {"available": True, "oi_change_pct": 1.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False):
+            result = self._run(oi_snapshot_bybit=bybit, oi_snapshot_okx=okx)
+
+        self.assertIsNone(result["oi_change_pct_bybit"])
+        self.assertIsNone(result["oi_change_pct_okx"])
+        self.assertIsNone(result["cross_exchange_oi_agree"])
+
+    def test_cross_exchange_oi_is_never_added_to_confluence_scoring(self):
+        bybit = {"available": True, "oi_change_pct": 2.0}
+        okx = {"available": True, "oi_change_pct": 1.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True):
+            with_cross = self._run(oi_snapshot_bybit=bybit, oi_snapshot_okx=okx)
+
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False):
+            without_cross = self._run(oi_snapshot_bybit=bybit, oi_snapshot_okx=okx)
+
+        self.assertEqual(with_cross["confluence_total"], without_cross["confluence_total"])
+        self.assertEqual(with_cross["confluence_score"], without_cross["confluence_score"])
+
+    # config.VOLUME_PROFILE_TRACKING_ENABLED - descriptive only, no
+    # "aligned" field (see config.py's own reasoning). volume_profile.py's
+    # own bucketing/POC/value-area math is covered directly in
+    # test_volume_profile.py; these only prove signal_engine wires a real
+    # volume_profile_snapshot through.
+
+    def test_volume_profile_fields_carried_through_when_available(self):
+        snapshot = {
+            "available": True, "poc_price": 100.0, "value_area_high": 105.0,
+            "value_area_low": 95.0, "position": "INSIDE_VALUE_AREA",
+        }
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertEqual(result["vp_poc_price"], 100.0)
+        self.assertEqual(result["vp_value_area_high"], 105.0)
+        self.assertEqual(result["vp_value_area_low"], 95.0)
+        self.assertEqual(result["vp_position"], "INSIDE_VALUE_AREA")
+
+    def test_volume_profile_unavailable_snapshot_reads_as_none(self):
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True):
+            result = self._run(volume_profile_snapshot={"available": False})
+
+        self.assertIsNone(result["vp_poc_price"])
+        self.assertIsNone(result["vp_position"])
+
+    def test_volume_profile_disabled_by_config(self):
+        snapshot = {
+            "available": True, "poc_price": 100.0, "value_area_high": 105.0,
+            "value_area_low": 95.0, "position": "INSIDE_VALUE_AREA",
+        }
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", False):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertIsNone(result["vp_poc_price"])
+        self.assertIsNone(result["vp_position"])
+
+    def test_volume_profile_is_never_added_to_confluence_scoring(self):
+        snapshot = {
+            "available": True, "poc_price": 100.0, "value_area_high": 105.0,
+            "value_area_low": 95.0, "position": "INSIDE_VALUE_AREA",
+        }
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True):
+            with_vp = self._run(volume_profile_snapshot=snapshot)
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", False):
+            without_vp = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertEqual(with_vp["confluence_total"], without_vp["confluence_total"])
+        self.assertEqual(with_vp["confluence_score"], without_vp["confluence_score"])
+
+    # config.CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED - EXPLICIT LIVE TEST,
+    # no resolved-trade evidence (see config.py's own comment). Real
+    # cross_exchange_oi.compute_agreement() logic is covered directly in
+    # test_cross_exchange_oi.py; these only prove the reject condition
+    # itself.
+
+    def test_cross_exchange_oi_disagree_rejects_when_gate_enabled(self):
+        # Default oi_snapshot (OI_RISING) has oi_change_pct=5.0 (rising) -
+        # Bybit disagrees (falling).
+        bybit = {"available": True, "oi_change_pct": -2.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", True):
+            result = self._run(oi_snapshot_bybit=bybit)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "CROSS_EXCHANGE_OI_DISAGREE")
+
+    def test_cross_exchange_oi_agreement_does_not_reject(self):
+        bybit = {"available": True, "oi_change_pct": 2.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", True):
+            result = self._run(oi_snapshot_bybit=bybit)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_cross_exchange_oi_unavailable_does_not_reject(self):
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", True):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_cross_exchange_oi_reject_disabled_by_default_flag(self):
+        bybit = {"available": True, "oi_change_pct": -2.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", False):
+            result = self._run(oi_snapshot_bybit=bybit)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    # config.VP_EXTENSION_REJECT_ENABLED - EXPLICIT LIVE TEST, no
+    # resolved-trade evidence (see config.py's own comment).
+
+    def test_vp_extension_rejects_buy_already_above_value_area(self):
+        snapshot = {"available": True, "position": "ABOVE_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", True):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "VP_ALREADY_EXTENDED")
+
+    def test_vp_extension_rejects_sell_already_below_value_area(self):
+        snapshot = {"available": True, "position": "BELOW_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0, cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0,
+                volume_profile_snapshot=snapshot,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "VP_ALREADY_EXTENDED")
+
+    def test_vp_extension_does_not_reject_the_opposite_sides_extension(self):
+        # BUY candidate, price already BELOW the value area (not extended
+        # in ITS own direction) - must not reject.
+        snapshot = {"available": True, "position": "BELOW_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", True):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_vp_extension_does_not_reject_inside_value_area(self):
+        snapshot = {"available": True, "position": "INSIDE_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", True):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_vp_extension_does_not_reject_when_unavailable(self):
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", False), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", True):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_vp_extension_reject_disabled_by_default_flag(self):
+        snapshot = {"available": True, "position": "ABOVE_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", False):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertEqual(result["signal"], "BUY")
 
     def test_btc_aligned_counts_toward_confluence_score(self):
         result = self._run(symbol="ETHUSDT", btc_return=0.05)  # aligned

@@ -14,6 +14,7 @@ was rejected (for the shadow journal) get that for free.
 """
 import absorption
 import config
+import cross_exchange_oi
 import cvd_divergence
 import liquidity_sweep
 import market_structure
@@ -53,6 +54,7 @@ def evaluate(
     symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
     oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,
     btc_candles=None, funding_rate=None, crash_snapshot=None,
+    oi_snapshot_bybit=None, oi_snapshot_okx=None, volume_profile_snapshot=None,
 ):
     if not htf_candles or not ltf_candles:
         return _reject("INSUFFICIENT_CANDLES")
@@ -305,6 +307,18 @@ def evaluate(
         absorption_signal = absorption.compute(
             cvd_snapshot, depth_snapshot.get("price_change_pct_1m")
         )
+
+    # config.VOLUME_PROFILE_TRACKING_ENABLED - descriptive fields only
+    # (no directional "aligned" reading, see config.py's own docstring for
+    # why). Direction-independent, same as absorption_signal above.
+    vp_snapshot_ = volume_profile_snapshot or {}
+    vp_poc_price = vp_value_area_high = vp_value_area_low = vp_position = None
+
+    if config.VOLUME_PROFILE_TRACKING_ENABLED and vp_snapshot_.get("available"):
+        vp_poc_price = vp_snapshot_.get("poc_price")
+        vp_value_area_high = vp_snapshot_.get("value_area_high")
+        vp_value_area_low = vp_snapshot_.get("value_area_low")
+        vp_position = vp_snapshot_.get("position")
 
     # Candidate list - same detection conditions and same priority order
     # as before (STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
@@ -690,6 +704,28 @@ def evaluate(
             if oi_change_pct is not None:
                 oi_rising = oi_change_pct > 0
 
+        # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED - corroboration only,
+        # NOT a gate. Sign-only comparison against Binance's own
+        # oi_change_pct above (see cross_exchange_oi.compute_agreement's
+        # own docstring for why sign, not magnitude).
+        oi_change_pct_bybit = None
+        oi_change_pct_okx = None
+        cross_exchange_oi_agree = None
+
+        if config.CROSS_EXCHANGE_OI_TRACKING_ENABLED:
+            oi_snapshot_bybit_ = oi_snapshot_bybit or {}
+            oi_snapshot_okx_ = oi_snapshot_okx or {}
+
+            if oi_snapshot_bybit_.get("available"):
+                oi_change_pct_bybit = oi_snapshot_bybit_.get("oi_change_pct")
+
+            if oi_snapshot_okx_.get("available"):
+                oi_change_pct_okx = oi_snapshot_okx_.get("oi_change_pct")
+
+            cross_exchange_oi_agree = cross_exchange_oi.compute_agreement(
+                oi_change_pct, oi_change_pct_bybit, oi_change_pct_okx
+            )
+
         # OI_RISING - a real gate, unlike every other field in this
         # function (see config.OI_RISING_REJECT_ENABLED for the evidence).
         # Universal across triggers (same as NOT_IN_DISCOUNT/DEPTH_OPPOSING
@@ -700,6 +736,21 @@ def evaluate(
         # it into one count instead of one per oi_change_pct value.
         if config.OI_RISING_REJECT_ENABLED and oi_rising:
             return _reject("OI_RISING")
+
+        # config.CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED - see config.py's
+        # own comment for why this is a live test, not evidence-backed.
+        # Reject only on an explicit disagreement - None (unavailable)
+        # never blocks, same fail-open convention as every gate above.
+        if config.CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED and cross_exchange_oi_agree is False:
+            return _reject("CROSS_EXCHANGE_OI_DISAGREE")
+
+        # config.VP_EXTENSION_REJECT_ENABLED - see config.py's own
+        # comment. None/INSIDE_VALUE_AREA never blocks.
+        if config.VP_EXTENSION_REJECT_ENABLED:
+            if side == "BUY" and vp_position == "ABOVE_VALUE_AREA":
+                return _reject("VP_ALREADY_EXTENDED")
+            if side == "SELL" and vp_position == "BELOW_VALUE_AREA":
+                return _reject("VP_ALREADY_EXTENDED")
 
         # CRASH_MODE - config.CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED. See
         # crash_detector.py for the real incident this was built for: a
@@ -971,6 +1022,9 @@ def evaluate(
             "ema_aligned": ema_aligned,
             "oi_change_pct": oi_change_pct,
             "oi_rising": oi_rising,
+            "oi_change_pct_bybit": oi_change_pct_bybit,
+            "oi_change_pct_okx": oi_change_pct_okx,
+            "cross_exchange_oi_agree": cross_exchange_oi_agree,
             "liquidation_notional_net": liquidation_notional_net,
             "liquidation_cluster": liquidation_cluster,
             "liquidation_aligned": liquidation_aligned,
@@ -980,6 +1034,10 @@ def evaluate(
             "btc_aligned": btc_aligned,
             "absorption_signal": absorption_signal,
             "absorption_aligned": absorption_aligned,
+            "vp_poc_price": vp_poc_price,
+            "vp_value_area_high": vp_value_area_high,
+            "vp_value_area_low": vp_value_area_low,
+            "vp_position": vp_position,
             "funding_rate": funding_rate_,
             "funding_favorable": funding_favorable,
             # long_short_ratio/long_short_favorable are NOT set here - the

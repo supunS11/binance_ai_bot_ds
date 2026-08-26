@@ -149,6 +149,38 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["absorption_signal"], "BUY")
         self.assertEqual(rows[0]["absorption_aligned"], "True")
 
+    def test_append_signal_writes_cross_exchange_oi_fields(self):
+        # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED - real
+        # cross_exchange_oi.py logic covered in test_cross_exchange_oi.py/
+        # test_signal_engine.py; this only proves the journal writes it
+        # through, same as absorption_signal above.
+        signal_journal.append_signal(
+            _signal(
+                oi_change_pct_bybit=2.0, oi_change_pct_okx=1.0, cross_exchange_oi_agree=True,
+            ),
+            _plan(),
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["oi_change_pct_bybit"], "2.0")
+        self.assertEqual(rows[0]["oi_change_pct_okx"], "1.0")
+        self.assertEqual(rows[0]["cross_exchange_oi_agree"], "True")
+
+    def test_append_signal_writes_volume_profile_fields(self):
+        signal_journal.append_signal(
+            _signal(
+                vp_poc_price=100.0, vp_value_area_high=105.0,
+                vp_value_area_low=95.0, vp_position="INSIDE_VALUE_AREA",
+            ),
+            _plan(),
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["vp_poc_price"], "100.0")
+        self.assertEqual(rows[0]["vp_value_area_high"], "105.0")
+        self.assertEqual(rows[0]["vp_value_area_low"], "95.0")
+        self.assertEqual(rows[0]["vp_position"], "INSIDE_VALUE_AREA")
+
     def test_append_signal_writes_the_three_favorable_boolean_fields(self):
         signal_journal.append_signal(
             _signal(

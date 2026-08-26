@@ -25,6 +25,8 @@ from orderbook import DepthImbalanceEngine
 from open_interest import OpenInterestEngine
 from liquidation_tracker import LiquidationEngine, LIQUIDATION_STREAM_URL
 from crash_detector import CrashDetector
+from volume_profile import VolumeProfileEngine
+import cross_exchange_oi
 
 
 FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
@@ -136,6 +138,12 @@ class RealtimeMarketData:
         self.cvd = CVDEngine()
         self.depth = DepthImbalanceEngine()
         self.open_interest = OpenInterestEngine()
+        # Reuses OpenInterestEngine as-is (fully generic - it doesn't know
+        # or care the value came from Binance) for two more venues - see
+        # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED.
+        self.open_interest_bybit = OpenInterestEngine()
+        self.open_interest_okx = OpenInterestEngine()
+        self.volume_profile = VolumeProfileEngine()
         self.liquidations = LiquidationEngine()
         self.crash_detector = CrashDetector()
         # 24h quote volume per symbol - the data behind the signal-time
@@ -159,6 +167,8 @@ class RealtimeMarketData:
         self.depth_websockets = {}
         self.watchdog_thread = None
         self.oi_poll_thread = None
+        self.oi_poll_thread_bybit = None
+        self.oi_poll_thread_okx = None
         self.liquidation_thread = None
         self.volume_poll_thread = None
         self.funding_poll_thread = None
@@ -195,6 +205,8 @@ class RealtimeMarketData:
         self._start_market_streams()
         self._start_depth_streams()
         self._start_oi_poll()
+        self._start_oi_poll_bybit()
+        self._start_oi_poll_okx()
         self._start_liquidation_stream()
         self._start_volume_poll()
         self._start_funding_poll()
@@ -486,6 +498,9 @@ class RealtimeMarketData:
             timestamp=timestamp,
         )
 
+        if config.VOLUME_PROFILE_TRACKING_ENABLED:
+            self.volume_profile.record_trade(symbol, data.get("p"), data.get("q"), timestamp=timestamp)
+
         # config.CRASH_DETECTOR_REFERENCE_SYMBOL - single-symbol check,
         # negligible added cost on this otherwise-hot per-tick path (see
         # crash_detector.py for why this needs the raw trade stream
@@ -628,6 +643,84 @@ class RealtimeMarketData:
                     return
 
                 self.open_interest.record(symbol, get_open_interest(symbol))
+
+                if self.stop_event.wait(gap):
+                    return
+
+    # =========================
+    # CROSS-EXCHANGE OPEN INTEREST (Bybit, OKX - informational only, see
+    # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED). Same spread-across-the-
+    # window pacing as _oi_poll_loop above, on separate threads so a slow
+    # or unavailable venue never delays Binance's own OI poll.
+    # =========================
+    def _start_oi_poll_bybit(self):
+        if not config.CROSS_EXCHANGE_OI_TRACKING_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._oi_poll_loop_bybit,
+            args=(generation,),
+            name="realtime-oi-poll-bybit",
+            daemon=True,
+        )
+        thread.start()
+        self.oi_poll_thread_bybit = thread
+
+    def _oi_poll_loop_bybit(self, generation):
+        interval = max(float(config.CROSS_EXCHANGE_OI_POLL_INTERVAL_SECONDS), 5)
+
+        while self._worker_active(generation):
+            if not self.symbols:
+                if self.stop_event.wait(interval):
+                    return
+                continue
+
+            gap = interval / len(self.symbols)
+
+            for symbol in self.symbols:
+                if not self._worker_active(generation):
+                    return
+
+                self.open_interest_bybit.record(symbol, cross_exchange_oi.get_open_interest_bybit(symbol))
+
+                if self.stop_event.wait(gap):
+                    return
+
+    def _start_oi_poll_okx(self):
+        if not config.CROSS_EXCHANGE_OI_TRACKING_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._oi_poll_loop_okx,
+            args=(generation,),
+            name="realtime-oi-poll-okx",
+            daemon=True,
+        )
+        thread.start()
+        self.oi_poll_thread_okx = thread
+
+    def _oi_poll_loop_okx(self, generation):
+        interval = max(float(config.CROSS_EXCHANGE_OI_POLL_INTERVAL_SECONDS), 5)
+
+        while self._worker_active(generation):
+            if not self.symbols:
+                if self.stop_event.wait(interval):
+                    return
+                continue
+
+            gap = interval / len(self.symbols)
+
+            for symbol in self.symbols:
+                if not self._worker_active(generation):
+                    return
+
+                self.open_interest_okx.record(symbol, cross_exchange_oi.get_open_interest_okx(symbol))
 
                 if self.stop_event.wait(gap):
                     return

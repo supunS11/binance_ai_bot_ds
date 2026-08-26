@@ -39,6 +39,9 @@ class _FakeFeed:
         self.cvd = _FakeSnapshotSource()
         self.depth = _FakeSnapshotSource()
         self.open_interest = _FakeSnapshotSource()
+        self.open_interest_bybit = _FakeSnapshotSource()
+        self.open_interest_okx = _FakeSnapshotSource()
+        self.volume_profile = _FakeSnapshotSource()
         self.liquidations = _FakeSnapshotSource()
         self.crash_detector = _FakeCrashDetector()
         self.volumes = volumes if volumes is not None else {}

@@ -1,6 +1,7 @@
 """Backtest replacement for ws_client.RealtimeMarketData - duck-types the
 exact interface main._evaluate_symbol/_poll_positions read from a live feed
 (`.candles`, `.htf_candles`, `.cvd`, `.depth`, `.open_interest`,
+`.open_interest_bybit`, `.open_interest_okx`, `.volume_profile`,
 `.liquidations`, `.volumes`, `.funding_rates`), but built from pre-fetched
 historical data and advanced one closed candle at a time instead of a live
 websocket.
@@ -39,6 +40,12 @@ class BacktestFeed:
         self.cvd = CVDEngine()
         self.depth = _UnavailableSnapshotSource()
         self.open_interest = _UnavailableSnapshotSource()
+        # Cross-exchange OI and volume-profile have no faithful
+        # historical-replay source either (same rationale as depth/OI/
+        # liquidations above) - same stub, same honest degrade.
+        self.open_interest_bybit = _UnavailableSnapshotSource()
+        self.open_interest_okx = _UnavailableSnapshotSource()
+        self.volume_profile = _UnavailableSnapshotSource()
         self.liquidations = _UnavailableSnapshotSource()
         # Plain dicts - matches how main._evaluate_symbol reads a live feed's
         # own .volumes/.funding_rates (feed.volumes.get(symbol), not a
