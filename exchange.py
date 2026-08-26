@@ -1174,6 +1174,73 @@ def place_stop_loss(symbol, side, trigger_price, client_algo_id=None):
     return place_algo_order(**params)
 
 
+def _normalize_callback_rate(callback_rate):
+    """config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - Binance requires
+    0.1-10 for a TRAILING_STOP_MARKET's callbackRate (python-binance's own
+    futures_create_algo_order docstring: "min 0.1, max 10"), but this
+    project deliberately caps the top end lower (5) - a callback anywhere
+    near Binance's own max would give back far more profit than the flat
+    breakeven stop it's replacing was ever designed to risk. No existing
+    price-formatting helper applies here (normalize_order_price/
+    _format_price_for_api are both tick-size/price-precision based) -
+    this is a plain percentage, not a price."""
+    return round(max(0.1, min(float(callback_rate), 5.0)), 1)
+
+
+def place_trailing_stop_loss(symbol, side, activate_price, callback_rate, client_algo_id=None):
+    """config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a real, native Binance
+    TRAILING_STOP_MARKET, closePosition=true, mirroring place_stop_loss's
+    own shape. Unlike a plain STOP_MARKET this doesn't fire at a fixed
+    level - it only starts trailing once price first reaches
+    `activate_price`, then trails behind the best price seen by
+    `callback_rate`%, entirely server-side (no bot polling, no cancel/
+    replace round trip - see position_manager._execute_dca's own comment
+    for the real race this closes).
+
+    Real, unverified assumption this project is shipping on anyway (see
+    config.py's own comment): whether a closePosition=true STOP_MARKET
+    (the existing wide post-DCA SL) and a closePosition=true TRAILING_
+    STOP_MARKET can rest on the same symbol/side simultaneously has never
+    been tested in this codebase - only same-type duplicates are proven to
+    conflict (-4130, see place_stop_loss's own docstring on why
+    client_algo_id matters, and execution.py's -4130 handling). Callers
+    must treat this as best-effort/non-fatal, exactly like TP1/TP2
+    placement failures already are.
+
+    `priceProtect`/`workingType` included for consistency with place_
+    stop_loss/place_take_profit_full - not confirmed whether Binance
+    accepts them for this order type specifically, covered by the same
+    best-effort framing."""
+    close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    # Reuses the non-TAKE_PROFIT (SL-direction) rounding branch - a
+    # genuine price, same rounding math regardless of order type, just
+    # never previously exercised with this literal type string.
+    activate_price = normalize_trigger_price(symbol, side, "STOP_MARKET", activate_price)
+
+    if activate_price <= 0:
+        raise ValueError(f"{symbol} trailing stop activate price is invalid")
+
+    activate_price = _format_price_for_api(symbol, activate_price)
+    callback_rate = _normalize_callback_rate(callback_rate)
+
+    params = dict(
+        symbol=symbol,
+        side=close_side,
+        type="TRAILING_STOP_MARKET",
+        activatePrice=activate_price,
+        callbackRate=callback_rate,
+        closePosition="true",
+        workingType="MARK_PRICE",
+        priceProtect="TRUE",
+        timeInForce="GTC",
+    )
+
+    if client_algo_id:
+        params["clientAlgoId"] = client_algo_id
+
+    return place_algo_order(**params)
+
+
 def place_take_profit_partial(symbol, side, quantity, trigger_price):
     """Reduce-only TAKE_PROFIT_MARKET for an exact quantity - this is TP1,
     closing part of the position and leaving the rest open."""

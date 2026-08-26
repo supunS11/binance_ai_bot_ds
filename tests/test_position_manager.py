@@ -17,21 +17,27 @@ from position_manager import (
 )
 
 
-# _close() journals every outcome for real (signal_journal.append_outcome)
-# so it can associate a trade_id with its result - none of these tests
-# care about that side effect, so it's patched out for the whole module
-# rather than in every single test that reaches a close.
-_journal_patcher = None
+# _close() journals every outcome for real (signal_journal.append_outcome),
+# and _finalize_retracement_entry journals every settle for real
+# (signal_journal.append_retracement_settle) - neither side effect is
+# something these tests care about, so both are patched out for the whole
+# module rather than in every single test that reaches one.
+_journal_patchers = []
 
 
 def setUpModule():
-    global _journal_patcher
-    _journal_patcher = patch("position_manager.signal_journal.append_outcome")
-    _journal_patcher.start()
+    global _journal_patchers
+    _journal_patchers = [
+        patch("position_manager.signal_journal.append_outcome"),
+        patch("position_manager.signal_journal.append_retracement_settle"),
+    ]
+    for patcher in _journal_patchers:
+        patcher.start()
 
 
 def tearDownModule():
-    _journal_patcher.stop()
+    for patcher in _journal_patchers:
+        patcher.stop()
 
 
 def _plan(side="BUY"):
@@ -742,6 +748,58 @@ class ReconcileOnStartupTests(unittest.TestCase):
 
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+
+    def test_dca_active_recovery_finds_a_resting_dcatrail_tagged_order(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - Binance keeps a
+        # real TRAILING_STOP_MARKET resting across a bot restart; this
+        # only has to notice it via the same clientAlgoId-based
+        # disambiguation the SL/TP tags already use, not recreate it.
+        manager = PositionManager()
+        orders = self._dca_active_open_orders() + [
+            {
+                "type": "TRAILING_STOP_MARKET", "closePosition": "true",
+                "algoId": "trail_real", "clientAlgoId": "dcaTrail1787000000000",
+            },
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_ACTIVE)
+        self.assertEqual(position["dca_trail_order_id"], "trail_real")
+
+    def test_dca_active_recovery_without_a_trail_order_leaves_it_none(self):
+        # The normal case - no flag, no trail order ever placed.
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_active_open_orders()):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_ACTIVE)
+        self.assertIsNone(position["dca_trail_order_id"])
+
+    def test_dca_active_recovery_ignores_an_untagged_trailing_stop_market(self):
+        # Only the dcaTrail-prefixed tag counts - an unrelated real
+        # TRAILING_STOP_MARKET (not this feature's doing) must not
+        # false-positive.
+        manager = PositionManager()
+        orders = self._dca_active_open_orders() + [
+            {
+                "type": "TRAILING_STOP_MARKET", "closePosition": "true",
+                "algoId": "trail_unrelated", "clientAlgoId": "x-Cb7ytekJ7f08390857d3692432277d",
+            },
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertIsNone(position["dca_trail_order_id"])
 
 
 class ReentryCooldownTests(unittest.TestCase):
@@ -3630,6 +3688,7 @@ class ReconcilePendingEntriesOnStartupTests(unittest.TestCase):
 
         with patch.object(config, "LIMIT_ENTRY_MODE_ENABLED", False), \
              patch.object(config, "RETRACEMENT_ENTRY_ENABLED", False), \
+             patch.object(config, "DCA_RESTING_ORDER_ENABLED", False), \
              patch.object(exchange, "get_all_open_orders") as get_orders:
             manager.reconcile_pending_entries_on_startup()
 
@@ -3840,7 +3899,7 @@ class ResolveRetracementMarketFallbackTests(unittest.TestCase):
         manager, position = self._manager_with_position()
 
         with patch.object(exchange, "place_market_order") as market_order:
-            total_quantity, entry_price, error = manager._resolve_retracement_market_fallback(
+            total_quantity, entry_price, used_fallback, error = manager._resolve_retracement_market_fallback(
                 position, 1.0, 99.8
             )
 
@@ -3848,13 +3907,14 @@ class ResolveRetracementMarketFallbackTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(total_quantity, 1.0)
         self.assertEqual(entry_price, 99.8)
+        self.assertFalse(used_fallback)
 
     def test_zero_fill_places_a_full_market_fallback(self):
         manager, position = self._manager_with_position()
 
         with patch.object(exchange, "place_market_order", return_value={"orderId": 2}) as market_order, \
              patch.object(exchange, "resolve_market_fill_price", return_value=100.5):
-            total_quantity, entry_price, error = manager._resolve_retracement_market_fallback(
+            total_quantity, entry_price, used_fallback, error = manager._resolve_retracement_market_fallback(
                 position, 0.0, None
             )
 
@@ -3862,13 +3922,14 @@ class ResolveRetracementMarketFallbackTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(total_quantity, 1.0)
         self.assertEqual(entry_price, 100.5)
+        self.assertTrue(used_fallback)
 
     def test_partial_fill_blends_with_the_market_fallback(self):
         manager, position = self._manager_with_position()
 
         with patch.object(exchange, "place_market_order", return_value={"orderId": 2}) as market_order, \
              patch.object(exchange, "resolve_market_fill_price", return_value=100.5):
-            total_quantity, entry_price, error = manager._resolve_retracement_market_fallback(
+            total_quantity, entry_price, used_fallback, error = manager._resolve_retracement_market_fallback(
                 position, 0.4, 99.5
             )
 
@@ -3876,12 +3937,13 @@ class ResolveRetracementMarketFallbackTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertAlmostEqual(total_quantity, 1.0)
         self.assertAlmostEqual(entry_price, 99.5 * 0.4 + 100.5 * 0.6)
+        self.assertTrue(used_fallback)
 
     def test_market_order_failure_returns_an_error(self):
         manager, position = self._manager_with_position()
 
         with patch.object(exchange, "place_market_order", side_effect=RuntimeError("boom")):
-            total_quantity, entry_price, error = manager._resolve_retracement_market_fallback(
+            total_quantity, entry_price, used_fallback, error = manager._resolve_retracement_market_fallback(
                 position, 0.0, None
             )
 
@@ -3937,7 +3999,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}) as tp2, \
              patch.object(exchange, "place_stop_loss") as sl:
-            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0)
+            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
 
         self.assertIsNone(outcome)
         final = manager.positions["BTCUSDT"]
@@ -3971,7 +4033,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         with patch.object(config, "LEVERAGE", 10), \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
-            manager._finalize_retracement_entry(position, 99.0, 1.0)  # real fill: 99.0, not the planned 100
+            manager._finalize_retracement_entry(position, 99.0, 1.0, "LIMIT")  # real fill: 99.0, not the planned 100
 
         final = manager.positions["BTCUSDT"]
         self.assertAlmostEqual(final["tp1_price"], 99.0 * 1.04)  # 40% ROI/10x off the REAL entry
@@ -3984,7 +4046,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
 
         with patch.object(exchange, "place_take_profit_partial") as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}) as tp_full:
-            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0)
+            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
 
         self.assertIsNone(outcome)
         final = manager.positions["BTCUSDT"]
@@ -4002,7 +4064,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
-            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0)
+            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
 
         self.assertIsNone(outcome)
         final = manager.positions["BTCUSDT"]
@@ -4016,7 +4078,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
 
         with patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
              patch.object(exchange, "close_position_market") as close_market:
-            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0)
+            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
 
         self.assertEqual(outcome, "RETRACEMENT_SL_PLACEMENT_FAILED")
         self.assertFalse(manager.has_open_position("BTCUSDT"))
@@ -4033,7 +4095,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}), \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
-            manager._finalize_retracement_entry(position, 99.0, 1.7)
+            manager._finalize_retracement_entry(position, 99.0, 1.7, "LIMIT")
 
         final = manager.positions["BTCUSDT"]
         self.assertEqual(final["quantity"], 1.7)
@@ -4048,7 +4110,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         with patch.object(exchange, "place_take_profit_partial") as tp1, \
              patch.object(exchange, "place_take_profit_full") as tp2, \
              patch.object(exchange, "place_stop_loss") as sl:
-            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0)
+            outcome = manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
 
         self.assertIsNone(outcome)
         final = manager.positions["BTCUSDT"]
@@ -4057,6 +4119,55 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         tp1.assert_not_called()
         tp2.assert_not_called()
         sl.assert_not_called()
+
+    # config.RETRACEMENT_ENTRY_ENABLED observability (2026-08-25) -
+    # signal_journal.append_retracement_settle is called with the real
+    # settled entry_price and the fill_type/fill_lag this method received,
+    # regardless of dca/single_tp/shadow shape or a downstream SL failure.
+
+    def test_journals_the_real_entry_price_and_fill_type(self):
+        manager = _retracement_manager(dca=True, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        trade_id = position["trade_id"]
+
+        with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager._finalize_retracement_entry(position, 99.5, 1.0, "MARKET_FALLBACK")
+
+        append_settle.assert_called_once()
+        args = append_settle.call_args.args
+        self.assertEqual(args[0], "BTCUSDT")
+        self.assertEqual(args[1], trade_id)
+        self.assertEqual(args[2], 99.5)
+        self.assertEqual(args[3], "MARKET_FALLBACK")
+        self.assertIsInstance(args[4], float)
+
+    def test_journals_even_when_the_post_settle_sl_placement_fails(self):
+        # entry_price/fill_type are known and worth keeping even when the
+        # position closes right back out from a downstream SL failure.
+        manager = _retracement_manager(dca=False, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
+             patch.object(exchange, "close_position_market"), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
+
+        append_settle.assert_called_once()
+
+    def test_fill_lag_reflects_real_elapsed_time_since_the_limit_was_placed(self):
+        manager = _retracement_manager(dca=True, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["limit_placed_at"] = time.time() - 184.2
+
+        with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
+
+        fill_lag = append_settle.call_args.args[4]
+        self.assertAlmostEqual(fill_lag, 184.2, delta=1.0)
 
 
 class PollRetracementPendingTests(unittest.TestCase):
@@ -4191,6 +4302,56 @@ class PollRetracementPendingTests(unittest.TestCase):
         market_order.assert_not_called()  # the race fill covered the full quantity
         cancel_order.assert_called_once_with("BTCUSDT", "limit1")
 
+    # config.RETRACEMENT_ENTRY_ENABLED observability (2026-08-25) - the
+    # journaled fill_type must reflect whether the market fallback was
+    # actually needed, not just whether the position settled successfully.
+
+    def test_full_fill_journals_fill_type_limit(self):
+        manager = _retracement_manager(dca=True, single_tp=False)
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("FILLED", executed_qty=1.0, avg_price=99.8)), \
+             patch.object(exchange, "cancel_order"), \
+             patch.object(exchange, "place_market_order") as market_order, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager.poll_retracement_pending("BTCUSDT", latest_candle=None)
+
+        market_order.assert_not_called()
+        self.assertEqual(append_settle.call_args.args[3], "LIMIT")
+
+    def test_expired_fallback_journals_fill_type_market_fallback(self):
+        manager = _retracement_manager(dca=True, single_tp=False)
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+
+        with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW", executed_qty=0.0)), \
+             patch.object(exchange, "cancel_order"), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 2}), \
+             patch.object(exchange, "resolve_market_fill_price", return_value=101.0), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager.poll_retracement_pending("BTCUSDT", latest_candle=None)
+
+        self.assertEqual(append_settle.call_args.args[3], "MARKET_FALLBACK")
+
+    def test_partial_fill_plus_fallback_journals_fill_type_market_fallback(self):
+        manager = _retracement_manager(dca=True, single_tp=False)
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+
+        with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("PARTIALLY_FILLED", executed_qty=0.4, avg_price=99.5)), \
+             patch.object(exchange, "cancel_order"), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 2}), \
+             patch.object(exchange, "resolve_market_fill_price", return_value=100.5), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager.poll_retracement_pending("BTCUSDT", latest_candle=None)
+
+        self.assertEqual(append_settle.call_args.args[3], "MARKET_FALLBACK")
+
 
 class PollShadowRetracementPendingTests(unittest.TestCase):
     def test_touches_retracement_price_settles_immediately(self):
@@ -4198,7 +4359,8 @@ class PollShadowRetracementPendingTests(unittest.TestCase):
         candle = _candle(high=100, low=99.5)  # touches 99.8, never reaches sl=98
 
         with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
-             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
             outcome = manager.poll_shadow_retracement_pending("BTCUSDT", candle)
 
         self.assertIsNone(outcome)
@@ -4206,6 +4368,7 @@ class PollShadowRetracementPendingTests(unittest.TestCase):
         self.assertEqual(position["stage"], DCA_PENDING)
         self.assertEqual(position["entry_price"], 99.8)
         self.assertTrue(position["shadow"])
+        self.assertEqual(append_settle.call_args.args[3], "LIMIT")
 
     def test_touches_sl_before_retracement_invalidates(self):
         manager = _retracement_manager(shadow=True, retracement_price=99.8)
@@ -4232,13 +4395,15 @@ class PollShadowRetracementPendingTests(unittest.TestCase):
 
         with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
-             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
             outcome = manager.poll_shadow_retracement_pending("BTCUSDT", candle)
 
         self.assertIsNone(outcome)
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], DCA_PENDING)
         self.assertEqual(position["entry_price"], 100.3)
+        self.assertEqual(append_settle.call_args.args[3], "MARKET_FALLBACK")
 
     def test_still_waiting_is_a_noop(self):
         manager = _retracement_manager(shadow=True, retracement_price=99.8)
@@ -4570,6 +4735,22 @@ class ExecuteDcaShadowTests(unittest.TestCase):
         self.assertEqual(position["stage"], DCA_PENDING)
         self.assertFalse(position["dca_applied"])
 
+    def test_never_places_a_trail_order_in_shadow_even_when_flag_enabled(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - placement is
+        # strictly live-only (inside the `not shadow` branch); a shadow
+        # position always keeps dca_trail_order_id at None regardless of
+        # the flag.
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(config, "DCA_BREAKEVEN_TRAILING_STOP_ENABLED", True), \
+             patch.object(exchange, "place_trailing_stop_loss") as trail_order:
+            manager._execute_dca(position)
+
+        trail_order.assert_not_called()
+        self.assertIsNone(position["dca_trail_order_id"])
+
 
 class ExecuteDcaLiveTests(unittest.TestCase):
     def setUp(self):
@@ -4626,6 +4807,78 @@ class ExecuteDcaLiveTests(unittest.TestCase):
         self.assertEqual(position["stage"], DCA_ACTIVE)
         self.assertEqual(position["tp_order_id"], "tp_new")
         self.assertEqual(position["sl_order_id"], "sl_new")
+
+    def test_places_dormant_trail_order_when_flag_enabled(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - placed strictly
+        # after the real SL succeeds, own separate try/except, tagged
+        # with the dcaTrail prefix _adopt_position's restart recovery
+        # looks for.
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(config, "DCA_BREAKEVEN_TRAILING_STOP_ENABLED", True), \
+             patch.object(config, "DCA_BREAKEVEN_TRAILING_CALLBACK_RATE", 0.2), \
+             patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.15), \
+             patch.object(exchange, "place_trailing_stop_loss", return_value={"algoId": "trail_new"}) as trail_order:
+            outcome = manager._execute_dca(position)
+
+        self.assertIsNone(outcome)
+        trail_order.assert_called_once()
+        self.assertEqual(trail_order.call_args.args, ("BTCUSDT", "BUY", 98.0 * 1.0015, 0.2))
+        self.assertTrue(trail_order.call_args.kwargs["client_algo_id"].startswith("dcaTrail"))
+        self.assertEqual(position["dca_trail_order_id"], "trail_new")
+
+    def test_flag_disabled_never_attempts_trail_placement(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(config, "DCA_BREAKEVEN_TRAILING_STOP_ENABLED", False), \
+             patch.object(exchange, "place_trailing_stop_loss") as trail_order:
+            outcome = manager._execute_dca(position)
+
+        self.assertIsNone(outcome)
+        trail_order.assert_not_called()
+        self.assertIsNone(position["dca_trail_order_id"])
+
+    def test_trail_placement_failure_is_best_effort_and_does_not_affect_sl_tp(self):
+        # Own, separate try/except from the real-SL placement above - a
+        # rejection here must never be mistaken for the atomic "first
+        # real SL placement failed" case and trigger an emergency
+        # market-close the position doesn't need.
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
+             patch.object(config, "DCA_BREAKEVEN_TRAILING_STOP_ENABLED", True), \
+             patch.object(exchange, "place_trailing_stop_loss", side_effect=Exception("boom")):
+            outcome = manager._execute_dca(position)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(position["stage"], DCA_ACTIVE)
+        self.assertEqual(position["sl_order_id"], "sl_new")
+        self.assertEqual(position["tp_order_id"], "tp_new")
+        self.assertIsNone(position["dca_trail_order_id"])
+        close_market.assert_not_called()
+        cancel_all.assert_not_called()
 
     def test_cancels_the_real_exchange_tp_orders_not_stale_local_ids(self):
         # Same ground-truth discipline _replace_sl_order already applies
@@ -5983,6 +6236,40 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertTrue(manager.has_open_position("BTCUSDT"))
 
+    def test_trail_finished_closes_as_dca_breakeven_trail_hit(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a resting native
+        # trailing stop that fires is detected the same way sl_status/
+        # tp_status already are, via _status_or_missing on the stored
+        # order id, and sweeps all open orders exactly like the sibling
+        # SL/TP-finished paths above.
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["dca_trail_order_id"] = "trail_1"
+
+        def status_side_effect(symbol, order_id):
+            return "FINISHED" if order_id == "trail_1" else "NEW"
+
+        with patch.object(exchange, "get_algo_order_status", side_effect=status_side_effect), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "DCA_BREAKEVEN_TRAIL_HIT")
+        cancel_all.assert_called_once_with("BTCUSDT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_no_trail_order_id_is_a_safe_no_op(self):
+        # dca_trail_order_id stays None for every position that never had
+        # the flag on (or whose placement failed) - _status_or_missing
+        # already returns "MISSING" for a falsy id, so this must behave
+        # identically to today (stays open, no new close reason).
+        manager = self._manager_with_dca_active()
+        self.assertIsNone(manager.positions["BTCUSDT"].get("dca_trail_order_id"))
+
+        with patch.object(exchange, "get_algo_order_status", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
     def test_dca_breakeven_arms_when_price_reaches_breakeven(self):
         # entry=98, sl=94 (a real loss level) - the candle's high recovers
         # to breakeven_price=98.02, the fix closes that gap by moving the
@@ -6064,6 +6351,28 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         self.assertIsNone(outcome)
         new_sl.assert_not_called()  # already armed - structure/profit-protection trailing takes over from here
 
+    def test_dca_breakeven_does_not_arm_while_a_native_trail_order_is_resting(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a resting
+        # dca_trail_order_id means the native order is already doing this
+        # job server-side. Without _is_dca_breakeven_candidate's skip, the
+        # poll-based path would replace the SL with a flat stop and (via
+        # _replace_sl_order's own cleanup) cancel the trail order that was
+        # just protecting the position better.
+        manager = self._manager_with_dca_active()
+        position = manager.positions["BTCUSDT"]
+        position.update({"breakeven_price": 98.02, "dca_trail_order_id": "trail_1"})
+
+        with patch.object(config, "DCA_BREAKEVEN_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "place_stop_loss") as new_sl:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertFalse(position["dca_breakeven_applied"])
+        new_sl.assert_not_called()
+        self.assertEqual(position["dca_trail_order_id"], "trail_1")
+
     def test_profit_protection_arm_takes_priority_over_dca_breakeven_in_the_same_tick(self):
         # Mirrors _try_early_promotions' profit-protection-then-early-
         # breakeven ordering: if one tick's move already clears profit
@@ -6119,6 +6428,59 @@ class PollLiveDcaActiveTests(unittest.TestCase):
         new_sl.assert_called_once_with("BTCUSDT", "BUY", 100.5)
         self.assertEqual(position["sl_order_id"], "sl_pp")
         self.assertEqual(position["sl_price"], 100.5)
+
+    def test_profit_protection_replace_retires_a_resting_dca_trail_order(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - _replace_sl_order's
+        # centralized cleanup: a DIFFERENT mechanism (profit protection
+        # here) just took over the SL, so a resting native trail order's
+        # job is done and it must be cancelled + cleared, not left to
+        # possibly conflict with a later third replace.
+        manager = self._manager_with_dca_active()
+        manager.positions["BTCUSDT"]["dca_trail_order_id"] = "trail_1"
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 50), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "get_mark_price", return_value=103.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_pp"}):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["profit_protection_applied"])
+        cancel.assert_any_call("BTCUSDT", "sl_new")
+        cancel.assert_any_call("BTCUSDT", "trail_1")
+        self.assertEqual(cancel.call_count, 2)
+        self.assertIsNone(position["dca_trail_order_id"])
+
+    def test_replace_sl_order_cleanup_is_a_no_op_without_a_trail_order(self):
+        # No dca_trail_order_id at all (the normal case for every
+        # position that never had the flag on) - the new cleanup must be
+        # a true no-op, same behavior as before this feature existed.
+        manager = self._manager_with_dca_active()
+        self.assertIsNone(manager.positions["BTCUSDT"].get("dca_trail_order_id"))
+
+        with patch.object(config, "PROFIT_PROTECTION_ENABLED", True), \
+             patch.object(config, "PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1", 50), \
+             patch.object(config, "PROFIT_PROTECTION_LOCK_PCT_OF_TP1", 25), \
+             patch.object(config, "PROFIT_PROTECTION_RETRACE_PCT", 50), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "get_mark_price", return_value=103.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 2.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_pp"}):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        cancel.assert_called_once_with("BTCUSDT", "sl_new")
 
     def test_profit_protection_trails_once_armed(self):
         manager = self._manager_with_dca_active()

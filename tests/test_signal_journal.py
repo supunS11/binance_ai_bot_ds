@@ -82,6 +82,39 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[1]["outcome"], "SL_HIT")
         self.assertEqual(rows[0]["outcome"], "")
 
+    # config.RETRACEMENT_ENTRY_ENABLED - a second, partial row for the
+    # same trade_id once a retracement-pending signal settles into a
+    # real position, carrying the REAL settled entry_price (correcting
+    # the original row's stale planned/trigger one) plus the two new
+    # fill-type/fill-lag diagnostic fields.
+
+    def test_append_retracement_settle_carries_the_same_trade_id(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_retracement_settle("BTCUSDT", trade_id, 99.5, "LIMIT", 184.2)
+
+        rows = self._read_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["trade_id"], trade_id)
+
+    def test_append_retracement_settle_writes_the_real_entry_price_and_fill_fields(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())  # planned entry_price=100.0
+        signal_journal.append_retracement_settle("BTCUSDT", trade_id, 99.5, "LIMIT", 184.2)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[0]["entry_price"], "100.0")  # original row untouched
+        self.assertEqual(rows[1]["entry_price"], "99.5")  # real settled price, corrected
+        self.assertEqual(rows[1]["retracement_fill_type"], "LIMIT")
+        self.assertEqual(rows[1]["retracement_fill_lag_seconds"], "184.2")
+        self.assertEqual(rows[1]["outcome"], "")  # not an outcome row
+
+    def test_append_retracement_settle_market_fallback_fill_type(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_retracement_settle("BTCUSDT", trade_id, 100.8, "MARKET_FALLBACK", 300.4)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["retracement_fill_type"], "MARKET_FALLBACK")
+        self.assertEqual(rows[1]["retracement_fill_lag_seconds"], "300.4")
+
     def test_append_signal_writes_quote_volume_usdt(self):
         signal_journal.append_signal(_signal(quote_volume_usdt=12_500_000), _plan())
         rows = self._read_rows()

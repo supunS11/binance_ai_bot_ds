@@ -36,7 +36,8 @@ FIELDNAMES = [
     "confluence_ratio", "quote_volume_usdt", "size_multiplier", "tp1_r_multiple", "tp2_r_multiple",
     "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
     "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed",
-    "dca_pressure_confirmed", "outcome",
+    "dca_pressure_confirmed", "retracement_fill_type", "retracement_fill_lag_seconds",
+    "outcome",
 ]
 
 
@@ -188,6 +189,39 @@ def append_signal(signal, plan):
     })
     _append_row(row)
     return trade_id
+
+
+def append_retracement_settle(symbol, trade_id, entry_price, fill_type, fill_lag_seconds):
+    """config.RETRACEMENT_ENTRY_ENABLED - a second, partial row for the
+    same trade_id, appended once a retracement-pending signal actually
+    settles into a real position (position_manager._finalize_retracement_
+    entry). Same "append-only, never mutate the original row" convention
+    append_outcome already uses (see JOURNAL_PATH's own module docstring)
+    - trade_id ties it back to append_signal's row via the join every
+    reader already does (journal_analysis.load_trades/signal_journal
+    consumers merge same-trade_id rows, later non-blank fields winning).
+
+    Real gap this closes (2026-08-25 investigation): the ORIGINAL signal
+    row's entry_price is the planned/trigger price at signal time, never
+    updated after a retracement fills at a different real price - every
+    downstream read of entry_price for a retracement-settled trade was
+    silently stale. This row supplies the REAL settled entry_price
+    (overwriting the stale one on any reader that merges by trade_id,
+    same mechanism DCA/outcome rows already rely on) plus the two new
+    diagnostic fields: whether the resting limit filled on its own
+    (`fill_type="LIMIT"`) or needed the market fallback for some/all of
+    the quantity (`fill_type="MARKET_FALLBACK"`), and how many seconds
+    elapsed between placing the resting order and this resolution -
+    previously only reconstructible (partially - roughly half the time)
+    by cross-referencing log lines after the fact."""
+    row = {field: "" for field in FIELDNAMES}
+    row["timestamp"] = time.time()
+    row["trade_id"] = trade_id or ""
+    row["symbol"] = symbol
+    row["entry_price"] = entry_price
+    row["retracement_fill_type"] = fill_type
+    row["retracement_fill_lag_seconds"] = fill_lag_seconds
+    _append_row(row)
 
 
 def append_outcome(

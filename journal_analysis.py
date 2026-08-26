@@ -95,6 +95,16 @@ WIN_OUTCOMES = {
     # win, same category as TP2_HIT/DCA_TP_HIT above, just for this
     # narrower pre-DCA single-TP lifecycle.
     "STATIC_TP_HIT", "SHADOW_STATIC_TP_HIT",
+    # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a native Binance
+    # TRAILING_STOP_MARKET placed dormant at DCA time (position_manager.
+    # _execute_dca) only ever activates once price first reaches
+    # breakeven, and only ever tightens further from there - a close via
+    # this order is at-or-better-than breakeven by construction, same
+    # "real win" category as TRAILING_STOP_PROFIT_HIT/PROFIT_PROTECTION_
+    # HIT above (position_manager.poll_live's DCA_ACTIVE trail_status
+    # check). Shadow mode never sets dca_trail_order_id (placement is
+    # live-only), so there is no SHADOW_ variant.
+    "DCA_BREAKEVEN_TRAIL_HIT",
 }
 
 

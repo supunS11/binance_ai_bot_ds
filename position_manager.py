@@ -81,6 +81,12 @@ RETRACEMENT_PENDING = "RETRACEMENT_PENDING"
 # place_stop_loss's own docstring for the mechanism.
 _DCA_SL_CLIENT_ALGO_ID_PREFIX = "dcaSL"
 _DCA_TP_CLIENT_ALGO_ID_PREFIX = "dcaTP"
+# config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - tags the dormant/active
+# native TRAILING_STOP_MARKET order _execute_dca places alongside the
+# real SL, so a restart's _adopt_position can recognize it and repopulate
+# position["dca_trail_order_id"] instead of losing track of it (same
+# mechanism as the two prefixes above).
+_DCA_TRAIL_CLIENT_ALGO_ID_PREFIX = "dcaTrail"
 
 
 def _order_type(order):
@@ -1034,6 +1040,14 @@ class PositionManager:
         tp2_order = next(
             (o for o in tp_orders if str(o.get("closePosition")).lower() == "true"), None
         )
+        trail_order = next(
+            (
+                o for o in open_orders
+                if _order_type(o) == "TRAILING_STOP_MARKET"
+                and str(o.get("clientAlgoId") or "").startswith(_DCA_TRAIL_CLIENT_ALGO_ID_PREFIX)
+            ),
+            None,
+        )
 
         def _trigger_price(order):
             if not order:
@@ -1048,6 +1062,13 @@ class PositionManager:
             )
 
             if recovered is not None:
+                # Same clientAlgoId-based disambiguation _execute_dca's own
+                # SL/TP tags already give this function - a resting dcaTrail
+                # order restarts as-is (Binance keeps it live across a bot
+                # restart), so recovery just has to notice it, not recreate it.
+                recovered["dca_trail_order_id"] = (
+                    exchange._accepted_order_id(trail_order) if trail_order else None
+                )
                 self.positions[symbol] = recovered
                 log_info(
                     f"{symbol} adopted existing open position | side={side} "
@@ -1415,6 +1436,26 @@ class PositionManager:
             position["sl_order_id"] = exchange._accepted_order_id(new_sl_order)
             position["sl_price"] = target_price
             log_info(f"{symbol} {reason} | SL moved to {target_price}")
+
+            # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a DIFFERENT
+            # mechanism (profit protection or structure trailing; DCA
+            # breakeven's own poll-based path never reaches here while a
+            # real trail order exists - see _is_dca_breakeven_candidate)
+            # has just taken over the SL. The native trailing stop's job
+            # is done - retire it here, centrally, so every caller of this
+            # function gets the cleanup for free and it can never later
+            # conflict with a THIRD replace. No-op (.get() is falsy) for
+            # every position that never had one.
+            if position.get("dca_trail_order_id"):
+                try:
+                    exchange.cancel_algo_order(symbol, position["dca_trail_order_id"])
+                except Exception as exc:
+                    log_warning(
+                        f"{symbol} dormant DCA trailing stop cleanup cancel "
+                        f"failed (likely already gone): {exc}"
+                    )
+                position["dca_trail_order_id"] = None
+
             return None, True
 
         except Exception as exc:
@@ -1980,8 +2021,39 @@ class PositionManager:
                     )
                 exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "DCA_SL_PLACEMENT_FAILED")
+
+            # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - see its own
+            # config.py comment for the full evidence/rationale. Placed
+            # strictly AFTER the real-SL try/except above has already
+            # succeeded (reaching this line proves it did, since every
+            # failure path there returns early) - deliberately its own,
+            # separate try/except so a failure here can NEVER be mistaken
+            # for the atomic "first real SL placement failed" case above
+            # and trigger an emergency market-close the position doesn't
+            # need. Best-effort/non-fatal, same treatment as the TP
+            # placement above: a rejection just means dca_trail_order_id
+            # stays None, and DCA_BREAKEVEN_ENABLED's existing poll-based
+            # mechanism (_is_dca_breakeven_candidate) remains the fallback
+            # exactly as it works today.
+            position["dca_trail_order_id"] = None
+
+            if config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED:
+                breakeven_price = risk_manager.compute_breakeven_price(plan["entry_price"], side)
+
+                try:
+                    trail_order = exchange.place_trailing_stop_loss(
+                        symbol, side, breakeven_price, config.DCA_BREAKEVEN_TRAILING_CALLBACK_RATE,
+                        client_algo_id=f"{_DCA_TRAIL_CLIENT_ALGO_ID_PREFIX}{int(time.time() * 1000)}",
+                    )
+                    position["dca_trail_order_id"] = exchange._accepted_order_id(trail_order)
+                except Exception as exc:
+                    log_warning(
+                        f"{symbol} dormant DCA-breakeven trailing stop failed "
+                        f"(falling back to poll-based breakeven move): {exc}"
+                    )
         else:
             position["tp_order_id"] = None
+            position["dca_trail_order_id"] = None
 
         position["entry_price"] = plan["entry_price"]
         position["sl_price"] = plan["sl_price"]
@@ -2201,8 +2273,23 @@ class PositionManager:
         swing, a DCA_ACTIVE position that merely recovers to breakeven has
         nothing protecting it. One-time arm, same shape as
         _is_dca_profit_protection_candidate - dca_breakeven_applied is set
-        the moment it fires and never re-checked again for this position."""
+        the moment it fires and never re-checked again for this position.
+
+        config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a resting
+        dca_trail_order_id means a native trailing stop is already doing
+        this job (or waiting to), server-side - this poll-based mechanism
+        becomes a pure fallback for whenever that flag is off or its
+        placement failed for this specific position. Without this check,
+        the poll-based path would detect the exact same "price reached
+        breakeven" condition, replace the SL with a FLAT stop, and (via
+        _replace_sl_order's own cleanup) cancel the trailing stop that was
+        just protecting the position better - racing its own fix back
+        down to the old behavior on literally the first tick both are
+        true."""
         if not config.DCA_BREAKEVEN_ENABLED or position.get("dca_breakeven_applied"):
+            return False
+
+        if position.get("dca_trail_order_id"):
             return False
 
         return position["stage"] == DCA_ACTIVE
@@ -2618,6 +2705,21 @@ class PositionManager:
             if tp_status == "FINISHED":
                 exchange.cancel_all_open_orders(symbol)
                 return self._close(symbol, "DCA_TP_HIT")
+
+            # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - the dormant/
+            # active native trailing stop itself fired. _status_or_missing
+            # already returns "MISSING" for a None/falsy id, so this is a
+            # safe no-op for every position without a real trail order -
+            # no extra guard needed. Only ever activates at or past
+            # breakeven and then only tightens further (see place_
+            # trailing_stop_loss), so a close via this order is always
+            # at-or-better-than breakeven by construction - see journal_
+            # analysis.py's WIN_OUTCOMES for why this is win-shaped.
+            trail_status = self._status_or_missing(symbol, position.get("dca_trail_order_id"))
+
+            if trail_status == "FINISHED":
+                exchange.cancel_all_open_orders(symbol)
+                return self._close(symbol, "DCA_BREAKEVEN_TRAIL_HIT")
 
             if position.get("profit_protection_applied"):
                 # Extra mark-price fetch, same "only pay for it when a
@@ -3624,23 +3726,29 @@ class PositionManager:
         the market fallback into one quantity-weighted entry price, the
         same blending math risk_manager.build_dca_plan already uses for a
         DCA fill - a partial fill isn't thrown away just because the
-        remainder timed out. Returns (total_quantity, entry_price, error) -
-        error is None on success; on a market-order failure the resting
-        limit has already been cancelled by the caller, so any real
-        partial fill IS on the exchange right now, unprotected, and the
-        caller must retry resolution next poll rather than give up."""
+        remainder timed out. Returns (total_quantity, entry_price,
+        used_fallback, error) - error is None on success; on a
+        market-order failure the resting limit has already been
+        cancelled by the caller, so any real partial fill IS on the
+        exchange right now, unprotected, and the caller must retry
+        resolution next poll rather than give up. `used_fallback` (
+        config.DCA_RESTING_ORDER_ENABLED's sibling observability need,
+        see signal_journal.append_retracement_settle) is True whenever
+        this placed (or tried to place) a real market order for any
+        remainder - False only for the genuine no-op "already fully
+        filled by the resting limit alone" case."""
         plan = position["plan"]
         symbol = position["symbol"]
         side = position["side"]
         remainder = round(plan["quantity"] - filled_quantity, 8)
 
         if remainder <= 0:
-            return filled_quantity, filled_avg_price, None
+            return filled_quantity, filled_avg_price, False, None
 
         try:
             market_order = exchange.place_market_order(symbol, side, remainder)
         except Exception as exc:
-            return None, None, f"market fallback order error: {exc}"
+            return None, None, True, f"market fallback order error: {exc}"
 
         market_price = exchange.resolve_market_fill_price(symbol, market_order, plan["entry_price"])
         total_quantity = round(filled_quantity + remainder, 8)
@@ -3652,9 +3760,9 @@ class PositionManager:
         else:
             entry_price = market_price
 
-        return total_quantity, entry_price, None
+        return total_quantity, entry_price, True, None
 
-    def _finalize_retracement_entry(self, position, entry_price, quantity):
+    def _finalize_retracement_entry(self, position, entry_price, quantity, fill_type):
         """Common tail once a final entry_price/quantity is known - a
         genuine full limit fill, a blended limit+market-fallback fill, or
         (shadow mode) a simulated touch/fallback. Builds a settled plan
@@ -3678,7 +3786,14 @@ class PositionManager:
         placement failed outright (closed already, at market - see
         execution.place_protection_orders); None otherwise, including the
         ordinary case where this settled into DCA_PENDING/TP1_PENDING,
-        which is not itself a closed-trade outcome."""
+        which is not itself a closed-trade outcome.
+
+        `fill_type` ("LIMIT" or "MARKET_FALLBACK", see poll_retracement_
+        pending/poll_shadow_retracement_pending) is journaled here
+        alongside the real fill lag - see signal_journal.
+        append_retracement_settle's own docstring for why this also
+        corrects the original signal row's stale (pre-retracement)
+        entry_price, not just adds new fields."""
         plan = position["plan"]
         symbol = position["symbol"]
         side = position["side"]
@@ -3695,6 +3810,15 @@ class PositionManager:
 
         if not plan.get("single_tp"):
             settled_plan["tp1_price"] = _resolve_tp1_price(plan, entry_price, side)
+
+        # config.RETRACEMENT_ENTRY_ENABLED observability (2026-08-25) -
+        # journaled here (entry_price/quantity/fill_type all already
+        # known) rather than after protection orders, so a SL-placement
+        # failure below still gets this recorded instead of losing it.
+        fill_lag_seconds = round(time.time() - position["limit_placed_at"], 1)
+        signal_journal.append_retracement_settle(
+            symbol, trade_id, entry_price, fill_type, fill_lag_seconds
+        )
 
         if plan.get("single_tp"):
             settled_plan["tp1_quantity"] = None
@@ -3813,7 +3937,7 @@ class PositionManager:
         # then finalize with the real (possibly blended) quantity/price -
         # guarantees this signal still becomes a position exactly like a
         # direct entry would have.
-        total_quantity, entry_price, error = self._resolve_retracement_market_fallback(
+        total_quantity, entry_price, used_fallback, error = self._resolve_retracement_market_fallback(
             position, filled_quantity, filled_avg_price
         )
 
@@ -3821,7 +3945,8 @@ class PositionManager:
             log_error(f"{symbol} {error} - leaving unresolved for the next poll")
             return None
 
-        return self._finalize_retracement_entry(position, entry_price, total_quantity)
+        fill_type = "MARKET_FALLBACK" if used_fallback else "LIMIT"
+        return self._finalize_retracement_entry(position, entry_price, total_quantity, fill_type)
 
     def _close_shadow_retracement_invalidated(self, position):
         symbol = position["symbol"]
@@ -3866,7 +3991,9 @@ class PositionManager:
             return self._close_shadow_retracement_invalidated(position)
 
         if touches_retracement:
-            return self._finalize_retracement_entry(position, retracement_price, plan["quantity"])
+            return self._finalize_retracement_entry(
+                position, retracement_price, plan["quantity"], "LIMIT"
+            )
 
         expired = (
             time.time() - position["limit_placed_at"]
@@ -3877,6 +4004,8 @@ class PositionManager:
                 f"{symbol} [SHADOW] retracement entry expired unfilled - "
                 f"market fallback @ {latest_candle['close']}"
             )
-            return self._finalize_retracement_entry(position, latest_candle["close"], plan["quantity"])
+            return self._finalize_retracement_entry(
+                position, latest_candle["close"], plan["quantity"], "MARKET_FALLBACK"
+            )
 
         return None

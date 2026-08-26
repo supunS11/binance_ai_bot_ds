@@ -1503,6 +1503,62 @@ DCA_BREAKEVEN_CONFIRMATION_ENABLED = env_bool("DCA_BREAKEVEN_CONFIRMATION_ENABLE
 DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED = env_bool(
     "DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED", "False"
 )
+# Real gap in DCA_BREAKEVEN_ENABLED's own mechanism, not what it protects
+# against: it's a poll-and-replace design (detect price reached breakeven,
+# cancel the old SL, place a new one at breakeven) - two real sources of
+# delay (POSITION_POLL_INTERVAL_SECONDS=10s detection lag, then the
+# cancel/place round trip itself). Real incident (2026-08-26, MEUSDT SELL):
+# price recovered to breakeven, the bot detected it and tried to move the
+# SL there, but by the time the replacement order reached the exchange
+# price had already reversed back past breakeven again - Binance rejected
+# it with -2021 ("would immediately trigger"), and _replace_sl_order's
+# existing fallback closed the position at market anyway. grep of the VPS
+# log confirms this isn't a one-off: 5 DCA-breakeven races, 2 TP1-breakeven
+# races, 1 profit-protection race, all within an 8-day window (see
+# _dca_breakeven_price_reached_in_range's own docstring, which already
+# named this exact race before this flag existed).
+#
+# When on: the moment DCA fires, a real Binance TRAILING_STOP_MARKET order
+# is placed alongside the existing wide hard SL, activatePrice=breakeven_
+# price, resting dormant. Binance itself arms it server-side the instant
+# price reaches breakeven and trails it from there - zero bot polling,
+# zero cancel/replace round trip, so the specific MEUSDT race can't repeat
+# for a position on this path. It also improves on the OLD mechanism's
+# flat stop: once armed, it keeps tightening as price extends further
+# favorably instead of sitting flat at breakeven waiting for
+# PROFIT_PROTECTION_ENABLED's much deeper threshold or STRUCTURE_STOP_
+# MANAGEMENT_ENABLED's next confirmed swing to catch up.
+#
+# Real, unverified assumption (operator-confirmed 2026-08-26, ship it
+# anyway): this requires a closePosition=true STOP_MARKET and a
+# closePosition=true TRAILING_STOP_MARKET to coexist simultaneously on the
+# same symbol/side. This project has only ever proven Binance allows
+# DIFFERENT-type closePosition orders together (SL + TP, already this
+# bot's normal shape - see place_stop_loss/place_take_profit_full) and
+# REJECTS same-type duplicates (-4130, a real 2026-08-08 incident - see
+# execution.py's own -4130 handling). Whether STOP_MARKET + TRAILING_
+# STOP_MARKET specifically coexists has never been tested here. The
+# placement is deliberately best-effort/non-fatal (same treatment as
+# TP1/TP2 placement failures in _execute_dca already) - a rejection just
+# means the position keeps its existing wide SL exactly as today, nothing
+# else breaks, and the very first live DCA-breakeven event under this flag
+# is the real-world answer. DCA_BREAKEVEN_ENABLED's own poll-based
+# mechanism stays fully intact as the fallback for whenever this either
+# isn't enabled or its placement failed for this specific position (see
+# _is_dca_breakeven_candidate). Default False: new, unvalidated mechanism
+# touching real order placement, on an unverified exchange-behavior
+# assumption - same "earns a live default only after real data" rule as
+# every other unvalidated mechanism here.
+DCA_BREAKEVEN_TRAILING_STOP_ENABLED = env_bool("DCA_BREAKEVEN_TRAILING_STOP_ENABLED", "False")
+# Binance's real minimum is 0.1 (python-binance's own futures_create_algo_
+# order docstring: "min 0.1, max 10" for callbackRate). 0.2 is a small
+# safety margin above that floor, not outcome-validated - a starting
+# value, same convention as RETRACEMENT_ENTRY_OFFSET_R etc. Deliberately
+# capped well below Binance's own max of 10 by _normalize_callback_rate
+# (exchange.py) - a callback anywhere near that wide would give back far
+# more profit than the flat breakeven stop it's replacing was ever
+# designed to risk.
+DCA_BREAKEVEN_TRAILING_CALLBACK_RATE = env_float("DCA_BREAKEVEN_TRAILING_CALLBACK_RATE", 0.2)
 
 # =========================
 # EXECUTION

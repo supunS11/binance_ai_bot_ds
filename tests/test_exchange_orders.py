@@ -79,6 +79,60 @@ class OrderParameterTests(unittest.TestCase):
         _, kwargs = mock_place.call_args
         self.assertEqual(kwargs["clientAlgoId"], "dcaTP123")
 
+    def test_place_trailing_stop_loss_sends_activate_price_and_callback_rate(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a real TRAILING_
+        # STOP_MARKET, closePosition=true, activatePrice/callbackRate not
+        # triggerPrice, mirroring place_stop_loss's own coverage above.
+        with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
+            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 98.0, 0.2)
+
+        _, kwargs = mock_place.call_args
+        self.assertEqual(kwargs["type"], "TRAILING_STOP_MARKET")
+        self.assertEqual(kwargs["activatePrice"], 98.0)
+        self.assertEqual(kwargs["callbackRate"], 0.2)
+        self.assertNotIn("triggerPrice", kwargs)
+        self.assertEqual(kwargs["closePosition"], "true")
+
+    def test_place_trailing_stop_loss_without_client_algo_id_omits_the_key(self):
+        with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
+            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 98.0, 0.2)
+
+        _, kwargs = mock_place.call_args
+        self.assertNotIn("clientAlgoId", kwargs)
+
+    def test_place_trailing_stop_loss_with_client_algo_id_passes_it_through(self):
+        with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
+             patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
+            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 98.0, 0.2, client_algo_id="dcaTrail123")
+
+        _, kwargs = mock_place.call_args
+        self.assertEqual(kwargs["clientAlgoId"], "dcaTrail123")
+
+    def test_place_trailing_stop_loss_rejects_invalid_activate_price(self):
+        with patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: 0.0):
+            with self.assertRaises(ValueError):
+                exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 0.0, 0.2)
+
+
+class NormalizeCallbackRateTests(unittest.TestCase):
+    """config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - Binance requires
+    0.1-10 for callbackRate; this project deliberately caps the top end
+    at 5 (see exchange._normalize_callback_rate's own docstring)."""
+
+    def test_clamps_below_binance_minimum_up_to_point_one(self):
+        self.assertEqual(exchange._normalize_callback_rate(0.0), 0.1)
+
+    def test_clamps_above_project_ceiling_down_to_five(self):
+        self.assertEqual(exchange._normalize_callback_rate(10.0), 5.0)
+
+    def test_passes_through_mid_range_value_rounded_to_one_decimal(self):
+        self.assertEqual(exchange._normalize_callback_rate(0.234), 0.2)
+
 
 class FormatPriceForApiTests(unittest.TestCase):
     """Real bug found live (NEIROUSDT, 2026-08-10, 100% reproducible):

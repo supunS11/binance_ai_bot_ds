@@ -117,6 +117,15 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ja.classify("PROFIT_PROTECTION_HIT"), "WIN")
         self.assertEqual(ja.classify("SHADOW_PROFIT_PROTECTION_HIT"), "WIN")
 
+    def test_dca_breakeven_trail_hit_is_win(self):
+        # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a native trailing
+        # stop only ever activates at or past breakeven and only tightens
+        # further, so a close via this order is at-or-better-than
+        # breakeven by construction, same category as TRAILING_STOP_
+        # PROFIT_HIT/PROFIT_PROTECTION_HIT above. Live-only (shadow never
+        # sets dca_trail_order_id), so there is no SHADOW_ variant.
+        self.assertEqual(ja.classify("DCA_BREAKEVEN_TRAIL_HIT"), "WIN")
+
     def test_unknown_outcome_is_unknown(self):
         self.assertEqual(ja.classify("SOMETHING_ELSE"), "UNKNOWN")
 
