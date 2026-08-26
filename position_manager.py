@@ -689,7 +689,26 @@ class PositionManager:
         tagged order with NO matching tracked DCA_PENDING position
         (state lost/corrupt, or genuinely stale) still falls through to
         the same cancel-and-re-evaluate treatment as everything else -
-        the exception is narrow, not a blanket exemption for the tag."""
+        the exception is narrow, not a blanket exemption for the tag.
+
+        Real bug found live (2026-08-26): the match condition used to
+        require `not position.get("dca_order_id")` - but reconcile_on_
+        startup's OWN preferred path (_try_restore_from_saved_state)
+        restores the saved position dict verbatim, which already carries
+        the real dca_order_id from before the restart. That's the common
+        case for a DCA_PENDING position with a real resting order, not a
+        rare one - so the "preserve" branch was failing on exactly the
+        scenario this whole exception exists for, and silently cancelling
+        a live resting DCA order on every restart. Confirmed live on
+        MEUSDT/UBUSDT: the stale (now-cancelled) dca_order_id then also
+        blocked poll_live's own candle-range fallback (an `elif`, only
+        reached when dca_order_id is falsy) - DCA_PENDING has no real SL
+        by design (register_dca_pending's own docstring), so both
+        positions were left with neither a working DCA trigger nor a
+        stop-loss until this fix. Now accepts a MATCHING dca_order_id
+        too (confirms what saved-state already restored, doesn't need to
+        "recover" anything) - only a genuine mismatch (a different,
+        already-tracked order_id) still falls through to cancel."""
         if (
             not config.LIMIT_ENTRY_MODE_ENABLED
             and not config.RETRACEMENT_ENTRY_ENABLED
@@ -718,7 +737,10 @@ class PositionManager:
                 if (
                     position
                     and position.get("stage") == DCA_PENDING
-                    and not position.get("dca_order_id")
+                    and (
+                        not position.get("dca_order_id")
+                        or position.get("dca_order_id") == order_id
+                    )
                 ):
                     position["dca_order_id"] = order_id
                     preserved += 1
@@ -1785,9 +1807,7 @@ class PositionManager:
         position with no dca_order_id). A plain order, not algo, so
         exchange.get_order_status is the right primitive - same one
         poll_retracement_pending already uses, and the one that reports
-        partial fills via executed_qty. That function never raises - a
-        transient failure or a genuinely gone order both come back with
-        executed_qty=0.0, handled the same as "still resting" below.
+        partial fills via executed_qty.
 
         Returns (fired, outcome): `fired` is False when nothing has
         changed yet (still resting, transient lookup failure, or the
@@ -1806,6 +1826,33 @@ class PositionManager:
         order = exchange.get_order_status(symbol, order_id)
 
         if order["executed_qty"] <= 0:
+            # Real bug found live (2026-08-26, MEUSDT/UBUSDT, root-caused
+            # to reconcile_pending_entries_on_startup wrongly cancelling a
+            # real resting DCA order on restart - now fixed there too):
+            # a genuinely gone order used to read identically to "still
+            # resting" here forever, since only executed_qty was ever
+            # checked, never the order's own status. That silently
+            # disabled BOTH this path (nothing left to ever fire) AND
+            # poll_live's candle-range fallback (an `elif`, only reached
+            # once dca_order_id is falsy) - DCA_PENDING carries no real
+            # SL by design, so an affected position was left with
+            # neither. Ground-truth self-heal: a terminal, not-going-to-
+            # fill status clears dca_order_id so the very next poll falls
+            # through to the fallback instead of waiting on a dead order
+            # forever. "UNKNOWN" (a transient lookup failure - see
+            # exchange.get_order_status's own docstring) deliberately
+            # stays conservative here, same as "NEW"/"PARTIALLY_FILLED"
+            # with nothing filled yet - only a real terminal status counts
+            # as "gone", not a momentary API hiccup.
+            if order["status"] in ("CANCELED", "EXPIRED", "REJECTED", "NOT_FOUND"):
+                log_warning(
+                    f"{symbol} resting DCA order {order_id} is gone "
+                    f"(status={order['status']}) but was still tracked - "
+                    f"clearing dca_order_id so the candle-range fallback "
+                    f"takes over on the next poll"
+                )
+                position["dca_order_id"] = None
+
             return False, None
 
         outcome = self._execute_dca(
