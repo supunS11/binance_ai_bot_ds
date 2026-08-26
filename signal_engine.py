@@ -12,6 +12,7 @@ looking at what already closed.
 "BUY"/"SELL") and `reason` - callers that want to see *why* a candidate
 was rejected (for the shadow journal) get that for free.
 """
+import absorption
 import config
 import cvd_divergence
 import liquidity_sweep
@@ -145,6 +146,33 @@ def evaluate(
             divergence_swings, cvd_snapshot.get("history") or []
         )
 
+        # config.CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED - see its own
+        # config.py comment. Read-only: divergence itself already reports
+        # a CONFIRMED result or None - this exposes every real structural
+        # candidate regardless of outcome, so a future recalibration is
+        # evidence-based (2026-08-26 finding: CVD_DIVERGENCE has never
+        # produced a single trade - same "log real values before
+        # guessing" pattern already proven on LIQUIDATION_SWEEP_CONFIRMED
+        # below). Fires at most twice per symbol per eval tick (once per
+        # structural direction that actually has a candidate), never
+        # touches `divergence` or any returned field.
+        if config.CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED:
+            for candidate in cvd_divergence.diagnostic_candidates(
+                divergence_swings, cvd_snapshot.get("history") or []
+            ):
+                confirmed = (
+                    divergence is not None
+                    and divergence["direction"] == candidate["structural_direction"]
+                )
+                log_info(
+                    f"CVD_DIVERGENCE_DIAGNOSTIC symbol={symbol} "
+                    f"structural_direction={candidate['structural_direction']} "
+                    f"cvd_data_found={candidate['cvd_data_found']} "
+                    f"delta_usdt={candidate['delta_usdt']} "
+                    f"threshold={config.CVD_DIVERGENCE_MIN_DELTA_USDT} "
+                    f"confirmed={confirmed}"
+                )
+
     # config.ORDER_BLOCK_RETEST_TRIGGER_ENABLED - a sixth, alternative
     # entry trigger: a fresh rejection wick back into a previously-formed,
     # unmitigated order block (see market_structure.find_order_block_retest).
@@ -165,6 +193,26 @@ def evaluate(
         oi_divergence_result = oi_divergence.detect_divergence(
             oi_divergence_swings, (oi_snapshot or {}).get("history") or []
         )
+
+        # config.OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED - see its own
+        # config.py comment, same shape/motivation as the CVD_DIVERGENCE
+        # diagnostic above.
+        if config.OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED:
+            for candidate in oi_divergence.diagnostic_candidates(
+                oi_divergence_swings, (oi_snapshot or {}).get("history") or []
+            ):
+                confirmed = (
+                    oi_divergence_result is not None
+                    and oi_divergence_result["direction"] == candidate["structural_direction"]
+                )
+                log_info(
+                    f"OI_DIVERGENCE_DIAGNOSTIC symbol={symbol} "
+                    f"structural_direction={candidate['structural_direction']} "
+                    f"oi_data_found={candidate['oi_data_found']} "
+                    f"delta_pct={candidate['delta_pct']} "
+                    f"threshold={config.OI_DIVERGENCE_MIN_DELTA_PCT} "
+                    f"confirmed={confirmed}"
+                )
 
     # config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED - an eighth,
     # alternative entry trigger: a plain LIQUIDITY_SWEEP additionally
@@ -243,6 +291,20 @@ def evaluate(
     ):
         btc_correlation = market_structure.price_correlation(ltf_candles, btc_candles)
         btc_return = market_structure.price_return(btc_candles)
+
+    # config.ABSORPTION_TRACKING_ENABLED - order-book absorption
+    # informational field (see absorption.py's own docstring). Direction-
+    # independent (like btc_return above) - only the alignment-with-this-
+    # candidate's-own-side comparison varies per direction, computed
+    # inside _evaluate_direction below. depth_snapshot may not carry
+    # "price_change_pct_1m" at all when unavailable/stale - .get() returns
+    # None in that case, same fail-open convention as depth_imbalance.
+    absorption_signal = None
+
+    if config.ABSORPTION_TRACKING_ENABLED:
+        absorption_signal = absorption.compute(
+            cvd_snapshot, depth_snapshot.get("price_change_pct_1m")
+        )
 
     # Candidate list - same detection conditions and same priority order
     # as before (STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP >
@@ -809,6 +871,14 @@ def evaluate(
         if btc_return is not None:
             btc_aligned = (btc_return > 0) if side == "BUY" else (btc_return < 0)
 
+        # config.ABSORPTION_TRACKING_ENABLED - informational only, NOT a
+        # gate, same treatment as btc_aligned above. absorption_signal
+        # itself is direction-independent (hoisted above); this is just
+        # whether it happens to agree with THIS candidate's own side.
+        absorption_aligned = (
+            absorption_signal == side if absorption_signal is not None else None
+        )
+
         # Funding rate: informational only, NOT a gate - see
         # config.FUNDING_RATE_ENABLED. Strongly positive means longs are
         # paying heavily to stay long (a crowded trade, more prone to a
@@ -908,6 +978,8 @@ def evaluate(
             "efficiency_favorable": efficiency_favorable,
             "btc_correlation": btc_correlation,
             "btc_aligned": btc_aligned,
+            "absorption_signal": absorption_signal,
+            "absorption_aligned": absorption_aligned,
             "funding_rate": funding_rate_,
             "funding_favorable": funding_favorable,
             # long_short_ratio/long_short_favorable are NOT set here - the

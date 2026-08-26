@@ -151,6 +151,51 @@ ORDER_FLOW_MIN_NOTIONAL_USDT = env_float("ORDER_FLOW_MIN_NOTIONAL_USDT", 5000)
 ORDER_FLOW_DIVERGENCE_LOOKBACK = env_int("ORDER_FLOW_DIVERGENCE_LOOKBACK", 20)
 
 # =========================
+# ORDER-BOOK ABSORPTION (informational)
+# =========================
+# 2026-08-26 signal-engine "next level" audit: real, one-sided aggressive
+# volume (order_flow.CVDEngine's existing ratio_1m/notional_1m) that
+# didn't move price (orderbook.DepthImbalanceEngine's short mid-price
+# history, built alongside this) - the one thing neither existing
+# order-flow gate measures. SIGNAL_MIN_CVD_SCORE is a recent-window
+# aggressor LEAN, blind to how much price actually moved for that volume;
+# SIGNAL_MIN_DEPTH_IMBALANCE is a snapshot of RESTING size, blind to
+# whether real flow is even testing it right now (see absorption.py's own
+# docstring). Uses data already flowing for both of those - no new
+# market-data subscription. Brand new, zero trade history exists on it by
+# construction - informational/journaled only, same "evidence before
+# gate" convention as ema_aligned/btc_aligned/funding_favorable. Default
+# True (unlike CVD_DIVERGENCE_TRIGGER_ENABLED's own "brand new, default
+# OFF" convention): this is a read-only computation, never changes
+# entry/exit behavior, same treatment as those informational fields' own
+# ENABLED defaults.
+ABSORPTION_TRACKING_ENABLED = env_bool("ABSORPTION_TRACKING_ENABLED", "True")
+# How far back orderbook.DepthImbalanceEngine retains its own short
+# mid-price history to answer "how much did price actually move" - must
+# comfortably exceed ABSORPTION_WINDOW_SECONDS below so a real reference
+# sample already exists once the engine's been running a while.
+ABSORPTION_PRICE_HISTORY_SECONDS = env_int("ABSORPTION_PRICE_HISTORY_SECONDS", 90)
+# The lookback window absorption.compute() measures price movement over -
+# deliberately matches CVDEngine.snapshot()'s own first window (60s,
+# "ratio_1m"/"notional_1m") so the aggressor-volume reading and the
+# price-movement reading always describe the exact same interval, not two
+# different timeframes compared as if they were one.
+ABSORPTION_WINDOW_SECONDS = env_int("ABSORPTION_WINDOW_SECONDS", 60)
+# How one-sided the 60s aggressor flow (cvd_snapshot's ratio_1m, -1..1)
+# has to be before a reading is trusted at all - same purpose as
+# SIGNAL_MIN_CVD_SCORE, kept as its own knob since this is a different
+# question (a genuinely lopsided window worth explaining away, not merely
+# "confirms this trade's direction"). Starting value, not yet calibrated
+# against real trade data - zero trade history exists on this field by
+# construction.
+ABSORPTION_MIN_CVD_RATIO = env_float("ABSORPTION_MIN_CVD_RATIO", 0.5)
+# How little the mid-price is allowed to have actually moved (%, absolute)
+# over that same window for the lopsided flow above to count as
+# "absorbed" rather than merely "resolved a bit slower than usual".
+# Starting value, not yet calibrated against real trade data.
+ABSORPTION_MAX_PRICE_MOVE_PCT = env_float("ABSORPTION_MAX_PRICE_MOVE_PCT", 0.05)
+
+# =========================
 # MARKET STRUCTURE (ICT/SMC)
 # =========================
 SWING_LEFT = env_int("SWING_LEFT", 2)
@@ -790,6 +835,25 @@ CVD_DIVERGENCE_TRIGGER_ENABLED = env_bool("CVD_DIVERGENCE_TRIGGER_ENABLED", "Fal
 # CVD reading at all). Starting value, not yet calibrated against real
 # trade data.
 CVD_DIVERGENCE_MIN_DELTA_USDT = env_float("CVD_DIVERGENCE_MIN_DELTA_USDT", 5000)
+# Temporary, read-only diagnostic (2026-08-26 signal-engine "next level"
+# audit follow-up: CVD_DIVERGENCE has never produced a single trade,
+# still true a full day and 12 more resolved trades after the 2026-08-25
+# audit first flagged it). Unlike LIQUIDATION_SWEEP_CONFIRMED's own
+# silence (see LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED below - that
+# one turned out to be a real data-source gap, not a threshold problem),
+# CVD's underlying data source is confirmed healthy elsewhere: cvd_score
+# gates every trade successfully off the exact same feed. So this logs
+# the REAL swing-to-swing CVD delta at every structural candidate (price
+# making a new extreme), whether or not it clears CVD_DIVERGENCE_MIN_
+# DELTA_USDT and whether or not the CVD-history lookup even found data at
+# both swing points - so a future recalibration is evidence-based rather
+# than a guess. Never gates anything, never changes any returned field -
+# default True purely because it's observability-only, same convention as
+# LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED; turn off once enough
+# evidence has accumulated to decide.
+CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED = env_bool(
+    "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", "True"
+)
 # Sixth entry trigger: a fresh rejection wick back into a previously-
 # formed, UNMITIGATED order block (market_structure.find_order_block_
 # retest) - the order-block counterpart to OB_FVG_RETEST_TRIGGER_ENABLED
@@ -830,6 +894,19 @@ OI_DIVERGENCE_MIN_DELTA_PCT = env_float("OI_DIVERGENCE_MIN_DELTA_PCT", 5.0)
 # distinct trigger from CVD_DIVERGENCE and may need a different staleness
 # tolerance once real data exists for both.
 OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES = env_int("OI_DIVERGENCE_TRIGGER_MAX_AGE_CANDLES", 20)
+# Temporary, read-only diagnostic - same shape and same motivation as
+# CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED above: OI_DIVERGENCE has never
+# produced a single trade either, and OI's underlying data source is also
+# confirmed healthy elsewhere (oi_rising, fed by the same OI history, is
+# the single strongest gate in the whole system - re-confirmed on 117+
+# resolved trades). Logs the real swing-to-swing OI delta (%) at every
+# structural candidate, whether or not it clears OI_DIVERGENCE_MIN_
+# DELTA_PCT and whether or not the OI-history lookup found a sample at
+# both swing points. Never gates anything - default True, observability-
+# only, same convention as its CVD sibling.
+OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED = env_bool(
+    "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", "True"
+)
 # Eighth entry trigger: promotes a plain LIQUIDITY_SWEEP into a stricter,
 # distinct trigger by additionally requiring a REAL clustered forced-
 # liquidation event backing it (liquidity_sweep.detect_liquidation_

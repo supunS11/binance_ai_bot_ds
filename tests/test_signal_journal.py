@@ -137,6 +137,18 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["funding_rate"], "0.0002")
         self.assertEqual(rows[0]["long_short_ratio"], "1.8")
 
+    def test_append_signal_writes_absorption_fields(self):
+        # config.ABSORPTION_TRACKING_ENABLED - real absorption.py logic
+        # covered in test_absorption.py/test_signal_engine.py; this only
+        # proves the journal writes it through, same as btc_aligned above.
+        signal_journal.append_signal(
+            _signal(absorption_signal="BUY", absorption_aligned=True), _plan(),
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["absorption_signal"], "BUY")
+        self.assertEqual(rows[0]["absorption_aligned"], "True")
+
     def test_append_signal_writes_the_three_favorable_boolean_fields(self):
         signal_journal.append_signal(
             _signal(

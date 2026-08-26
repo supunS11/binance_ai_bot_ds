@@ -109,3 +109,53 @@ def detect_divergence(swings, oi_history, min_delta_pct=None):
         return None
 
     return max(candidates, key=lambda c: c["index"])
+
+
+def diagnostic_candidates(swings, oi_history):
+    """Read-only diagnostic - same shape and motivation as cvd_divergence.
+    diagnostic_candidates (see config.OI_DIVERGENCE_DIAGNOSTIC_LOGGING_
+    ENABLED's own comment): detect_divergence only ever reports a
+    CONFIRMED divergence, so it can't explain its own silence on its own.
+    Exposes every real structural candidate (price making a new extreme)
+    regardless of whether OI data was found at both swing points or
+    whether the delta clears min_delta_pct. Kept separate from
+    detect_divergence so the real trigger path is untouched; mirrors its
+    comparison logic exactly.
+
+    Returns a list of 0-2 dicts: {"structural_direction": "BEARISH"/
+    "BULLISH", "oi_data_found": bool, "delta_pct": float or None}."""
+    if not swings or not oi_history:
+        return []
+
+    highs = sorted((s for s in swings if s.kind == "HIGH"), key=lambda s: s.index)
+    lows = sorted((s for s in swings if s.kind == "LOW"), key=lambda s: s.index)
+
+    out = []
+
+    if len(highs) >= 2:
+        prev_high, last_high = highs[-2], highs[-1]
+
+        if last_high.price > prev_high.price:
+            prev_oi = _oi_at_or_before(oi_history, prev_high.open_time / 1000)
+            last_oi = _oi_at_or_before(oi_history, last_high.open_time / 1000)
+            data_found = prev_oi is not None and last_oi is not None and prev_oi > 0
+            out.append({
+                "structural_direction": "BEARISH",
+                "oi_data_found": data_found,
+                "delta_pct": ((prev_oi - last_oi) / prev_oi * 100) if data_found else None,
+            })
+
+    if len(lows) >= 2:
+        prev_low, last_low = lows[-2], lows[-1]
+
+        if last_low.price < prev_low.price:
+            prev_oi = _oi_at_or_before(oi_history, prev_low.open_time / 1000)
+            last_oi = _oi_at_or_before(oi_history, last_low.open_time / 1000)
+            data_found = prev_oi is not None and last_oi is not None and prev_oi > 0
+            out.append({
+                "structural_direction": "BULLISH",
+                "oi_data_found": data_found,
+                "delta_pct": ((prev_oi - last_oi) / prev_oi * 100) if data_found else None,
+            })
+
+    return out

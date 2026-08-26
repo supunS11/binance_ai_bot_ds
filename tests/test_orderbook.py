@@ -93,5 +93,65 @@ class DepthImbalanceEngineTests(unittest.TestCase):
         self.assertTrue(engine.snapshot("ETHUSDT", now=1000)["available"])
 
 
+class PriceChangePctTests(unittest.TestCase):
+    """config.ABSORPTION_TRACKING_ENABLED - the short rolling mid-price
+    history that backs absorption.compute()'s "how much did price
+    actually move" input."""
+
+    def test_single_sample_has_no_reference_point_yet(self):
+        engine = DepthImbalanceEngine()
+        engine.record_depth("BTCUSDT", bids=[["100", "1"]], asks=[["101", "1"]], timestamp=1000)
+
+        with patch.object(config, "ABSORPTION_WINDOW_SECONDS", 60):
+            snapshot = engine.snapshot("BTCUSDT", now=1000)
+
+        self.assertIsNone(snapshot["price_change_pct_1m"])
+
+    def test_real_price_move_over_the_window_is_reported(self):
+        engine = DepthImbalanceEngine()
+        # mid = 100 at t=0
+        engine.record_depth("BTCUSDT", bids=[["99.5", "1"]], asks=[["100.5", "1"]], timestamp=1000)
+        # mid = 101 sixty seconds later - a real +1% move
+        engine.record_depth("BTCUSDT", bids=[["100.5", "1"]], asks=[["101.5", "1"]], timestamp=1060)
+
+        with patch.object(config, "ABSORPTION_WINDOW_SECONDS", 60), \
+             patch.object(config, "ABSORPTION_PRICE_HISTORY_SECONDS", 90):
+            snapshot = engine.snapshot("BTCUSDT", now=1060)
+
+        self.assertAlmostEqual(snapshot["price_change_pct_1m"], 1.0, places=4)
+
+    def test_not_enough_history_yet_within_the_window_is_none(self):
+        engine = DepthImbalanceEngine()
+        engine.record_depth("BTCUSDT", bids=[["99.5", "1"]], asks=[["100.5", "1"]], timestamp=1000)
+        # Only 30s of history - shorter than the 60s window being asked for.
+        engine.record_depth("BTCUSDT", bids=[["100.5", "1"]], asks=[["101.5", "1"]], timestamp=1030)
+
+        with patch.object(config, "ABSORPTION_WINDOW_SECONDS", 60), \
+             patch.object(config, "ABSORPTION_PRICE_HISTORY_SECONDS", 90):
+            snapshot = engine.snapshot("BTCUSDT", now=1030)
+
+        self.assertIsNone(snapshot["price_change_pct_1m"])
+
+    def test_samples_older_than_the_retention_window_are_pruned(self):
+        engine = DepthImbalanceEngine()
+        engine.record_depth("BTCUSDT", bids=[["99.5", "1"]], asks=[["100.5", "1"]], timestamp=1000)
+
+        with patch.object(config, "ABSORPTION_PRICE_HISTORY_SECONDS", 10):
+            # 100s later - way past the 10s retention window, so the
+            # first sample should have been pruned already.
+            engine.record_depth(
+                "BTCUSDT", bids=[["100.5", "1"]], asks=[["101.5", "1"]], timestamp=1100
+            )
+
+        state = engine._book["BTCUSDT"]
+        self.assertEqual(len(state["mid_price_history"]), 1)
+
+    def test_missing_symbol_has_no_price_change_key_error(self):
+        engine = DepthImbalanceEngine()
+        snapshot = engine.snapshot("NOPE")
+
+        self.assertNotIn("price_change_pct_1m", snapshot)
+
+
 if __name__ == "__main__":
     unittest.main()

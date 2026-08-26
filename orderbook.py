@@ -6,6 +6,7 @@ module's fixed symbol list.
 """
 import threading
 import time
+from collections import deque
 
 import config
 
@@ -37,6 +38,14 @@ class DepthImbalanceEngine:
                 "updated_at": 0.0,
                 "best_bid": 0.0,
                 "best_ask": 0.0,
+                # config.ABSORPTION_TRACKING_ENABLED - a short rolling
+                # (timestamp, mid_price) series, pruned by ABSORPTION_
+                # PRICE_HISTORY_SECONDS, independent of imbalance's own EMA
+                # smoothing above. Nothing else in this codebase retains a
+                # sub-candle price history - absorption.py needs "how much
+                # did price actually move in the last ~60s", which candles
+                # (1h) are far too coarse for.
+                "mid_price_history": deque(),
             }
             self._book[symbol] = state
 
@@ -95,7 +104,48 @@ class DepthImbalanceEngine:
             state["samples"] += 1
             state["best_bid"] = best_bid
             state["best_ask"] = best_ask
-            state["updated_at"] = time.time() if timestamp is None else timestamp
+            recorded_at = time.time() if timestamp is None else timestamp
+            state["updated_at"] = recorded_at
+
+            if mid:
+                history = state["mid_price_history"]
+                history.append((recorded_at, mid))
+                cutoff = recorded_at - max(float(config.ABSORPTION_PRICE_HISTORY_SECONDS), 10)
+
+                while history and history[0][0] < cutoff:
+                    history.popleft()
+
+    def _price_change_pct(self, state, now):
+        """config.ABSORPTION_TRACKING_ENABLED - % change from the oldest
+        retained mid-price sample at or before `now - ABSORPTION_WINDOW_
+        SECONDS` to the current mid - same "latest sample at or before a
+        target time" search as oi_divergence._oi_at_or_before, applied to
+        a continuously-retained short series instead of a periodic poll.
+        None (not False/0) whenever there isn't yet a real reference point
+        old enough - a freshly (re)started engine must never report a
+        manufactured 0% move as if it were a real reading. Assumes the
+        caller already holds self.lock (only called from within
+        snapshot() below)."""
+        history = state["mid_price_history"]
+
+        if not history:
+            return None
+
+        window_seconds = max(float(config.ABSORPTION_WINDOW_SECONDS), 1)
+        cutoff = now - window_seconds
+        current = history[-1][1]
+        reference = None
+
+        for sample_time, mid in history:
+            if sample_time <= cutoff:
+                reference = mid
+            else:
+                break
+
+        if reference is None or reference <= 0:
+            return None
+
+        return (current - reference) / reference * 100
 
     def snapshot(self, symbol, now=None):
         symbol = symbol.upper()
@@ -120,6 +170,7 @@ class DepthImbalanceEngine:
                 "best_ask": state["best_ask"],
                 "samples": state["samples"],
                 "age_seconds": round(age, 1),
+                "price_change_pct_1m": self._price_change_pct(state, now),
             }
 
     def reset(self, symbol=None):

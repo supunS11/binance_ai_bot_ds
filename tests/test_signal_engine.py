@@ -805,6 +805,101 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["btc_correlation"])
         self.assertIsNone(result["btc_aligned"])
 
+    # config.ABSORPTION_TRACKING_ENABLED - informational only, same
+    # treatment as btc_aligned above. absorption.compute() itself is
+    # covered directly in test_absorption.py; these only prove
+    # signal_engine wires real cvd_snapshot/depth_snapshot data through
+    # to absorption_signal, and that alignment is compared against the
+    # winning candidate's own side.
+
+    def test_absorption_signal_and_aligned_computed_from_real_data(self):
+        # Aggressive one-sided SELLING (ratio negative) that didn't move
+        # price - buyers absorbed it -> "BUY" signal. BUY-side candidate
+        # (default _run()) agrees -> aligned True.
+        cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
+        depth = {"available": True, "depth_imbalance": 0.2, "price_change_pct_1m": 0.01}
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", True), \
+             patch.object(config, "ABSORPTION_MIN_CVD_RATIO", 0.5), \
+             patch.object(config, "ABSORPTION_MAX_PRICE_MOVE_PCT", 0.05):
+            result = self._run(cvd=cvd, depth=depth)
+
+        self.assertEqual(result["absorption_signal"], "BUY")
+        self.assertTrue(result["absorption_aligned"])
+
+    def test_absorption_aligned_false_when_signal_disagrees_with_the_candidate_side(self):
+        # Same absorption reading (bullish) but the winning candidate is
+        # SELL - aligned must be False, not None (real data exists, it
+        # just disagrees).
+        cvd = {"available": True, "cvd_score": -0.5, "ratio_1m": -0.8, "notional_1m": 10000}
+        depth = {"available": True, "depth_imbalance": -0.2, "price_change_pct_1m": 0.01}
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", True), \
+             patch.object(config, "ABSORPTION_MIN_CVD_RATIO", 0.5), \
+             patch.object(config, "ABSORPTION_MAX_PRICE_MOVE_PCT", 0.05):
+            result = self._run(
+                ltf_close=108.0, cvd=cvd, depth=depth, htf_structure=HTF_BEARISH,
+                ltf_analysis=LTF_BEARISH_BREAK, sweep_direction="BEARISH", ema_value=115.0,
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["absorption_signal"], "BUY")
+        self.assertFalse(result["absorption_aligned"])
+
+    def test_absorption_signal_none_when_price_moved_too_much(self):
+        # Real one-sided flow that DID move price - not absorption.
+        cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
+        depth = {"available": True, "depth_imbalance": 0.2, "price_change_pct_1m": 0.5}
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", True), \
+             patch.object(config, "ABSORPTION_MIN_CVD_RATIO", 0.5), \
+             patch.object(config, "ABSORPTION_MAX_PRICE_MOVE_PCT", 0.05):
+            result = self._run(cvd=cvd, depth=depth)
+
+        self.assertIsNone(result["absorption_signal"])
+        self.assertIsNone(result["absorption_aligned"])
+
+    def test_absorption_signal_none_when_price_change_data_unavailable(self):
+        # depth_snapshot carries no price_change_pct_1m key at all - the
+        # engine just started tracking, not enough history yet.
+        cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
+        depth = {"available": True, "depth_imbalance": 0.2}
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", True):
+            result = self._run(cvd=cvd, depth=depth)
+
+        self.assertIsNone(result["absorption_signal"])
+        self.assertIsNone(result["absorption_aligned"])
+
+    def test_absorption_disabled_by_config(self):
+        cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
+        depth = {"available": True, "depth_imbalance": 0.2, "price_change_pct_1m": 0.01}
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", False):
+            result = self._run(cvd=cvd, depth=depth)
+
+        self.assertIsNone(result["absorption_signal"])
+        self.assertIsNone(result["absorption_aligned"])
+
+    def test_absorption_is_never_added_to_confluence_scoring(self):
+        # 2026-08-26 - brand new, unvalidated field, same "evidence before
+        # confluence" discipline as efficiency_favorable/funding_favorable/
+        # long_short_favorable (see signal_engine.py's own comment on
+        # confluence_fields). Only ema_aligned/oi_rising/btc_aligned feed
+        # confluence_total's denominator - a real absorption reading must
+        # not silently change confluence_ratio.
+        cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
+        depth = {"available": True, "depth_imbalance": 0.2, "price_change_pct_1m": 0.01}
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", True):
+            with_absorption = self._run(cvd=cvd, depth=depth)
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", False):
+            without_absorption = self._run(cvd=cvd, depth=depth)
+
+        self.assertEqual(with_absorption["confluence_total"], without_absorption["confluence_total"])
+        self.assertEqual(with_absorption["confluence_score"], without_absorption["confluence_score"])
+
     def test_btc_aligned_counts_toward_confluence_score(self):
         result = self._run(symbol="ETHUSDT", btc_return=0.05)  # aligned
 
@@ -1946,6 +2041,104 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(status, "OK")
         self.assertGreater(plan["sl_price"], plan["entry_price"])
 
+    # config.CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED - real swing-to-
+    # swing CVD delta at every structural candidate, independent of
+    # whether detect_divergence itself confirmed anything (2026-08-26
+    # finding: CVD_DIVERGENCE has never produced a trade).
+    # diagnostic_candidates() own logic is covered in test_cvd_divergence.
+    # py; these only prove the wiring. find_swing_points is always []
+    # under _run()'s own mocking (same as every other divergence
+    # trigger's real detection) - cvd_divergence.diagnostic_candidates
+    # itself is mocked directly to inject a controlled candidate list.
+
+    def test_cvd_divergence_diagnostic_logs_a_real_structural_candidate(self):
+        candidate = {
+            "structural_direction": "BULLISH", "cvd_data_found": True, "delta_usdt": 42.0,
+        }
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(cvd_divergence, "diagnostic_candidates", return_value=[candidate]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_log.assert_called_once()
+        message = mock_log.call_args[0][0]
+        self.assertIn("CVD_DIVERGENCE_DIAGNOSTIC", message)
+        self.assertIn("structural_direction=BULLISH", message)
+        self.assertIn("cvd_data_found=True", message)
+        self.assertIn("delta_usdt=42.0", message)
+        self.assertIn("confirmed=False", message)  # divergence itself is None by default
+
+    def test_cvd_divergence_diagnostic_reports_confirmed_true_when_it_matches(self):
+        candidate = {
+            "structural_direction": "BULLISH", "cvd_data_found": True, "delta_usdt": 42.0,
+        }
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(cvd_divergence, "diagnostic_candidates", return_value=[candidate]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run(divergence_direction="BULLISH", divergence_level=88)
+
+        self.assertIn("confirmed=True", mock_log.call_args[0][0])
+
+    def test_cvd_divergence_diagnostic_silent_when_disabled(self):
+        candidate = {"structural_direction": "BULLISH", "cvd_data_found": True, "delta_usdt": 42.0}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(cvd_divergence, "diagnostic_candidates", return_value=[candidate]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_log.assert_not_called()
+
+    def test_cvd_divergence_diagnostic_silent_when_trigger_disabled(self):
+        # divergence_swings never gets computed at all when the trigger
+        # itself is off - diagnostic_candidates never even gets called.
+        candidate = {"structural_direction": "BULLISH", "cvd_data_found": True, "delta_usdt": 42.0}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", False), \
+             patch.object(config, "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(
+                 cvd_divergence, "diagnostic_candidates", return_value=[candidate]
+             ) as mock_diag, \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_diag.assert_not_called()
+        mock_log.assert_not_called()
+
+    def test_cvd_divergence_diagnostic_silent_when_no_structural_candidate(self):
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(cvd_divergence, "diagnostic_candidates", return_value=[]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_log.assert_not_called()
+
+    def test_cvd_divergence_diagnostic_never_changes_the_returned_result(self):
+        candidate = {"structural_direction": "BULLISH", "cvd_data_found": True, "delta_usdt": 42.0}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(cvd_divergence, "diagnostic_candidates", return_value=[candidate]):
+            result_on = self._run()
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", False), \
+             patch.object(cvd_divergence, "diagnostic_candidates", return_value=[candidate]):
+            result_off = self._run()
+
+        self.assertEqual(result_on, result_off)
+
     # config.ORDER_BLOCK_RETEST_TRIGGER_ENABLED - a fresh rejection wick
     # back into a previously-formed, unmitigated order block. Ranked
     # after CVD_DIVERGENCE: STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_
@@ -2166,6 +2359,97 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(status, "OK")
         self.assertGreater(plan["sl_price"], plan["entry_price"])
+
+    # config.OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED - same shape/
+    # motivation as CVD_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED above.
+    # oi_divergence.diagnostic_candidates itself is mocked directly, same
+    # reason (find_swing_points is always [] under _run()'s own mocking).
+
+    def test_oi_divergence_diagnostic_logs_a_real_structural_candidate(self):
+        candidate = {
+            "structural_direction": "BEARISH", "oi_data_found": True, "delta_pct": 12.5,
+        }
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(oi_divergence, "diagnostic_candidates", return_value=[candidate]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_log.assert_called_once()
+        message = mock_log.call_args[0][0]
+        self.assertIn("OI_DIVERGENCE_DIAGNOSTIC", message)
+        self.assertIn("structural_direction=BEARISH", message)
+        self.assertIn("oi_data_found=True", message)
+        self.assertIn("delta_pct=12.5", message)
+        self.assertIn("confirmed=False", message)
+
+    def test_oi_divergence_diagnostic_reports_confirmed_true_when_it_matches(self):
+        candidate = {
+            "structural_direction": "BULLISH", "oi_data_found": True, "delta_pct": 12.5,
+        }
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(oi_divergence, "diagnostic_candidates", return_value=[candidate]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run(oi_divergence_direction="BULLISH", oi_divergence_level=88)
+
+        self.assertIn("confirmed=True", mock_log.call_args[0][0])
+
+    def test_oi_divergence_diagnostic_silent_when_disabled(self):
+        candidate = {"structural_direction": "BULLISH", "oi_data_found": True, "delta_pct": 12.5}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(oi_divergence, "diagnostic_candidates", return_value=[candidate]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_log.assert_not_called()
+
+    def test_oi_divergence_diagnostic_silent_when_trigger_disabled(self):
+        candidate = {"structural_direction": "BULLISH", "oi_data_found": True, "delta_pct": 12.5}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", False), \
+             patch.object(config, "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(
+                 oi_divergence, "diagnostic_candidates", return_value=[candidate]
+             ) as mock_diag, \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_diag.assert_not_called()
+        mock_log.assert_not_called()
+
+    def test_oi_divergence_diagnostic_silent_when_no_structural_candidate(self):
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED", False), \
+             patch.object(oi_divergence, "diagnostic_candidates", return_value=[]), \
+             patch.object(signal_engine, "log_info") as mock_log:
+            self._run()
+
+        mock_log.assert_not_called()
+
+    def test_oi_divergence_diagnostic_never_changes_the_returned_result(self):
+        candidate = {"structural_direction": "BULLISH", "oi_data_found": True, "delta_pct": 12.5}
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", True), \
+             patch.object(oi_divergence, "diagnostic_candidates", return_value=[candidate]):
+            result_on = self._run()
+
+        with patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_DIAGNOSTIC_LOGGING_ENABLED", False), \
+             patch.object(oi_divergence, "diagnostic_candidates", return_value=[candidate]):
+            result_off = self._run()
+
+        self.assertEqual(result_on, result_off)
 
     # config.LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED - a plain
     # LIQUIDITY_SWEEP additionally confirmed by a real clustered forced-
