@@ -33,6 +33,13 @@ _backoff_until = {}  # host -> timestamp
 _unavailable_symbols = {}  # (host, symbol) -> until-timestamp
 
 _RATE_LIMIT_RE = re.compile(r"(429|rate limit|too many requests)", re.IGNORECASE)
+# Real Binance symbols are always plain uppercase alphanumeric (see
+# exchange.py - nothing there ever validates this because it's always
+# been a safe assumption). Guards _to_okx_symbol below against a real
+# 2026-08-26 event: a handful of Binance-listed meme perpetuals have
+# non-ASCII (CJK) base asset names, which still builds a syntactically
+# valid f-string instId that OKX then rejects outright.
+_VALID_BASE_ASSET_RE = re.compile(r"^[A-Z0-9]+$")
 
 
 def _rate_limit(host):
@@ -68,15 +75,40 @@ def _mark_symbol_unavailable(host, symbol):
     _unavailable_symbols[(host, symbol)] = time.time() + cooldown
 
 
+def _handle_fetch_error(host, symbol, exc):
+    """Real event (2026-08-26): a plain `except Exception` treated an
+    HTTP 400 (OKX rejecting an unresolvable instId) identically to a
+    transient network hiccup - neither backing off nor marking the
+    symbol unavailable, so it retried and re-logged an ERROR every single
+    poll cycle forever. A 4xx (other than 429, which is rate-limiting,
+    not a symbol problem) means the remote API itself rejected THIS
+    symbol - a permanent-style failure, same distinction exchange.py's
+    own _oi_unavailable_symbols already makes for Binance's own
+    permanent-style OI errors. `getattr` chain is exception-shape-safe:
+    a plain RuntimeError (tests) or a connection/timeout error (no HTTP
+    response at all) both fall through to the backoff branch unchanged."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+
+    if status is not None and status != 429 and 400 <= status < 500:
+        _mark_symbol_unavailable(host, symbol)
+    else:
+        _set_backoff(host, exc)
+
+
 def _to_okx_symbol(symbol):
     """"BTCUSDT" -> "BTC-USDT-SWAP". Only defined for USDT-quoted symbols
-    (this bot's entire tradable universe) - returns None otherwise."""
+    (this bot's entire tradable universe) with a plain alphanumeric base
+    asset - returns None otherwise (real event, 2026-08-26: a non-ASCII
+    base asset name still builds a "valid" f-string here, but OKX then
+    rejects the resulting request outright - rejecting it here instead
+    means zero wasted requests and zero log spam for a symbol that could
+    never plausibly resolve on OKX)."""
     if not symbol.endswith("USDT"):
         return None
 
     base = symbol[:-4]
 
-    if not base:
+    if not base or not _VALID_BASE_ASSET_RE.match(base):
         return None
 
     return f"{base}-USDT-SWAP"
@@ -121,7 +153,7 @@ def get_open_interest_bybit(symbol):
         return float(entries[0]["openInterest"])
 
     except Exception as exc:
-        _set_backoff(host, exc)
+        _handle_fetch_error(host, symbol, exc)
         log_error(f"{symbol} Bybit open interest error: {exc}")
         return None
 
@@ -163,7 +195,7 @@ def get_open_interest_okx(symbol):
         return float(entries[0]["oi"])
 
     except Exception as exc:
-        _set_backoff(host, exc)
+        _handle_fetch_error(host, symbol, exc)
         log_error(f"{symbol} OKX open interest error: {exc}")
         return None
 
