@@ -79,44 +79,60 @@ class OrderParameterTests(unittest.TestCase):
         _, kwargs = mock_place.call_args
         self.assertEqual(kwargs["clientAlgoId"], "dcaTP123")
 
-    def test_place_trailing_stop_loss_sends_activate_price_and_callback_rate(self):
+    def test_place_trailing_stop_loss_sends_activate_price_callback_rate_and_quantity(self):
         # config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a real TRAILING_
-        # STOP_MARKET, closePosition=true, activatePrice/callbackRate not
-        # triggerPrice, mirroring place_stop_loss's own coverage above.
+        # STOP_MARKET. Real bug found live (2026-08-26, MEUSDT): Binance
+        # rejects closePosition=true for this order type with -4136 -
+        # reduceOnly=true + an explicit quantity is the confirmed working
+        # shape instead, same as place_take_profit_partial.
         with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \
              patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
              patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
-            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 98.0, 0.2)
+            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 1.5, 98.0, 0.2)
 
         _, kwargs = mock_place.call_args
         self.assertEqual(kwargs["type"], "TRAILING_STOP_MARKET")
         self.assertEqual(kwargs["activatePrice"], 98.0)
         self.assertEqual(kwargs["callbackRate"], 0.2)
+        self.assertEqual(kwargs["quantity"], 1.5)
+        self.assertEqual(kwargs["reduceOnly"], "true")
         self.assertNotIn("triggerPrice", kwargs)
-        self.assertEqual(kwargs["closePosition"], "true")
+        self.assertNotIn("closePosition", kwargs)
 
     def test_place_trailing_stop_loss_without_client_algo_id_omits_the_key(self):
         with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \
              patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
              patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
-            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 98.0, 0.2)
+            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 1.5, 98.0, 0.2)
 
         _, kwargs = mock_place.call_args
         self.assertNotIn("clientAlgoId", kwargs)
 
     def test_place_trailing_stop_loss_with_client_algo_id_passes_it_through(self):
         with patch.object(exchange, "place_algo_order") as mock_place, \
+             patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \
              patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p), \
              patch.object(exchange, "_format_price_for_api", side_effect=lambda s, v: v):
-            exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 98.0, 0.2, client_algo_id="dcaTrail123")
+            exchange.place_trailing_stop_loss(
+                "BTCUSDT", "BUY", 1.5, 98.0, 0.2, client_algo_id="dcaTrail123"
+            )
 
         _, kwargs = mock_place.call_args
         self.assertEqual(kwargs["clientAlgoId"], "dcaTrail123")
 
     def test_place_trailing_stop_loss_rejects_invalid_activate_price(self):
-        with patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: 0.0):
+        with patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: q), \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: 0.0):
             with self.assertRaises(ValueError):
-                exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 0.0, 0.2)
+                exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 1.5, 0.0, 0.2)
+
+    def test_place_trailing_stop_loss_rejects_zero_quantity(self):
+        with patch.object(exchange, "normalize_order_quantity", side_effect=lambda s, q, order_type=None: 0.0), \
+             patch.object(exchange, "normalize_trigger_price", side_effect=lambda s, side, t, p: p):
+            with self.assertRaises(ValueError):
+                exchange.place_trailing_stop_loss("BTCUSDT", "BUY", 0.0, 98.0, 0.2)
 
 
 class NormalizeCallbackRateTests(unittest.TestCase):

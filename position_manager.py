@@ -2089,7 +2089,8 @@ class PositionManager:
 
                 try:
                     trail_order = exchange.place_trailing_stop_loss(
-                        symbol, side, breakeven_price, config.DCA_BREAKEVEN_TRAILING_CALLBACK_RATE,
+                        symbol, side, plan["quantity"], breakeven_price,
+                        config.DCA_BREAKEVEN_TRAILING_CALLBACK_RATE,
                         client_algo_id=f"{_DCA_TRAIL_CLIENT_ALGO_ID_PREFIX}{int(time.time() * 1000)}",
                     )
                     position["dca_trail_order_id"] = exchange._accepted_order_id(trail_order)

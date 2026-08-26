@@ -4872,7 +4872,9 @@ class ExecuteDcaLiveTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         trail_order.assert_called_once()
-        self.assertEqual(trail_order.call_args.args, ("BTCUSDT", "BUY", 98.0 * 1.0015, 0.2))
+        # quantity (args[2]) is plan["quantity"] - the post-DCA blended
+        # size, matching _DCA_RESULT_PLAN's "quantity": 2.0.
+        self.assertEqual(trail_order.call_args.args, ("BTCUSDT", "BUY", 2.0, 98.0 * 1.0015, 0.2))
         self.assertTrue(trail_order.call_args.kwargs["client_algo_id"].startswith("dcaTrail"))
         self.assertEqual(position["dca_trail_order_id"], "trail_new")
 

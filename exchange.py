@@ -1187,35 +1187,44 @@ def _normalize_callback_rate(callback_rate):
     return round(max(0.1, min(float(callback_rate), 5.0)), 1)
 
 
-def place_trailing_stop_loss(symbol, side, activate_price, callback_rate, client_algo_id=None):
+def place_trailing_stop_loss(symbol, side, quantity, activate_price, callback_rate, client_algo_id=None):
     """config.DCA_BREAKEVEN_TRAILING_STOP_ENABLED - a real, native Binance
-    TRAILING_STOP_MARKET, closePosition=true, mirroring place_stop_loss's
-    own shape. Unlike a plain STOP_MARKET this doesn't fire at a fixed
-    level - it only starts trailing once price first reaches
+    TRAILING_STOP_MARKET. Unlike a plain STOP_MARKET this doesn't fire at
+    a fixed level - it only starts trailing once price first reaches
     `activate_price`, then trails behind the best price seen by
     `callback_rate`%, entirely server-side (no bot polling, no cancel/
     replace round trip - see position_manager._execute_dca's own comment
     for the real race this closes).
 
-    Real, unverified assumption this project is shipping on anyway (see
-    config.py's own comment): whether a closePosition=true STOP_MARKET
-    (the existing wide post-DCA SL) and a closePosition=true TRAILING_
-    STOP_MARKET can rest on the same symbol/side simultaneously has never
-    been tested in this codebase - only same-type duplicates are proven to
-    conflict (-4130, see place_stop_loss's own docstring on why
-    client_algo_id matters, and execution.py's -4130 handling). Callers
-    must treat this as best-effort/non-fatal, exactly like TP1/TP2
-    placement failures already are.
+    Real bug found live (2026-08-26, MEUSDT, the feature's first-ever
+    live attempt): closePosition=true - this project's original
+    assumption, mirroring place_stop_loss's own shape - is rejected
+    outright by Binance for TRAILING_STOP_MARKET with -4136 ("Target
+    strategy invalid for orderType TRAILING_STOP_MARKET,closePosition
+    true"). Confirmed against a real Binance dev-forum report of the
+    identical error text and its working resolution: reduceOnly=true
+    with an explicit quantity instead - the exact shape place_take_
+    profit_partial already uses successfully. `quantity` must be the
+    position's real current size (the post-DCA blended quantity at the
+    moment this is placed) - unlike closePosition=true, a reduceOnly
+    order with a fixed quantity does NOT automatically track a position
+    size that changes afterward.
 
-    `priceProtect`/`workingType` included for consistency with place_
-    stop_loss/place_take_profit_full - not confirmed whether Binance
-    accepts them for this order type specifically, covered by the same
-    best-effort framing."""
+    Still real, unverified: whether a closePosition=true STOP_MARKET
+    (the existing wide post-DCA SL) and this reduceOnly TRAILING_STOP_
+    MARKET can rest on the same symbol/side simultaneously has never
+    been tested in this codebase. Callers must treat this as best-
+    effort/non-fatal, exactly like TP1/TP2 placement failures already
+    are."""
     close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    quantity = normalize_order_quantity(symbol, quantity, order_type="CONDITIONAL")
     # Reuses the non-TAKE_PROFIT (SL-direction) rounding branch - a
     # genuine price, same rounding math regardless of order type, just
     # never previously exercised with this literal type string.
     activate_price = normalize_trigger_price(symbol, side, "STOP_MARKET", activate_price)
+
+    if quantity <= 0:
+        raise ValueError(f"{symbol} trailing stop quantity normalized to zero")
 
     if activate_price <= 0:
         raise ValueError(f"{symbol} trailing stop activate price is invalid")
@@ -1229,7 +1238,8 @@ def place_trailing_stop_loss(symbol, side, activate_price, callback_rate, client
         type="TRAILING_STOP_MARKET",
         activatePrice=activate_price,
         callbackRate=callback_rate,
-        closePosition="true",
+        quantity=quantity,
+        reduceOnly="true",
         workingType="MARK_PRICE",
         priceProtect="TRUE",
         timeInForce="GTC",

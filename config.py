@@ -1606,26 +1606,34 @@ DCA_BREAKEVEN_CONFIRMATION_WITHHOLD_ENABLED = env_bool(
 # PROFIT_PROTECTION_ENABLED's much deeper threshold or STRUCTURE_STOP_
 # MANAGEMENT_ENABLED's next confirmed swing to catch up.
 #
-# Real, unverified assumption (operator-confirmed 2026-08-26, ship it
-# anyway): this requires a closePosition=true STOP_MARKET and a
-# closePosition=true TRAILING_STOP_MARKET to coexist simultaneously on the
-# same symbol/side. This project has only ever proven Binance allows
-# DIFFERENT-type closePosition orders together (SL + TP, already this
-# bot's normal shape - see place_stop_loss/place_take_profit_full) and
-# REJECTS same-type duplicates (-4130, a real 2026-08-08 incident - see
-# execution.py's own -4130 handling). Whether STOP_MARKET + TRAILING_
-# STOP_MARKET specifically coexists has never been tested here. The
+# Real incident (2026-08-26, MEUSDT, the feature's first-ever live
+# attempt): the ORIGINAL design used closePosition=true for the trailing
+# stop (mirroring place_stop_loss's own shape) - Binance rejected every
+# attempt outright with -4136 ("Target strategy invalid for orderType
+# TRAILING_STOP_MARKET,closePosition true"). Confirmed against a real
+# Binance dev-forum report of the identical error and its working fix:
+# TRAILING_STOP_MARKET doesn't support closePosition=true at all, full
+# stop - not a coexistence question. Now fixed (exchange.place_trailing_
+# stop_loss) to use reduceOnly=true with an explicit quantity instead,
+# the same shape place_take_profit_partial already uses successfully.
+#
+# Still real, unverified: whether a closePosition=true STOP_MARKET (the
+# existing wide post-DCA SL) and this reduceOnly TRAILING_STOP_MARKET can
+# rest on the same symbol/side simultaneously - this project has only
+# proven DIFFERENT-type closePosition orders coexist (SL + TP - see
+# place_stop_loss/place_take_profit_full) and that same-type closePosition
+# duplicates are REJECTED (-4130, a real 2026-08-08 incident - see
+# execution.py's own -4130 handling); a reduceOnly+quantity order is a
+# different shape from either of those, still untested here. The
 # placement is deliberately best-effort/non-fatal (same treatment as
 # TP1/TP2 placement failures in _execute_dca already) - a rejection just
 # means the position keeps its existing wide SL exactly as today, nothing
-# else breaks, and the very first live DCA-breakeven event under this flag
-# is the real-world answer. DCA_BREAKEVEN_ENABLED's own poll-based
-# mechanism stays fully intact as the fallback for whenever this either
-# isn't enabled or its placement failed for this specific position (see
-# _is_dca_breakeven_candidate). Default False: new, unvalidated mechanism
-# touching real order placement, on an unverified exchange-behavior
-# assumption - same "earns a live default only after real data" rule as
-# every other unvalidated mechanism here.
+# else breaks. DCA_BREAKEVEN_ENABLED's own poll-based mechanism stays
+# fully intact as the fallback for whenever this either isn't enabled or
+# its placement failed for this specific position (see _is_dca_breakeven_
+# candidate). Default False: new, unvalidated mechanism touching real
+# order placement - same "earns a live default only after real data" rule
+# as every other unvalidated mechanism here.
 DCA_BREAKEVEN_TRAILING_STOP_ENABLED = env_bool("DCA_BREAKEVEN_TRAILING_STOP_ENABLED", "False")
 # Binance's real minimum is 0.1 (python-binance's own futures_create_algo_
 # order docstring: "min 0.1, max 10" for callbackRate). 0.2 is a small
