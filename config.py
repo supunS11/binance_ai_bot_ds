@@ -404,6 +404,25 @@ HTF_TREND_FRESHNESS_ENABLED = env_bool("HTF_TREND_FRESHNESS_ENABLED", "True")
 # candle instead of needing 16h to confirm a swing. Starting value, not
 # yet calibrated against real trade data.
 HTF_TREND_EMA_PERIOD = env_int("HTF_TREND_EMA_PERIOD", 20)
+# EXPLICIT LIVE TEST (2026-08-27) - real mechanism (structure_state's
+# htf_trend has zero time decay - see market_structure.py's own
+# _classify_swings), but the systematic evidence behind THIS gate is
+# genuinely weak: a 107-trade check (real market_structure.structure_
+# state() run against real historical klines) found swing age does NOT
+# predict win/loss monotonically - the FRESHEST tercile had the WORST
+# win rate (65.7%), while the STALEST tercile still won 78.4% of the
+# time. What staleness DOES predict is MAE (0.841R vs 0.58-0.63R) - a
+# bumpier ride to the same win, not a more likely loss. This gate could
+# plausibly reduce win rate by rejecting the currently-best-performing
+# STALE trades while leaving the worst-performing FRESH ones untouched.
+# User's own explicit choice to test this live anyway, same category as
+# CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED/VP_EXTENSION_REJECT_ENABLED.
+HTF_TREND_SWING_AGE_REJECT_ENABLED = env_bool("HTF_TREND_SWING_AGE_REJECT_ENABLED", "False")
+# Starting value, not calibrated - roughly the p75 (62h) of the real
+# 107-trade sample's swing-age distribution (median 43h), rounded up to
+# a clean 3 days. No evidence this specific cutoff is the right one -
+# see the flag's own comment above for the honest caveat.
+HTF_TREND_MAX_SWING_AGE_HOURS = env_float("HTF_TREND_MAX_SWING_AGE_HOURS", 72.0)
 
 # =========================
 # SIGNAL ENGINE - order-flow confirmation thresholds

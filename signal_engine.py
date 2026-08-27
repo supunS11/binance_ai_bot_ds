@@ -74,6 +74,20 @@ def evaluate(
     if not htf_structure.get("available"):
         return _reject("HTF_STRUCTURE_UNAVAILABLE")
 
+    # config.HTF_TREND_SWING_AGE_REJECT_ENABLED - EXPLICIT LIVE TEST
+    # (2026-08-27), see config.py's own comment for the real evidence and
+    # its honest caveat (non-monotonic win rate, real MAE effect). "now" is
+    # the latest HTF candle's own open_time, not wall-clock time - keeps
+    # this pure/backtest-safe, same principle market_structure.py's own
+    # docstring states ("candles in, structure out").
+    htf_trend_swing_age_hours = None
+    last_event = htf_structure.get("last_event")
+
+    if last_event is not None and htf_candles:
+        now_ms = htf_candles[-1]["open_time"]
+        swing_open_time_ms = htf_candles[last_event["index"]]["open_time"]
+        htf_trend_swing_age_hours = max(now_ms - swing_open_time_ms, 0) / 3_600_000
+
     # config.HTF_TREND_FRESHNESS_ENABLED - a second, faster-updating HTF
     # read alongside htf_structure's swing-confirmed trend (see its
     # config.py comment for the real evidence: a stale swing-confirmed
@@ -590,6 +604,14 @@ def evaluate(
             if side == "SELL" and latest_price > htf_trend_ema:
                 return _reject("HTF_TREND_STALE")
 
+        # config.HTF_TREND_SWING_AGE_REJECT_ENABLED - see config.py's own
+        # comment for why this is a live test, not evidence-backed.
+        # Universal across triggers (not read from applicable_gates), same
+        # "no per-trigger split found" precedent as OI_RISING_REJECT_ENABLED.
+        if config.HTF_TREND_SWING_AGE_REJECT_ENABLED and htf_trend_swing_age_hours is not None:
+            if htf_trend_swing_age_hours > max(float(config.HTF_TREND_MAX_SWING_AGE_HOURS), 0):
+                return _reject("HTF_TREND_SWING_TOO_OLD")
+
         # config.EFFICIENCY_RATIO_GATE_ENABLED - genuine chop (price
         # round-tripping, no real directional move) is a failure mode
         # neither AGAINST_HTF_BIAS nor HTF_TREND_STALE can catch:
@@ -995,6 +1017,7 @@ def evaluate(
             "symbol": symbol,
             "entry_price": latest_price,
             "htf_trend": htf_structure.get("trend"),
+            "htf_trend_swing_age_hours": htf_trend_swing_age_hours,
             # Placeholders - the candidate (not the direction) determines
             # these; the caller overlays the winning candidate's real
             # values once a direction's pipeline has actually passed.

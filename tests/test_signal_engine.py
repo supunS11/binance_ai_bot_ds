@@ -100,10 +100,12 @@ class SignalEngineTests(unittest.TestCase):
         oi_snapshot_bybit=None,
         oi_snapshot_okx=None,
         volume_profile_snapshot=None,
+        htf_candles=None,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
         htf_structure = HTF_BULLISH if htf_structure is None else htf_structure
+        htf_candles = ["htf_placeholder"] if htf_candles is None else htf_candles
         zone = ZONE if zone is None else zone
         ltf_analysis = LTF_BULLISH_BREAK if ltf_analysis is None else ltf_analysis
         sweep = (
@@ -209,7 +211,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(cvd_divergence, "detect_divergence", return_value=divergence), \
              patch.object(oi_divergence, "detect_divergence", return_value=oi_divergence_result):
             return signal_engine.evaluate(
-                symbol, ["htf_placeholder"], _ltf_candles(ltf_close), cvd, depth,
+                symbol, htf_candles, _ltf_candles(ltf_close), cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
                 quote_volume_usdt=quote_volume_usdt, btc_candles=btc_candles,
                 funding_rate=funding_rate, crash_snapshot=crash_snapshot,
@@ -330,6 +332,81 @@ class SignalEngineTests(unittest.TestCase):
         # optional confirmation.
         result = self._run(htf_trend_ema=None)
         self.assertEqual(result["signal"], "BUY")
+
+    # config.HTF_TREND_SWING_AGE_REJECT_ENABLED - EXPLICIT LIVE TEST, no
+    # resolved-trade evidence supporting it (see config.py's own comment).
+    # market_structure.structure_state() itself is mocked via htf_structure
+    # in this test suite - these tests inject a real last_event/htf_candles
+    # pair since the age computation reads htf_candles directly, not
+    # through the mock.
+
+    def test_htf_trend_swing_age_is_computed_from_real_candles(self):
+        htf_candles = [{"open_time": i * 14_400_000} for i in range(20)]
+        htf_structure = dict(
+            HTF_BULLISH, last_event={"index": 17, "type": "BOS", "direction": "BULLISH", "price": 100},
+        )
+
+        result = self._run(htf_structure=htf_structure, htf_candles=htf_candles)
+
+        # (19 - 17) candles * 4h/candle = 8 hours
+        self.assertAlmostEqual(result["htf_trend_swing_age_hours"], 8.0)
+
+    def test_htf_trend_swing_age_is_none_without_a_last_event(self):
+        # Default HTF_BULLISH carries no last_event - every existing test
+        # in this suite relies on this staying a true no-op.
+        result = self._run()
+        self.assertIsNone(result["htf_trend_swing_age_hours"])
+
+    def test_htf_trend_swing_too_old_rejects_when_gate_enabled(self):
+        htf_candles = [{"open_time": i * 14_400_000} for i in range(20)]
+        htf_structure = dict(
+            HTF_BULLISH, last_event={"index": 0, "type": "BOS", "direction": "BULLISH", "price": 100},
+        )
+
+        with patch.object(config, "HTF_TREND_SWING_AGE_REJECT_ENABLED", True), \
+             patch.object(config, "HTF_TREND_MAX_SWING_AGE_HOURS", 72.0):
+            result = self._run(htf_structure=htf_structure, htf_candles=htf_candles)
+
+        # (19 - 0) candles * 4h/candle = 76h > 72h threshold
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "HTF_TREND_SWING_TOO_OLD")
+
+    def test_htf_trend_swing_age_under_threshold_does_not_reject(self):
+        htf_candles = [{"open_time": i * 14_400_000} for i in range(20)]
+        htf_structure = dict(
+            HTF_BULLISH, last_event={"index": 17, "type": "BOS", "direction": "BULLISH", "price": 100},
+        )
+
+        with patch.object(config, "HTF_TREND_SWING_AGE_REJECT_ENABLED", True), \
+             patch.object(config, "HTF_TREND_MAX_SWING_AGE_HOURS", 72.0):
+            result = self._run(htf_structure=htf_structure, htf_candles=htf_candles)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_htf_trend_swing_too_old_reject_disabled_by_default_flag(self):
+        htf_candles = [{"open_time": i * 14_400_000} for i in range(20)]
+        htf_structure = dict(
+            HTF_BULLISH, last_event={"index": 0, "type": "BOS", "direction": "BULLISH", "price": 100},
+        )
+
+        with patch.object(config, "HTF_TREND_SWING_AGE_REJECT_ENABLED", False):
+            result = self._run(htf_structure=htf_structure, htf_candles=htf_candles)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_htf_trend_swing_age_is_never_added_to_confluence_scoring(self):
+        htf_candles = [{"open_time": i * 14_400_000} for i in range(20)]
+        htf_structure = dict(
+            HTF_BULLISH, last_event={"index": 17, "type": "BOS", "direction": "BULLISH", "price": 100},
+        )
+
+        with patch.object(config, "HTF_TREND_SWING_AGE_REJECT_ENABLED", True):
+            with_age = self._run(htf_structure=htf_structure, htf_candles=htf_candles)
+
+        without_age = self._run()
+
+        self.assertEqual(with_age["confluence_total"], without_age["confluence_total"])
+        self.assertEqual(with_age["confluence_score"], without_age["confluence_score"])
 
     def test_market_choppy_rejects_below_the_threshold(self):
         analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
