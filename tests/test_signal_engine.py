@@ -101,11 +101,20 @@ class SignalEngineTests(unittest.TestCase):
         oi_snapshot_okx=None,
         volume_profile_snapshot=None,
         htf_candles=None,
+        htf_trend_ema_primary_enabled=False,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
         htf_structure = HTF_BULLISH if htf_structure is None else htf_structure
-        htf_candles = ["htf_placeholder"] if htf_candles is None else htf_candles
+        # A real (if inert - structure_state is always mocked below)
+        # candle dict, not a bare placeholder string - config.
+        # HTF_TREND_EMA_PRIMARY_ENABLED's htf_trend_live computation
+        # indexes into this directly (htf_candles[-1]["close"]), unlike
+        # structure_state's own swing detection which never touches it.
+        htf_candles = (
+            [{"open_time": 0, "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1, "closed": True}]
+            if htf_candles is None else htf_candles
+        )
         zone = ZONE if zone is None else zone
         ltf_analysis = LTF_BULLISH_BREAK if ltf_analysis is None else ltf_analysis
         sweep = (
@@ -190,7 +199,17 @@ class SignalEngineTests(unittest.TestCase):
         # every test above and below that doesn't care about this specific
         # gate exercising its old, pre-gate behavior; opt in explicitly
         # (oi_rising_reject_enabled=True) to test the gate itself.
+        #
+        # HTF_TREND_EMA_PRIMARY_ENABLED defaults True in the real live
+        # .env (explicit live test, see config.py's own comment) - without
+        # pinning it False here, AGAINST_HTF_BIAS would silently switch to
+        # reading htf_trend_live for every test in this suite, which stays
+        # None unless a test explicitly sets up htf_trend_ema, turning the
+        # gate into a silent no-op for tests that rely on it firing (e.g.
+        # test_no_signal_against_htf_bias). Same insulation pattern as
+        # oi_rising_reject_enabled above.
         with patch.object(config, "OI_RISING_REJECT_ENABLED", oi_rising_reject_enabled), \
+             patch.object(config, "HTF_TREND_EMA_PRIMARY_ENABLED", htf_trend_ema_primary_enabled), \
              patch.object(market_structure, "structure_state", return_value=htf_structure), \
              patch.object(market_structure, "premium_discount_zone", return_value=zone), \
              patch.object(market_structure, "analyze", return_value=ltf_analysis), \
@@ -407,6 +426,114 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(with_age["confluence_total"], without_age["confluence_total"])
         self.assertEqual(with_age["confluence_score"], without_age["confluence_score"])
+
+    # config.HTF_TREND_EMA_PRIMARY_ENABLED - EXPLICIT LIVE TEST, zero
+    # resolved-trade evidence (see config.py's own comment). Replaces
+    # AGAINST_HTF_BIAS's source entirely rather than adding a new reject,
+    # so these tests cover both the computed field and the source switch.
+
+    def test_htf_trend_live_is_bullish_when_price_above_the_ema(self):
+        # htf_trend_ema kept below the default ltf_close=93 so
+        # HTF_TREND_STALE's own check (latest_price < htf_trend_ema for a
+        # BUY) never fires here - this test is only about the computed
+        # field, not gate interactions (those are covered separately).
+        htf_candles = [{"open_time": 0, "close": 100}]
+
+        result = self._run(htf_candles=htf_candles, htf_trend_ema=85.0)
+
+        self.assertEqual(result["htf_trend_live"], "BULLISH")
+
+    def test_htf_trend_live_is_bearish_when_price_below_the_ema(self):
+        htf_candles = [{"open_time": 0, "close": 80}]
+
+        result = self._run(htf_candles=htf_candles, htf_trend_ema=85.0)
+
+        self.assertEqual(result["htf_trend_live"], "BEARISH")
+
+    def test_htf_trend_live_is_none_without_ema_data(self):
+        # Default htf_trend_ema=None (freshness disabled/insufficient
+        # HTF history) - same no-op convention as every optional field.
+        result = self._run()
+        self.assertIsNone(result["htf_trend_live"])
+
+    def test_against_htf_bias_uses_ema_trend_instead_of_swing_trend_when_enabled(self):
+        # Swing says BEARISH (would reject the default BUY candidate
+        # under the old mechanism) - EMA says BULLISH (price above it).
+        htf_structure = dict(HTF_BULLISH, trend="BEARISH")
+        htf_candles = [{"open_time": 0, "close": 100}]
+
+        result = self._run(
+            htf_structure=htf_structure, htf_candles=htf_candles, htf_trend_ema=95.0,
+            htf_trend_ema_primary_enabled=True,
+        )
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_against_htf_bias_rejects_on_ema_trend_even_when_swing_trend_agrees(self):
+        # Swing says BULLISH (would pass the default BUY candidate under
+        # the old mechanism) - EMA says BEARISH (price below it).
+        htf_candles = [{"open_time": 0, "close": 100}]
+
+        result = self._run(
+            htf_candles=htf_candles, htf_trend_ema=105.0, htf_trend_ema_primary_enabled=True,
+        )
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+        self.assertIn("htf=BEARISH", result["reason"])
+
+    def test_against_htf_bias_still_uses_swing_trend_when_flag_disabled(self):
+        # Same disagreement setup as the enabling test above, but the
+        # flag stays off (default) - old swing-based behavior persists.
+        htf_structure = dict(HTF_BULLISH, trend="BEARISH")
+        htf_candles = [{"open_time": 0, "close": 100}]
+
+        result = self._run(htf_structure=htf_structure, htf_candles=htf_candles, htf_trend_ema=95.0)
+
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_htf_trend_stale_is_a_noop_once_ema_primary_enabled(self):
+        # Same setup as the existing test_buy_rejected_when_price_has_
+        # fallen_below_the_htf_trend_ema (ltf_close=93 < htf_trend_ema=95,
+        # which fires HTF_TREND_STALE under the old mechanism) - but the
+        # HTF candle's own close (100) agrees with the default BUY, so
+        # once the new mechanism is primary this must succeed cleanly,
+        # not just avoid one specific rejection.
+        htf_candles = [{"open_time": 0, "close": 100}]
+
+        result = self._run(
+            htf_candles=htf_candles, htf_trend_ema=95.0, htf_trend_ema_primary_enabled=True,
+        )
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_htf_trend_swing_too_old_is_a_noop_once_ema_primary_enabled(self):
+        htf_candles = [{"open_time": i * 14_400_000, "close": 100} for i in range(20)]
+        htf_structure = dict(
+            HTF_BULLISH, last_event={"index": 0, "type": "BOS", "direction": "BULLISH", "price": 100},
+        )
+
+        with patch.object(config, "HTF_TREND_SWING_AGE_REJECT_ENABLED", True), \
+             patch.object(config, "HTF_TREND_MAX_SWING_AGE_HOURS", 72.0):
+            result = self._run(
+                htf_structure=htf_structure, htf_candles=htf_candles, htf_trend_ema=95.0,
+                htf_trend_ema_primary_enabled=True,
+            )
+
+        # Swing age here is still 76h > 72h (same as the dedicated
+        # swing-age test), which would normally reject - must not here.
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_htf_trend_live_is_never_added_to_confluence_scoring(self):
+        htf_candles = [{"open_time": 0, "close": 100}]
+
+        with_live = self._run(
+            htf_candles=htf_candles, htf_trend_ema=95.0, htf_trend_ema_primary_enabled=True,
+        )
+        without_live = self._run()
+
+        self.assertEqual(with_live["confluence_total"], without_live["confluence_total"])
+        self.assertEqual(with_live["confluence_score"], without_live["confluence_score"])
 
     def test_market_choppy_rejects_below_the_threshold(self):
         analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
@@ -1680,7 +1807,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False), \
              patch.object(config, "OI_RISING_REJECT_ENABLED", False):
             signal_engine.evaluate(
-                "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
+                "BTCUSDT", [{"open_time": 0, "close": 100}], _ltf_candles(93.0),
                 {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
                 oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
             )
@@ -1702,7 +1829,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
              patch.object(config, "OI_RISING_REJECT_ENABLED", False):
             signal_engine.evaluate(
-                "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
+                "BTCUSDT", [{"open_time": 0, "close": 100}], _ltf_candles(93.0),
                 {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
                 oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
             )
@@ -3146,7 +3273,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(config, "TRIGGER_QUALITY_RANKING_ENABLED", True), \
              patch.object(config, "OI_RISING_REJECT_ENABLED", False):
             result = signal_engine.evaluate(
-                "BTCUSDT", ["htf_placeholder"], _ltf_candles(93.0),
+                "BTCUSDT", [{"open_time": 0, "close": 100}], _ltf_candles(93.0),
                 {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
                 oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
             )

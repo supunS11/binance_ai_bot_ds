@@ -97,10 +97,28 @@ def evaluate(
     # optional confirmation, absence never blocks a signal on its own.
     htf_trend_ema = None
 
-    if config.HTF_TREND_FRESHNESS_ENABLED:
+    if config.HTF_TREND_FRESHNESS_ENABLED or config.HTF_TREND_EMA_PRIMARY_ENABLED:
         htf_trend_ema = market_structure.exponential_moving_average(
             htf_candles, period=config.HTF_TREND_EMA_PERIOD
         )
+
+    # config.HTF_TREND_EMA_PRIMARY_ENABLED - EXPLICIT LIVE TEST
+    # (2026-08-27), the user's own alternative to structure_state()'s
+    # swing-confirmed trend (see market_structure.py - a swing needs
+    # SWING_RIGHT candles after it before it's even recognized, so that
+    # read is inherently lagging by design, not by bug). This
+    # continuously updates every candle instead of waiting for a
+    # confirmed pivot - zero prior trade evidence on this specific
+    # method, unlike the swing-age gate.
+    htf_trend_live = None
+
+    if htf_trend_ema is not None and htf_candles:
+        latest_htf_close = htf_candles[-1]["close"]
+
+        if latest_htf_close > htf_trend_ema:
+            htf_trend_live = "BULLISH"
+        elif latest_htf_close < htf_trend_ema:
+            htf_trend_live = "BEARISH"
 
     zone = market_structure.premium_discount_zone(htf_candles)
 
@@ -592,12 +610,24 @@ def evaluate(
         applicable_gates = config.trigger_gate_profiles().get(trigger, frozenset())
 
         if "AGAINST_HTF_BIAS" in applicable_gates:
-            htf_side = _BULLISH_TO_SIDE.get(htf_structure.get("trend"))
+            effective_htf_trend = (
+                htf_trend_live if config.HTF_TREND_EMA_PRIMARY_ENABLED else htf_structure.get("trend")
+            )
+            htf_side = _BULLISH_TO_SIDE.get(effective_htf_trend)
 
             if htf_side and side != htf_side:
-                return _reject(f"AGAINST_HTF_BIAS htf={htf_structure.get('trend')} ltf={direction}")
+                return _reject(f"AGAINST_HTF_BIAS htf={effective_htf_trend} ltf={direction}")
 
-        if "HTF_TREND_STALE" in applicable_gates and htf_trend_ema is not None:
+        # Both checks below exist purely to catch a stale SWING-confirmed
+        # bias. Once AGAINST_HTF_BIAS no longer uses that bias at all
+        # (config.HTF_TREND_EMA_PRIMARY_ENABLED), checking its staleness
+        # is meaningless - gated off automatically here rather than
+        # requiring the user to separately manage 2 more flags, and rolls
+        # back for free if that flag is ever turned off again.
+        if (
+            "HTF_TREND_STALE" in applicable_gates and htf_trend_ema is not None
+            and not config.HTF_TREND_EMA_PRIMARY_ENABLED
+        ):
             if side == "BUY" and latest_price < htf_trend_ema:
                 return _reject("HTF_TREND_STALE")
 
@@ -608,7 +638,10 @@ def evaluate(
         # comment for why this is a live test, not evidence-backed.
         # Universal across triggers (not read from applicable_gates), same
         # "no per-trigger split found" precedent as OI_RISING_REJECT_ENABLED.
-        if config.HTF_TREND_SWING_AGE_REJECT_ENABLED and htf_trend_swing_age_hours is not None:
+        if (
+            config.HTF_TREND_SWING_AGE_REJECT_ENABLED and htf_trend_swing_age_hours is not None
+            and not config.HTF_TREND_EMA_PRIMARY_ENABLED
+        ):
             if htf_trend_swing_age_hours > max(float(config.HTF_TREND_MAX_SWING_AGE_HOURS), 0):
                 return _reject("HTF_TREND_SWING_TOO_OLD")
 
@@ -1017,6 +1050,7 @@ def evaluate(
             "symbol": symbol,
             "entry_price": latest_price,
             "htf_trend": htf_structure.get("trend"),
+            "htf_trend_live": htf_trend_live,
             "htf_trend_swing_age_hours": htf_trend_swing_age_hours,
             # Placeholders - the candidate (not the direction) determines
             # these; the caller overlays the winning candidate's real

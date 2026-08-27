@@ -423,6 +423,16 @@ HTF_TREND_SWING_AGE_REJECT_ENABLED = env_bool("HTF_TREND_SWING_AGE_REJECT_ENABLE
 # a clean 3 days. No evidence this specific cutoff is the right one -
 # see the flag's own comment above for the honest caveat.
 HTF_TREND_MAX_SWING_AGE_HOURS = env_float("HTF_TREND_MAX_SWING_AGE_HOURS", 72.0)
+# EXPLICIT LIVE TEST (2026-08-27) - user's own alternative to structure_
+# state()'s swing-confirmed trend: reuses the EMA already computed for
+# HTF_TREND_FRESHNESS_ENABLED (its own comment above) as the PRIMARY
+# trend read for AGAINST_HTF_BIAS instead of a secondary veto. Zero
+# resolved-trade evidence on this specific method - a fundamentally
+# different, unvalidated mechanism, not a threshold tweak on a validated
+# one. Automatically retires HTF_TREND_STALE/HTF_TREND_SWING_AGE_REJECT_
+# ENABLED's own reject checks while this is on (see signal_engine.py) -
+# both existed only to catch staleness in the mechanism this replaces.
+HTF_TREND_EMA_PRIMARY_ENABLED = env_bool("HTF_TREND_EMA_PRIMARY_ENABLED", "False")
 
 # =========================
 # SIGNAL ENGINE - order-flow confirmation thresholds
