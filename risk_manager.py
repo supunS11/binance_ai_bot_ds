@@ -721,16 +721,13 @@ def build_trade_plan(signal, balance):
     # stays exactly the existing real-liquidity-first structure target
     # (compute_static_tp1_structure_tp2 reuses compute_targets' own TP2
     # resolution, just fed the static TP1 price as its "at least 1R beyond
-    # TP1" floor input). Still a normal TP1(partial)+TP2(remainder) close
-    # with breakeven-on-TP1-fill promotion - single_tp stays False here;
-    # that flag now only ever becomes True post-DCA (_execute_dca, a
-    # separate concept - see position_manager.py), never from this signal-
-    # time branch. 2026-08-19: originally shipped as a single whole-
-    # position target instead (tp1_price/tp2_price both None, single_tp
-    # True) - changed 2026-08-21 on operator request to reuse the existing
-    # TP2 machinery rather than replace it.
-    tp_price = None
-    single_tp = False
+    # TP1" floor input). This itself doesn't touch single_tp - that's a
+    # separate decision, see config.TP2_ENABLED below (2026-08-19:
+    # originally shipped as a single whole-position target instead
+    # (tp1_price/tp2_price both None, single_tp True) - changed 2026-08-21
+    # on operator request to reuse the existing TP2 machinery rather than
+    # replace it; TP2_ENABLED=False, 2026-08-28, brings that option back
+    # as an explicit opt-out instead of the old unconditional default).
     # config.TP_STATIC_ROI_ENABLED - the ROI% actually used for TP1, or
     # None when TP1 is structure-resolved instead. Carried through so a
     # caller that later learns the REAL entry price differed from this
@@ -753,6 +750,20 @@ def build_trade_plan(signal, balance):
 
     if tp1_price is None or tp2_price is None:
         return None, "TARGETS_UNAVAILABLE"
+
+    if config.TP2_ENABLED:
+        tp_price = None
+        single_tp = False
+    else:
+        # config.TP2_ENABLED=False - reuses the exact single-TP shape
+        # _execute_dca already produces post-DCA (see register_dca_
+        # pending's own comment) - just reachable from signal time too
+        # now. tp1_price is unchanged by this (still structure-resolved,
+        # or TP_STATIC_ROI_ENABLED's fixed ROI% target) - this only
+        # changes whether the position closes there in one piece or
+        # partially.
+        tp_price = tp1_price
+        single_tp = True
 
     nearest_favorable_sr_r = nearest_favorable_structure_r(
         signal.get("liquidity_pools"), entry_price, side, risk_distance

@@ -3858,6 +3858,18 @@ class PositionManager:
 
         if not plan.get("single_tp"):
             settled_plan["tp1_price"] = _resolve_tp1_price(plan, entry_price, side)
+        elif plan.get("tp1_static_roi_pct") is not None:
+            # config.TP2_ENABLED=False - a single_tp plan built from a
+            # static-ROI TP1 (config.TP_STATIC_ROI_ENABLED) has that same
+            # "pure function of entry_price" drift problem the non-
+            # single_tp branch above already handles - a retracement fill
+            # settles at a different price than the original signal
+            # estimate, so tp_price needs the same real-price recompute,
+            # not just tp1_price. _resolve_tp1_price itself doesn't care
+            # about single_tp - it only reads plan["tp1_price"]/plan.get
+            # ("tp1_static_roi_pct"), both still populated in this plan
+            # shape, so it's safe to reuse verbatim here.
+            settled_plan["tp_price"] = _resolve_tp1_price(plan, entry_price, side)
 
         # config.RETRACEMENT_ENTRY_ENABLED observability (2026-08-25) -
         # journaled here (entry_price/quantity/fill_type all already

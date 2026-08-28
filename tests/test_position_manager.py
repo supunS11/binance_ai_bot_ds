@@ -4082,6 +4082,55 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         tp1.assert_called_once()
         self.assertAlmostEqual(tp1.call_args.args[3], 99.0 * 1.04)  # the REAL order uses the same price
 
+    def test_static_tp_price_is_recomputed_from_the_real_fill_when_single_tp(self):
+        # config.TP2_ENABLED=False - the same real bug class as the
+        # tp1_price recompute test above, but for a single_tp plan's
+        # tp_price: a static-ROI single-TP built from a retracement entry
+        # must also reflect the REAL settled fill, not the stale planned
+        # trigger price. _resolve_tp1_price itself reads plan["tp1_price"]/
+        # plan.get("tp1_static_roi_pct"), so both are set here even
+        # though tp1_price is never actually used for order placement in
+        # single_tp mode - it's still the source this recompute reads.
+        manager = PositionManager()
+        execution_result = {"shadow": False, "entry_order": {"orderId": "limit1"}, "retracement_price": 99.8}
+        plan = _retracement_plan(dca=True, single_tp=True)
+        plan["tp_price"] = 104.0  # as originally computed off the planned entry_price=100
+        plan["tp1_price"] = 104.0
+        plan["tp1_static_roi_pct"] = 40
+
+        with patch.object(config, "DCA_ENABLED", True):
+            manager.register_retracement_pending(plan, execution_result, trade_id="BTCUSDT_1")
+
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}) as tp_full:
+            manager._finalize_retracement_entry(position, 99.0, 1.0, "LIMIT")  # real fill: 99.0, not the planned 100
+
+        final = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(final["tp_price"], 99.0 * 1.04)  # 40% ROI/10x off the REAL entry
+        tp_full.assert_called_once()
+        self.assertAlmostEqual(tp_full.call_args.args[2], 99.0 * 1.04)  # the REAL order uses the same price
+
+    def test_single_tp_structure_price_is_unaffected_by_retracement_fill(self):
+        # Mirrors compute_targets' own structure-anchored TP2/SL - a real
+        # level, not a pure function of entry_price, so unlike the static-
+        # ROI case above it must NOT drift with the real fill price.
+        manager = PositionManager()
+        execution_result = {"shadow": False, "entry_order": {"orderId": "limit1"}, "retracement_price": 99.8}
+        plan = _retracement_plan(dca=True, single_tp=True)  # tp1_static_roi_pct left unset (None)
+
+        with patch.object(config, "DCA_ENABLED", True):
+            manager.register_retracement_pending(plan, execution_result, trade_id="BTCUSDT_1")
+
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}):
+            manager._finalize_retracement_entry(position, 99.0, 1.0, "LIMIT")
+
+        final = manager.positions["BTCUSDT"]
+        self.assertEqual(final["tp_price"], 106)  # unchanged from _retracement_plan's own default
+
     def test_dca_single_tp_places_only_the_full_tp(self):
         manager = _retracement_manager(dca=True, single_tp=True)
         position = manager.positions["BTCUSDT"]

@@ -634,11 +634,30 @@ class BuildTradePlanTests(unittest.TestCase):
         # for MAX_ENTRY_EXTENSION_R/MAX_SL_ROI_PCT above.
         self.static_roi_patcher = patch.object(config, "TP_STATIC_ROI_ENABLED", False)
         self.static_roi_patcher.start()
+        # config.TP2_ENABLED - live .env now has this False (2026-08-28,
+        # operator's own choice) but every test in this class predating
+        # that change assumes the ordinary TP1+TP2 split; pinned True
+        # here so that live value can't silently switch this whole class
+        # onto the single-tp shape, same pattern as static_roi_patcher
+        # above. Tp2DisabledTests below turns it back off locally.
+        self.tp2_enabled_patcher = patch.object(config, "TP2_ENABLED", True)
+        self.tp2_enabled_patcher.start()
+        # config.TP1_CLOSE_PCT - live .env now has this at 100 (operator's
+        # own experiment, before TP2_ENABLED existed as the real fix) -
+        # 100 zeroes out tp2_quantity and trips TP_SPLIT_INVALID for every
+        # test in this class that doesn't explicitly override it. Pinned
+        # to the module's own coded default (config.py's env_float(...,
+        # 50)) so this whole class is insulated from that live value,
+        # same pattern as every other flag pinned above.
+        self.tp1_close_pct_patcher = patch.object(config, "TP1_CLOSE_PCT", 50)
+        self.tp1_close_pct_patcher.start()
 
     def tearDown(self):
         self.extension_patcher.stop()
         self.sl_roi_patcher.stop()
         self.static_roi_patcher.stop()
+        self.tp2_enabled_patcher.stop()
+        self.tp1_close_pct_patcher.stop()
 
     def _signal(self, side="BUY", entry_price=100, structure_level=98, atr=1):
         return {
@@ -748,6 +767,71 @@ class BuildTradePlanTests(unittest.TestCase):
 
         self.assertIsNone(plan)
         self.assertEqual(status, "TARGETS_UNAVAILABLE")
+
+    # config.TP2_ENABLED - live change (2026-08-28), the operator's own
+    # explicit choice to drop TP2 and close the whole position at TP1.
+    # Reuses the single-TP shape _execute_dca already produces post-DCA -
+    # these tests confirm build_trade_plan produces that exact shape from
+    # signal time too, and that the TP1_CLOSE_PCT=100 footgun this flag
+    # replaces (test_static_roi_mode_respects_tp1_close_pct_same_as_
+    # normal_mode above) doesn't apply to it.
+
+    def test_tp2_disabled_produces_a_single_tp_plan(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP2_ENABLED", False), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertTrue(plan["single_tp"])
+        self.assertEqual(plan["tp_price"], plan["tp1_price"])
+        self.assertIsNone(plan["tp1_quantity"])
+        self.assertIsNone(plan["tp2_quantity"])
+
+    def test_tp2_disabled_does_not_trigger_tp_split_invalid(self):
+        # The exact failure mode TP1_CLOSE_PCT=100 would cause (see the
+        # static-roi test above) - TP1_CLOSE_PCT is irrelevant once
+        # single_tp bypasses the split entirely, so even a value that
+        # would normally zero out tp2_quantity has no effect here.
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP2_ENABLED", False), \
+             patch.object(config, "TP1_CLOSE_PCT", 100), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertTrue(plan["single_tp"])
+
+    def test_tp2_disabled_combined_with_static_roi_uses_the_roi_target(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP2_ENABLED", False), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "TP_TARGET_ROI_PCT", 40), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertTrue(plan["single_tp"])
+        self.assertAlmostEqual(plan["tp_price"], 104.0)  # same 40% ROI / 10x target as tp1_price
+        self.assertAlmostEqual(plan["tp1_price"], 104.0)
+        self.assertEqual(plan["tp1_static_roi_pct"], 40)
+
+    def test_tp2_enabled_default_preserves_the_existing_split(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertFalse(plan["single_tp"])
+        self.assertIsNone(plan["tp_price"])
+        self.assertEqual(plan["tp1_quantity"], 5.0)
+        self.assertEqual(plan["tp2_quantity"], 5.0)
 
     def test_nearest_favorable_sr_r_is_threaded_through_from_the_signal_pools(self):
         signal = dict(

@@ -1271,6 +1271,18 @@ TP_STATIC_ROI_ENABLED = env_bool("TP_STATIC_ROI_ENABLED", "False")
 # PROFIT_PROTECTION_HIGH_TP1_ROI_THRESHOLD_PCT elsewhere in this file.
 # Starting value, not calibrated against real trade outcomes yet.
 TP_TARGET_ROI_PCT = env_float("TP_TARGET_ROI_PCT", 40)
+# LIVE CHANGE (2026-08-28) - user's own explicit choice to drop TP2 and
+# close the whole position at TP1 instead of the TP1(TP1_CLOSE_PCT%)+TP2
+# (remainder) split. Reuses the single-TP position shape _execute_dca
+# already produces post-DCA (see risk_manager.build_trade_plan/
+# position_manager.register_dca_pending's own comments) rather than a
+# new mechanism - proven code path, just reachable from signal time now.
+# TP1_CLOSE_PCT/TP2_R_MULTIPLE/TP2_MAX_R_MULTIPLE all become unused
+# while this is off. NOTE: setting TP1_CLOSE_PCT=100 instead of using
+# this flag does NOT work - it makes tp2_quantity exactly 0, which trips
+# build_trade_plan's own TP_SPLIT_INVALID guard and rejects every signal
+# outright.
+TP2_ENABLED = env_bool("TP2_ENABLED", "True")
 MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = env_bool(
     "MOVE_SL_TO_BREAKEVEN_AFTER_TP1", "True"
 )
