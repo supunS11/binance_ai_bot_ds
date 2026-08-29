@@ -43,6 +43,8 @@ class _FakeFeed:
         self.open_interest_okx = _FakeSnapshotSource()
         self.volume_profile = _FakeSnapshotSource()
         self.liquidations = _FakeSnapshotSource()
+        self.liquidations_bybit = _FakeSnapshotSource()
+        self.liquidations_okx = _FakeSnapshotSource()
         self.crash_detector = _FakeCrashDetector()
         self.volumes = volumes if volumes is not None else {}
         self.funding_rates = funding_rates if funding_rates is not None else {}

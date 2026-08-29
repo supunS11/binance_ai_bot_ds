@@ -239,6 +239,48 @@ CROSS_EXCHANGE_OI_MIN_REQUEST_GAP_SECONDS = env_float("CROSS_EXCHANGE_OI_MIN_REQ
 CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED = env_bool("CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", "False")
 
 # =========================
+# CROSS-EXCHANGE LIQUIDATIONS (informational)
+# =========================
+# 2026-08-29: unlike CROSS_EXCHANGE_OI above, this DOES fix a diagnosed
+# problem - the Binance-only liquidation_aligned/liquidation_cluster gates
+# (see LIQUIDATION_CONFIRMATION_ENABLED above) see only one venue's forced-
+# liquidation events; a cascade starting on Bybit/OKX is invisible until
+# (if ever) it shows up on Binance too. Confirmed buildable without a paid
+# vendor: Bybit's `allLiquidation.{symbol}` and OKX's `liquidation-orders`
+# channel are both public, unauthenticated WebSocket push - no REST
+# polling needed here the way cross_exchange_oi.py needs for OI, since
+# liquidations are discrete events, not a periodically-sampled value. Same
+# informational-first, evidence-before-gate rollout convention as every
+# other speculative signal in this file - default OFF, same "new outbound
+# network I/O to hosts never talked to before" caution as CROSS_EXCHANGE_
+# OI_TRACKING_ENABLED's own comment.
+CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED = env_bool(
+    "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", "False"
+)
+# Zero resolved-trade evidence behind this yet, same class of flag as
+# CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED above - built so it's ready once
+# real journal data justifies it, not enabled by default. Implicitly a
+# no-op unless CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED is also True
+# (cross_exchange_liquidation_agree only ever computes when that's on).
+CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED = env_bool(
+    "CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED", "False"
+)
+# LIQUIDATION_WINDOW_SECONDS/LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT/
+# LIQUIDATION_MAX_EVENTS_PER_SYMBOL (above) apply uniformly to the Bybit/
+# OKX LiquidationEngine instances too, not just Binance's - the engine
+# itself is fully generic and already reads these module-level, so no
+# per-venue duplication. Means Bybit/OKX can't be tuned independently of
+# Binance's thresholds yet; revisit only if real data ever shows they
+# should differ. No per-connection topic-count chunking needed for either
+# venue (confirmed live, 2026-08-29): OKX's instType-wide subscription
+# covers the whole market in one connection by design, and Bybit accepted
+# this bot's full ~400-symbol watchlist in a single connection with no
+# count-based rejection - the only real constraint found was a handful of
+# individual symbols Bybit doesn't support for liquidations at all
+# ("handler not found"), handled by ws_client.py's strip-and-retry
+# subscribe loop, not by chunking across sockets.
+
+# =========================
 # VOLUME PROFILE (informational)
 # =========================
 # 2026-08-26 signal-engine "next level" audit: no diagnosed problem

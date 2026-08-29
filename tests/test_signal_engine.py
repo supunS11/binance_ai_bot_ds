@@ -102,6 +102,8 @@ class SignalEngineTests(unittest.TestCase):
         volume_profile_snapshot=None,
         htf_candles=None,
         htf_trend_ema_primary_enabled=False,
+        liquidation_snapshot_bybit=None,
+        liquidation_snapshot_okx=None,
     ):
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
@@ -236,6 +238,8 @@ class SignalEngineTests(unittest.TestCase):
                 funding_rate=funding_rate, crash_snapshot=crash_snapshot,
                 oi_snapshot_bybit=oi_snapshot_bybit, oi_snapshot_okx=oi_snapshot_okx,
                 volume_profile_snapshot=volume_profile_snapshot,
+                liquidation_snapshot_bybit=liquidation_snapshot_bybit,
+                liquidation_snapshot_okx=liquidation_snapshot_okx,
             )
 
     def test_full_buy_signal_when_everything_aligns(self):
@@ -1174,6 +1178,80 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(with_cross["confluence_total"], without_cross["confluence_total"])
         self.assertEqual(with_cross["confluence_score"], without_cross["confluence_score"])
 
+    # config.CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED - informational
+    # only, same shape as CROSS_EXCHANGE_OI_TRACKING_ENABLED above (reuses
+    # cross_exchange_oi.compute_agreement directly - see signal_engine.py's
+    # own comment for why that's not OI-specific despite the module name).
+    # These only prove signal_engine wires liquidation_snapshot_bybit/_okx
+    # through - real parsing is covered in test_cross_exchange_liquidation.py.
+
+    def test_cross_exchange_liquidation_agree_true_when_both_venues_confirm(self):
+        # Default signal direction is BULLISH - a positive net Binance
+        # liquidation notional means longs are being liquidated in a
+        # BULLISH break too, per liquidation_aligned's own definition, but
+        # cross_exchange_liquidation_agree itself only compares sign
+        # against Binance's own net_liquidation_notional, not direction.
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+        bybit = {"available": True, "net_liquidation_notional": 500.0}
+        okx = {"available": True, "net_liquidation_notional": 200.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True):
+            result = self._run(
+                liquidation_snapshot=binance,
+                liquidation_snapshot_bybit=bybit, liquidation_snapshot_okx=okx,
+            )
+
+        self.assertEqual(result["liquidation_notional_net_bybit"], 500.0)
+        self.assertEqual(result["liquidation_notional_net_okx"], 200.0)
+        self.assertTrue(result["cross_exchange_liquidation_agree"])
+
+    def test_cross_exchange_liquidation_agree_false_when_a_venue_disagrees(self):
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+        bybit = {"available": True, "net_liquidation_notional": -500.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED", False):
+            result = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
+
+        self.assertFalse(result["cross_exchange_liquidation_agree"])
+
+    def test_cross_exchange_liquidation_unavailable_snapshot_reads_as_none(self):
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True):
+            result = self._run(
+                liquidation_snapshot=binance,
+                liquidation_snapshot_bybit={"available": False},
+                liquidation_snapshot_okx={"available": False},
+            )
+
+        self.assertIsNone(result["liquidation_notional_net_bybit"])
+        self.assertIsNone(result["liquidation_notional_net_okx"])
+        self.assertIsNone(result["cross_exchange_liquidation_agree"])
+
+    def test_cross_exchange_liquidation_disabled_by_config(self):
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+        bybit = {"available": True, "net_liquidation_notional": 500.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", False):
+            result = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
+
+        self.assertIsNone(result["liquidation_notional_net_bybit"])
+        self.assertIsNone(result["cross_exchange_liquidation_agree"])
+
+    def test_cross_exchange_liquidation_is_never_added_to_confluence_scoring(self):
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+        bybit = {"available": True, "net_liquidation_notional": 500.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True):
+            with_cross = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", False):
+            without_cross = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
+
+        self.assertEqual(with_cross["confluence_total"], without_cross["confluence_total"])
+        self.assertEqual(with_cross["confluence_score"], without_cross["confluence_score"])
+
     # config.VOLUME_PROFILE_TRACKING_ENABLED - descriptive only, no
     # "aligned" field (see config.py's own reasoning). volume_profile.py's
     # own bucketing/POC/value-area math is covered directly in
@@ -1268,6 +1346,48 @@ class SignalEngineTests(unittest.TestCase):
         with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True), \
              patch.object(config, "CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED", False):
             result = self._run(oi_snapshot_bybit=bybit)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    # config.CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED - same zero-
+    # evidence-yet, built-but-off convention as CROSS_EXCHANGE_OI_AGREE_
+    # REJECT_ENABLED above.
+
+    def test_cross_exchange_liquidation_disagree_rejects_when_gate_enabled(self):
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+        bybit = {"available": True, "net_liquidation_notional": -500.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED", True):
+            result = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "CROSS_EXCHANGE_LIQUIDATION_DISAGREE")
+
+    def test_cross_exchange_liquidation_agreement_does_not_reject(self):
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+        bybit = {"available": True, "net_liquidation_notional": 500.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED", True):
+            result = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_cross_exchange_liquidation_unavailable_does_not_reject(self):
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED", True):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_cross_exchange_liquidation_reject_disabled_by_default_flag(self):
+        binance = {"available": True, "net_liquidation_notional": 1000.0}
+        bybit = {"available": True, "net_liquidation_notional": -500.0}
+
+        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True), \
+             patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED", False):
+            result = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
 
         self.assertEqual(result["signal"], "BUY")
 

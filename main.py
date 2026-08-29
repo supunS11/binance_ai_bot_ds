@@ -176,6 +176,8 @@ def _evaluate_symbol(
     oi_snapshot_okx = feed.open_interest_okx.snapshot(symbol)
     volume_profile_snapshot = feed.volume_profile.snapshot(symbol)
     liquidation_snapshot = feed.liquidations.snapshot(symbol)
+    liquidation_snapshot_bybit = feed.liquidations_bybit.snapshot(symbol)
+    liquidation_snapshot_okx = feed.liquidations_okx.snapshot(symbol)
     quote_volume_usdt = feed.volumes.get(symbol)
     btc_candles = feed.candles.get(config.CORRELATION_REFERENCE_SYMBOL)
     funding_rate = feed.funding_rates.get(symbol)
@@ -188,6 +190,8 @@ def _evaluate_symbol(
         funding_rate=funding_rate, crash_snapshot=crash_snapshot,
         oi_snapshot_bybit=oi_snapshot_bybit, oi_snapshot_okx=oi_snapshot_okx,
         volume_profile_snapshot=volume_profile_snapshot,
+        liquidation_snapshot_bybit=liquidation_snapshot_bybit,
+        liquidation_snapshot_okx=liquidation_snapshot_okx,
     )
 
     if not result.get("signal"):

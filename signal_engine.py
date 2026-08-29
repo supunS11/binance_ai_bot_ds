@@ -55,6 +55,7 @@ def evaluate(
     oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,
     btc_candles=None, funding_rate=None, crash_snapshot=None,
     oi_snapshot_bybit=None, oi_snapshot_okx=None, volume_profile_snapshot=None,
+    liquidation_snapshot_bybit=None, liquidation_snapshot_okx=None,
 ):
     if not htf_candles or not ltf_candles:
         return _reject("INSUFFICIENT_CANDLES")
@@ -859,6 +860,42 @@ def evaluate(
                     else liquidation_notional_net < 0
                 )
 
+        # config.CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED - corroboration
+        # only, NOT a gate (same as CROSS_EXCHANGE_OI_TRACKING_ENABLED
+        # above). Sign-only comparison against Binance's own
+        # liquidation_notional_net above, via the same generic compute_
+        # agreement helper cross_exchange_oi_agree already uses - it's a
+        # plain sign comparison, not OI-specific despite the module name.
+        liquidation_notional_net_bybit = None
+        liquidation_notional_net_okx = None
+        cross_exchange_liquidation_agree = None
+
+        if config.CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED:
+            liquidation_snapshot_bybit_ = liquidation_snapshot_bybit or {}
+            liquidation_snapshot_okx_ = liquidation_snapshot_okx or {}
+
+            if liquidation_snapshot_bybit_.get("available"):
+                liquidation_notional_net_bybit = liquidation_snapshot_bybit_.get("net_liquidation_notional")
+
+            if liquidation_snapshot_okx_.get("available"):
+                liquidation_notional_net_okx = liquidation_snapshot_okx_.get("net_liquidation_notional")
+
+            cross_exchange_liquidation_agree = cross_exchange_oi.compute_agreement(
+                liquidation_notional_net, liquidation_notional_net_bybit, liquidation_notional_net_okx
+            )
+
+        # config.CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED - see
+        # config.py's own comment for why this is a live test, not
+        # evidence-backed yet, same convention as CROSS_EXCHANGE_OI_AGREE_
+        # REJECT_ENABLED above. Reject only on an explicit disagreement -
+        # None (unavailable) never blocks, same fail-open convention as
+        # every gate in this function.
+        if (
+            config.CROSS_EXCHANGE_LIQUIDATION_AGREE_REJECT_ENABLED
+            and cross_exchange_liquidation_agree is False
+        ):
+            return _reject("CROSS_EXCHANGE_LIQUIDATION_DISAGREE")
+
         if not cvd_snapshot.get("available"):
             return _reject("ORDER_FLOW_DATA_UNAVAILABLE")
 
@@ -1085,6 +1122,9 @@ def evaluate(
             "liquidation_notional_net": liquidation_notional_net,
             "liquidation_cluster": liquidation_cluster,
             "liquidation_aligned": liquidation_aligned,
+            "liquidation_notional_net_bybit": liquidation_notional_net_bybit,
+            "liquidation_notional_net_okx": liquidation_notional_net_okx,
+            "cross_exchange_liquidation_agree": cross_exchange_liquidation_agree,
             "efficiency_ratio": efficiency_ratio,
             "efficiency_favorable": efficiency_favorable,
             "btc_correlation": btc_correlation,

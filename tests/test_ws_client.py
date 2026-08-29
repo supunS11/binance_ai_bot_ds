@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -518,6 +519,116 @@ class LiquidationStreamUrlTests(unittest.TestCase):
         url = connect_mock.call_args.args[0]
         self.assertEqual(url, "wss://fstream.binance.com/market/stream?streams=!forceOrder@arr")
         self.assertNotIn("/ws/!forceOrder", url)
+
+
+class CrossExchangeLiquidationStreamUrlTests(unittest.TestCase):
+    """Confirms the new Bybit/OKX liquidation loops connect to their real,
+    live-verified (2026-08-29) URLs, same test shape as the existing
+    Binance LiquidationStreamUrlTests above."""
+
+    def test_bybit_connects_to_the_confirmed_mainnet_url(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+
+        def _raise_and_stop(*args, **kwargs):
+            feed.stop_event.set()
+            raise RuntimeError("boom")
+
+        with patch("websockets.sync.client.connect", side_effect=_raise_and_stop) as connect_mock:
+            feed._liquidation_stream_loop_bybit(feed.generation)
+
+        connect_mock.assert_called_once()
+        self.assertEqual(connect_mock.call_args.args[0], "wss://stream.bybit.com/v5/public/linear")
+
+    def test_okx_connects_to_the_confirmed_url(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+
+        def _raise_and_stop(*args, **kwargs):
+            feed.stop_event.set()
+            raise RuntimeError("boom")
+
+        with patch("websockets.sync.client.connect", side_effect=_raise_and_stop) as connect_mock:
+            feed._liquidation_stream_loop_okx(feed.generation)
+
+        connect_mock.assert_called_once()
+        self.assertEqual(connect_mock.call_args.args[0], "wss://ws.okx.com:8443/ws/v5/public")
+
+
+class BybitLiquidationSubscribeTests(unittest.TestCase):
+    """Real live finding (2026-08-29): Bybit rejects the ENTIRE subscribe
+    batch if even one symbol has no liquidation handler (~5% of a real
+    watchlist) - not a per-connection topic-count problem. These lock in
+    the strip-and-retry loop that works around it."""
+
+    def _feed(self, symbols):
+        return RealtimeMarketData(symbols)
+
+    def test_immediate_success_sends_once(self):
+        feed = self._feed(["BTCUSDT", "ETHUSDT"])
+        websocket = Mock()
+        websocket.recv.return_value = json.dumps({"success": True, "ret_msg": "", "op": "subscribe"})
+
+        result = feed._bybit_liquidation_subscribe(websocket, feed.generation)
+
+        self.assertTrue(result)
+        self.assertEqual(websocket.send.call_count, 1)
+        sent = json.loads(websocket.send.call_args.args[0])
+        self.assertEqual(sent["args"], ["allLiquidation.BTCUSDT", "allLiquidation.ETHUSDT"])
+
+    def test_rejected_symbol_is_excluded_and_retried_until_success(self):
+        feed = self._feed(["BTCUSDT", "1000000BOBUSDT", "ETHUSDT"])
+        websocket = Mock()
+        websocket.recv.side_effect = [
+            json.dumps({
+                "success": False,
+                "ret_msg": "error:handler not found,topic:allLiquidation.1000000BOBUSDT",
+            }),
+            json.dumps({"success": True, "ret_msg": ""}),
+        ]
+
+        result = feed._bybit_liquidation_subscribe(websocket, feed.generation)
+
+        self.assertTrue(result)
+        self.assertEqual(websocket.send.call_count, 2)
+        second_sent = json.loads(websocket.send.call_args_list[1].args[0])
+        self.assertEqual(second_sent["args"], ["allLiquidation.BTCUSDT", "allLiquidation.ETHUSDT"])
+
+    def test_every_symbol_rejected_gives_up_and_returns_false(self):
+        feed = self._feed(["BTCUSDT", "ETHUSDT"])
+        websocket = Mock()
+        websocket.recv.side_effect = [
+            json.dumps({"success": False, "ret_msg": "error:handler not found,topic:allLiquidation.BTCUSDT"}),
+            json.dumps({"success": False, "ret_msg": "error:handler not found,topic:allLiquidation.ETHUSDT"}),
+        ]
+
+        result = feed._bybit_liquidation_subscribe(websocket, feed.generation)
+
+        self.assertFalse(result)
+        self.assertEqual(websocket.send.call_count, 2)
+
+    def test_stop_requested_mid_retry_returns_false_without_further_sends(self):
+        feed = self._feed(["BTCUSDT", "ETHUSDT"])
+        websocket = Mock()
+
+        def _reject_and_stop(*args, **kwargs):
+            feed.stop_event.set()
+            return json.dumps({"success": False, "ret_msg": "error:handler not found,topic:allLiquidation.BTCUSDT"})
+
+        websocket.recv.side_effect = _reject_and_stop
+
+        result = feed._bybit_liquidation_subscribe(websocket, feed.generation)
+
+        self.assertFalse(result)
+        self.assertEqual(websocket.send.call_count, 1)
+
+    def test_unrecognized_rejection_reply_gives_up_immediately(self):
+        feed = self._feed(["BTCUSDT"])
+        websocket = Mock()
+        websocket.recv.return_value = json.dumps({"success": False, "ret_msg": "some other error"})
+
+        result = feed._bybit_liquidation_subscribe(websocket, feed.generation)
+
+        self.assertFalse(result)
+        self.assertEqual(websocket.send.call_count, 1)
 
 
 if __name__ == "__main__":

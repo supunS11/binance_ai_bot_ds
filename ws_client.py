@@ -30,6 +30,7 @@ from liquidation_tracker import LiquidationEngine, LIQUIDATION_STREAM_NAME
 from crash_detector import CrashDetector
 from volume_profile import VolumeProfileEngine
 import cross_exchange_oi
+import cross_exchange_liquidation
 
 
 FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
@@ -148,6 +149,11 @@ class RealtimeMarketData:
         self.open_interest_okx = OpenInterestEngine()
         self.volume_profile = VolumeProfileEngine()
         self.liquidations = LiquidationEngine()
+        # Reuses LiquidationEngine as-is (exchange-agnostic - only ever
+        # sees normalized tuples via record_liquidation) for two more
+        # venues - see config.CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED.
+        self.liquidations_bybit = LiquidationEngine()
+        self.liquidations_okx = LiquidationEngine()
         self.crash_detector = CrashDetector()
         # 24h quote volume per symbol - the data behind the signal-time
         # liquidity floor (config.MIN_24H_QUOTE_VOLUME_USDT). Plain dict,
@@ -173,9 +179,13 @@ class RealtimeMarketData:
         self.oi_poll_thread_bybit = None
         self.oi_poll_thread_okx = None
         self.liquidation_thread = None
+        self.liquidation_thread_bybit = None
+        self.liquidation_thread_okx = None
         self.volume_poll_thread = None
         self.funding_poll_thread = None
         self.liquidation_websocket = None
+        self.liquidation_websocket_bybit = None
+        self.liquidation_websocket_okx = None
 
     # =========================
     # LIFECYCLE
@@ -212,6 +222,8 @@ class RealtimeMarketData:
         self._start_oi_poll_bybit()
         self._start_oi_poll_okx()
         self._start_liquidation_stream()
+        self._start_liquidation_stream_bybit()
+        self._start_liquidation_stream_okx()
         self._start_volume_poll()
         self._start_funding_poll()
 
@@ -229,10 +241,18 @@ class RealtimeMarketData:
             self.generation += 1
             market_sockets = list(self.market_websockets.values())
             depth_sockets = list(self.depth_websockets.values())
-            liquidation_sockets = [self.liquidation_websocket] if self.liquidation_websocket else []
+            liquidation_sockets = [
+                socket for socket in (
+                    self.liquidation_websocket,
+                    self.liquidation_websocket_bybit,
+                    self.liquidation_websocket_okx,
+                ) if socket is not None
+            ]
             self.market_websockets = {}
             self.depth_websockets = {}
             self.liquidation_websocket = None
+            self.liquidation_websocket_bybit = None
+            self.liquidation_websocket_okx = None
 
         self._close_websockets(market_sockets + depth_sockets + liquidation_sockets)
 
@@ -895,3 +915,158 @@ class RealtimeMarketData:
                 with self.lock:
                     if self.liquidation_websocket is not None:
                         self.liquidation_websocket = None
+
+    # =========================
+    # CROSS-EXCHANGE LIQUIDATIONS (Bybit + OKX - see config.CROSS_EXCHANGE_
+    # LIQUIDATION_TRACKING_ENABLED)
+    # =========================
+    def _start_liquidation_stream_bybit(self):
+        if not config.CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._liquidation_stream_loop_bybit,
+            args=(generation,),
+            name="realtime-liquidation-stream-bybit",
+            daemon=True,
+        )
+        thread.start()
+        self.liquidation_thread_bybit = thread
+
+    def _bybit_liquidation_subscribe(self, websocket, generation):
+        """Sends the subscribe frame, stripping any symbol Bybit rejects
+        and retrying, until it accepts the remainder or symbols run out.
+        Confirmed live (2026-08-29): Bybit fails the ENTIRE batch if even
+        one symbol has no liquidation handler (~5% of this bot's watchlist,
+        e.g. BTCDOMUSDT/1000SHIBUSDT - not a per-connection topic-count
+        problem, all ~400 symbols fit in one connection fine once the
+        unsupported ones are excluded). Re-discovers the same unsupported
+        symbols from scratch on every reconnect rather than persisting a
+        cooldown set across reconnects - reconnects are infrequent and
+        each retry round-trip is sub-second, so the rediscovery cost is
+        negligible; simpler than adding OI-style unavailable-symbol state
+        for a "permanently unsupported" condition that isn't really a
+        transient rate-limit/network failure. Returns True once
+        subscribed, False if the connection should be abandoned."""
+        symbols = list(self.symbols)
+
+        while symbols:
+            if not self._worker_active(generation):
+                return False
+
+            websocket.send(json.dumps(cross_exchange_liquidation.bybit_subscribe_frame(symbols)))
+
+            try:
+                reply = json.loads(websocket.recv(timeout=10))
+            except TimeoutError:
+                log_warning("Bybit liquidation subscribe timed out waiting for ack")
+                return False
+
+            if reply.get("success"):
+                return True
+
+            rejected = cross_exchange_liquidation.bybit_parse_rejected_symbol(reply)
+
+            if rejected is None:
+                log_warning(f"Bybit liquidation subscribe failed, unrecognized reply: {reply}")
+                return False
+
+            symbols = [symbol for symbol in symbols if symbol != rejected]
+
+        return False
+
+    def _liquidation_stream_loop_bybit(self, generation):
+        from websockets.sync.client import connect
+
+        while self._worker_active(generation):
+            try:
+                with connect(
+                    cross_exchange_liquidation.BYBIT_WS_URL,
+                    open_timeout=10,
+                    close_timeout=2,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as websocket:
+                    with self.lock:
+                        if generation != self.generation:
+                            return
+                        self.liquidation_websocket_bybit = websocket
+
+                    if not self._bybit_liquidation_subscribe(websocket, generation):
+                        continue
+
+                    while self._worker_active(generation):
+                        try:
+                            message = websocket.recv(timeout=2)
+                        except TimeoutError:
+                            continue
+
+                        parsed = cross_exchange_liquidation.parse_bybit_liquidation(json.loads(message))
+
+                        if parsed is not None:
+                            self.liquidations_bybit.record_liquidation(*parsed)
+
+            except Exception as exc:
+                if self._worker_active(generation):
+                    log_warning(f"Realtime Bybit liquidation websocket reconnecting: {exc}")
+                    self.stop_event.wait(3)
+            finally:
+                with self.lock:
+                    if self.liquidation_websocket_bybit is not None:
+                        self.liquidation_websocket_bybit = None
+
+    def _start_liquidation_stream_okx(self):
+        if not config.CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._liquidation_stream_loop_okx,
+            args=(generation,),
+            name="realtime-liquidation-stream-okx",
+            daemon=True,
+        )
+        thread.start()
+        self.liquidation_thread_okx = thread
+
+    def _liquidation_stream_loop_okx(self, generation):
+        from websockets.sync.client import connect
+
+        while self._worker_active(generation):
+            try:
+                with connect(
+                    cross_exchange_liquidation.OKX_WS_URL,
+                    open_timeout=10,
+                    close_timeout=2,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as websocket:
+                    with self.lock:
+                        if generation != self.generation:
+                            return
+                        self.liquidation_websocket_okx = websocket
+
+                    websocket.send(json.dumps(cross_exchange_liquidation.okx_subscribe_frame()))
+
+                    while self._worker_active(generation):
+                        try:
+                            message = websocket.recv(timeout=2)
+                        except TimeoutError:
+                            continue
+
+                        for parsed in cross_exchange_liquidation.parse_okx_liquidation(json.loads(message)):
+                            self.liquidations_okx.record_liquidation(*parsed)
+
+            except Exception as exc:
+                if self._worker_active(generation):
+                    log_warning(f"Realtime OKX liquidation websocket reconnecting: {exc}")
+                    self.stop_event.wait(3)
+            finally:
+                with self.lock:
+                    if self.liquidation_websocket_okx is not None:
+                        self.liquidation_websocket_okx = None
