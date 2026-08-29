@@ -193,6 +193,42 @@ class EnterTradeLiveModeTests(unittest.TestCase):
         self.assertIsNone(result["tp2_order"])
 
 
+class EnterTradeShadowOnlyTriggerTests(unittest.TestCase):
+    """config.SHADOW_ONLY_TRIGGERS - forces an individual trigger into
+    shadow while EXECUTION_MODE stays LIVE (real motivation, 2026-08-29:
+    CVD_DIVERGENCE went from zero live track record to 60% of trade
+    volume overnight after a data-seeding bug fix - forced into shadow for
+    further evaluation without risking more capital)."""
+
+    def test_matching_trigger_forces_shadow_even_though_mode_is_live(self):
+        plan = dict(_plan(), signal_trigger="CVD_DIVERGENCE")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(exchange, "place_market_order") as market_order:
+            result = execution.enter_trade(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["shadow"])
+        market_order.assert_not_called()
+
+    def test_non_matching_trigger_is_unaffected_and_trades_live(self):
+        plan = dict(_plan(), signal_trigger="STRUCTURE_BREAK")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "status": "FILLED", "avgPrice": "100"}) as market_order, \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
+            result = execution.enter_trade(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["shadow"])
+        market_order.assert_called_once()
+
+
 class EnterTradeLimitShadowModeTests(unittest.TestCase):
     def test_shadow_mode_places_no_real_orders(self):
         with patch.object(config, "EXECUTION_MODE", "SHADOW"), \
@@ -246,6 +282,33 @@ class EnterTradeLimitLiveModeTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("boom", result["error"])
+
+
+class EnterTradeLimitShadowOnlyTriggerTests(unittest.TestCase):
+    def test_matching_trigger_forces_shadow_even_though_mode_is_live(self):
+        plan = dict(_plan(), signal_trigger="CVD_DIVERGENCE")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            result = execution.enter_trade_limit(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["shadow"])
+        limit_order.assert_not_called()
+
+    def test_non_matching_trigger_is_unaffected_and_trades_live(self):
+        plan = dict(_plan(), signal_trigger="STRUCTURE_BREAK")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}) as limit_order:
+            result = execution.enter_trade_limit(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["shadow"])
+        limit_order.assert_called_once()
 
 
 class EnterTradeRetracementShadowModeTests(unittest.TestCase):
@@ -328,6 +391,35 @@ class EnterTradeRetracementLiveModeTests(unittest.TestCase):
             100, 98, "BUY",
             fvgs=plan["fair_value_gaps"], pools=plan["liquidity_pools"],
         )
+
+
+class EnterTradeRetracementShadowOnlyTriggerTests(unittest.TestCase):
+    def test_matching_trigger_forces_shadow_even_though_mode_is_live(self):
+        plan = dict(_plan(), signal_trigger="CVD_DIVERGENCE")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            result = execution.enter_trade_retracement(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["shadow"])
+        limit_order.assert_not_called()
+
+    def test_non_matching_trigger_is_unaffected_and_trades_live(self):
+        plan = dict(_plan(), signal_trigger="STRUCTURE_BREAK")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}) as limit_order:
+            result = execution.enter_trade_retracement(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["shadow"])
+        limit_order.assert_called_once()
 
 
 def _dca_plan():
@@ -416,6 +508,35 @@ class EnterTradeDcaPendingLiveModeTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIsNone(result["tp1_order"])
+
+
+class EnterTradeDcaPendingShadowOnlyTriggerTests(unittest.TestCase):
+    def test_matching_trigger_forces_shadow_even_though_mode_is_live(self):
+        plan = dict(_dca_plan(), signal_trigger="CVD_DIVERGENCE")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(exchange, "place_market_order") as market_order:
+            result = execution.enter_trade_dca_pending(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["shadow"])
+        market_order.assert_not_called()
+
+    def test_non_matching_trigger_is_unaffected_and_trades_live(self):
+        plan = dict(_dca_plan(), signal_trigger="STRUCTURE_BREAK")
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", ["CVD_DIVERGENCE"]), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "100"}) as market_order, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
+            result = execution.enter_trade_dca_pending(plan)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["shadow"])
+        market_order.assert_called_once()
 
 
 class EnterTradeDcaPendingSingleTpTests(unittest.TestCase):

@@ -1824,6 +1824,21 @@ DCA_BREAKEVEN_TRAILING_CALLBACK_RATE = env_float("DCA_BREAKEVEN_TRAILING_CALLBAC
 # running this bot for the first time cannot place a real order by
 # accident - flip explicitly once shadow signal quality has been reviewed.
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "SHADOW").strip().upper()
+# Per-trigger override, evidence-gate philosophy applied at the trigger
+# level instead of the whole bot: forces every signal from a listed
+# trigger into shadow (evaluated/sized/journaled/tracked, no real order)
+# regardless of EXECUTION_MODE - one-directional, can only ADD shadow
+# behavior on top of LIVE, never force a trigger LIVE while the bot is
+# globally SHADOW. Real motivation (2026-08-29): CVD_DIVERGENCE was
+# structurally dead this bot's entire history until a data-seeding bug fix
+# earlier this session - since deploying, it became 60% of trade volume
+# (9/15 signals) with zero prior live track record, including one real
+# loss and one DCA rescue. This lets it keep running and journaling for
+# evaluation without risking further real capital until it earns a live
+# default the same way every other mechanism in this file does. Names must
+# match signal_engine.py's signal_trigger values - case-insensitive, see
+# env_str_list above (comma-split, stripped, uppercased).
+SHADOW_ONLY_TRIGGERS = env_str_list("SHADOW_ONLY_TRIGGERS", [])
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)
 # A signal must keep qualifying for this many consecutive eval ticks

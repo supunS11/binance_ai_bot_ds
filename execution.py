@@ -6,7 +6,9 @@ whatever remains after TP1.
 
 Defaults to SHADOW mode (config.EXECUTION_MODE) - real order placement
 only happens once that's explicitly switched to LIVE, so the very first
-run of this bot cannot place a real order by accident.
+run of this bot cannot place a real order by accident. config.SHADOW_ONLY_
+TRIGGERS can also force an individual trigger into shadow while the bot
+stays globally LIVE - see _is_shadow_mode below.
 """
 import time
 
@@ -14,6 +16,19 @@ import config
 import exchange
 import risk_manager
 from logger import log_error, log_info, log_warning
+
+
+def _is_shadow_mode(plan):
+    """True if this specific plan should not place a real order - either
+    the whole bot is in shadow mode, or its trigger is individually forced
+    into shadow via config.SHADOW_ONLY_TRIGGERS (evidence-gate philosophy
+    applied per-trigger instead of bot-wide - see that config's own
+    comment). One-directional: can only add shadow behavior on top of
+    LIVE, never force a trigger LIVE while EXECUTION_MODE is SHADOW."""
+    return (
+        config.EXECUTION_MODE != "LIVE"
+        or plan.get("signal_trigger") in config.SHADOW_ONLY_TRIGGERS
+    )
 
 # config.DCA_RESTING_ORDER_ENABLED - tags the resting LIMIT order placed
 # for the DCA add itself (a plain order, not algo - see exchange.
@@ -168,7 +183,7 @@ def enter_trade(plan):
     symbol = plan["symbol"]
     side = plan["side"]
 
-    if config.EXECUTION_MODE != "LIVE":
+    if _is_shadow_mode(plan):
         log_info(
             f"[SHADOW] {symbol} would enter {side} qty={plan['quantity']} "
             f"entry~={plan['entry_price']} SL={plan['sl_price']} "
@@ -250,7 +265,7 @@ def enter_trade_dca_pending(plan):
     side = plan["side"]
     single_tp = plan.get("single_tp")
 
-    if config.EXECUTION_MODE != "LIVE":
+    if _is_shadow_mode(plan):
         if single_tp:
             log_info(
                 f"[SHADOW] {symbol} would enter {side} qty={plan['quantity']} "
@@ -331,7 +346,7 @@ def enter_trade_limit(plan):
     symbol = plan["symbol"]
     side = plan["side"]
 
-    if config.EXECUTION_MODE != "LIVE":
+    if _is_shadow_mode(plan):
         log_info(
             f"[SHADOW] {symbol} would place a LIMIT {side} qty={plan['quantity']} "
             f"@ {plan['entry_price']} SL={plan['sl_price']} "
@@ -386,7 +401,7 @@ def enter_trade_retracement(plan):
         fvgs=plan.get("fair_value_gaps"), pools=plan.get("liquidity_pools"),
     )
 
-    if config.EXECUTION_MODE != "LIVE":
+    if _is_shadow_mode(plan):
         log_info(
             f"[SHADOW] {symbol} would place a RETRACEMENT limit {side} "
             f"qty={plan['quantity']} @ {retracement_price} "

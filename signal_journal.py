@@ -100,9 +100,17 @@ def _make_trade_id(symbol):
     return f"{symbol}_{int(time.time() * 1000)}"
 
 
-def append_signal(signal, plan):
+def append_signal(signal, plan, execution_result=None):
     """Returns the trade_id so the caller can pass it to position_manager,
-    which threads it through to append_outcome when the trade closes."""
+    which threads it through to append_outcome when the trade closes.
+
+    execution_result: the real per-trade outcome from execution.py's
+    enter_trade*/execution_result dict (has a real "shadow" bool) - when
+    provided, execution_mode reflects what ACTUALLY happened for this
+    trade (config.SHADOW_ONLY_TRIGGERS can force shadow per-trigger while
+    config.EXECUTION_MODE stays LIVE), not just the global config echoed a
+    second time. Optional and defaults to the old config-echo behavior so
+    existing callers that don't have it yet are unaffected."""
     trade_id = _make_trade_id(signal.get("symbol") or "UNKNOWN")
     entry_price = plan.get("entry_price") or 0
     risk_distance = plan.get("risk_distance") or 0
@@ -205,7 +213,10 @@ def append_signal(signal, plan):
         "size_multiplier": plan.get("size_multiplier"),
         "tp1_r_multiple": config.TP1_R_MULTIPLE,
         "tp2_r_multiple": config.TP2_R_MULTIPLE,
-        "execution_mode": config.EXECUTION_MODE,
+        "execution_mode": (
+            ("SHADOW" if execution_result.get("shadow") else "LIVE")
+            if execution_result is not None else config.EXECUTION_MODE
+        ),
     })
     _append_row(row)
     return trade_id

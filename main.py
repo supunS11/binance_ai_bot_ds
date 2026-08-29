@@ -262,6 +262,9 @@ def _evaluate_symbol(
     # this line runs.
     plan["structure_level"] = result.get("structure_level")
     plan["trigger_candle_open_time"] = result.get("trigger_candle_open_time")
+    # config.SHADOW_ONLY_TRIGGERS - execution._is_shadow_mode reads this
+    # off plan, not result, to decide per-trigger shadow routing.
+    plan["signal_trigger"] = result.get("signal_trigger")
 
     # config.TP_STATIC_ROI_ENABLED - see position_manager's heartbeat log
     # comment for why single-TP plans need their own display.
@@ -323,7 +326,7 @@ def _evaluate_symbol(
         positions.mark_entry_failure(symbol)
         return
 
-    trade_id = signal_journal.append_signal(result, plan)
+    trade_id = signal_journal.append_signal(result, plan, execution_result)
 
     if use_retracement:
         positions.register_retracement_pending(plan, execution_result, trade_id=trade_id)

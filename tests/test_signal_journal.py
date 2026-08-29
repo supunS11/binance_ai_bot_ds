@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import config
 import signal_journal
 
 
@@ -56,6 +57,33 @@ class SignalJournalTests(unittest.TestCase):
     def test_append_signal_returns_a_trade_id(self):
         trade_id = signal_journal.append_signal(_signal(), _plan())
         self.assertTrue(trade_id.startswith("BTCUSDT_"))
+
+    # config.SHADOW_ONLY_TRIGGERS - execution_mode must reflect what
+    # ACTUALLY happened for this specific trade (a per-trigger shadow
+    # override can force shadow while EXECUTION_MODE stays LIVE), not just
+    # echo the global config a second time - real gap found and fixed
+    # 2026-08-29 alongside that feature.
+
+    def test_execution_mode_reflects_a_real_shadow_result_even_when_global_mode_is_live(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"):
+            signal_journal.append_signal(_signal(), _plan(), execution_result={"shadow": True})
+
+        row = self._read_rows()[0]
+        self.assertEqual(row["execution_mode"], "SHADOW")
+
+    def test_execution_mode_reflects_a_real_live_result_even_when_global_mode_is_shadow(self):
+        with patch.object(config, "EXECUTION_MODE", "SHADOW"):
+            signal_journal.append_signal(_signal(), _plan(), execution_result={"shadow": False})
+
+        row = self._read_rows()[0]
+        self.assertEqual(row["execution_mode"], "LIVE")
+
+    def test_execution_mode_falls_back_to_the_global_config_when_execution_result_is_omitted(self):
+        with patch.object(config, "EXECUTION_MODE", "LIVE"):
+            signal_journal.append_signal(_signal(), _plan())
+
+        row = self._read_rows()[0]
+        self.assertEqual(row["execution_mode"], "LIVE")
 
     def test_append_signal_writes_diagnostic_fields(self):
         signal_journal.append_signal(_signal(), _plan())

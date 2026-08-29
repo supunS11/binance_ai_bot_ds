@@ -168,6 +168,36 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
         self.assertEqual(len(reject_counts), 0)
         self.assertEqual(len(positions.registered), 1)
 
+    def test_signal_trigger_is_copied_onto_plan_before_execution_and_journaling(self):
+        # config.SHADOW_ONLY_TRIGGERS - execution._is_shadow_mode reads
+        # plan["signal_trigger"], not result["signal_trigger"] - this
+        # must be populated before execution.enter_trade is called, same
+        # precedent as the existing structure_level/trigger_candle_open_time
+        # copy-through.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        plan = {
+            "symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+            "tp1_price": 102, "tp2_price": 104,
+        }
+        execution_result = {"ok": True, "shadow": True}
+        result = {"signal": "BUY", "signal_trigger": "CVD_DIVERGENCE"}
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(plan, "OK")), \
+             patch.object(execution, "enter_trade", return_value=execution_result) as enter_trade, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_123") as append_signal:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
+
+        entered_plan = enter_trade.call_args.args[0]
+        self.assertEqual(entered_plan["signal_trigger"], "CVD_DIVERGENCE")
+        append_signal.assert_called_once()
+        journaled_result, journaled_plan, journaled_execution_result = append_signal.call_args.args
+        self.assertIs(journaled_plan, plan)
+        self.assertEqual(journaled_plan["signal_trigger"], "CVD_DIVERGENCE")
+        self.assertIs(journaled_execution_result, execution_result)
+
     def test_quote_volume_is_passed_through_to_signal_engine(self):
         feed = _FakeFeed(volumes={"BTCUSDT": 42_000_000})
         positions = _FakePositions()
