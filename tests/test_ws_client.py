@@ -414,5 +414,111 @@ class ResetConnectionTests(unittest.TestCase):
         self.assertGreater(feed.last_depth_message_at, 0.0)
 
 
+class SeedHistoryTests(unittest.TestCase):
+    """Real incident (2026-08-29): CVD_DIVERGENCE_TRIGGER_ENABLED/OI_
+    DIVERGENCE_TRIGGER_ENABLED are both live but never once found matching
+    data (0/1,457,496 and 0/3,068,258 diagnostic log lines respectively),
+    because CVDEngine/OpenInterestEngine's in-memory history used to start
+    empty on every restart while self.candles (compared against for swing
+    points) is REST-seeded and restart-surviving. _seed_history now seeds
+    both the same way candles already are - gated behind the same flags
+    that gate the trigger/diagnostic itself, so no REST budget is spent
+    seeding data nobody reads when either is off."""
+
+    def _feed(self):
+        return RealtimeMarketData(["BTCUSDT"])
+
+    def test_cvd_is_seeded_from_the_same_ltf_dataframe_as_candles_when_enabled(self):
+        feed = self._feed()
+        ltf_sentinel = pd.DataFrame([{"time": 1, "tbqav": "1", "qav": "1"}])
+
+        with patch("ws_client.get_klines", return_value=ltf_sentinel) as klines_mock, \
+             patch.object(feed.candles, "seed"), \
+             patch.object(feed.htf_candles, "seed"), \
+             patch.object(feed.cvd, "seed_from_klines") as cvd_seed_mock, \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", False):
+            feed._seed_history()
+
+        cvd_seed_mock.assert_called_once_with("BTCUSDT", ltf_sentinel)
+        # Only the existing 2 calls (LTF + HTF candles) - CVD reuses the
+        # LTF one rather than triggering a 3rd get_klines call of its own.
+        self.assertEqual(klines_mock.call_count, 2)
+
+    def test_cvd_seeding_is_skipped_when_the_trigger_is_disabled(self):
+        feed = self._feed()
+
+        with patch("ws_client.get_klines", return_value=pd.DataFrame()), \
+             patch.object(feed.candles, "seed"), \
+             patch.object(feed.htf_candles, "seed"), \
+             patch.object(feed.cvd, "seed_from_klines") as cvd_seed_mock, \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", False), \
+             patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", False):
+            feed._seed_history()
+
+        cvd_seed_mock.assert_not_called()
+
+    def test_oi_is_seeded_from_get_open_interest_history_when_enabled(self):
+        feed = self._feed()
+        history_sentinel = [(100.0, 1000.0)]
+
+        with patch("ws_client.get_klines", return_value=pd.DataFrame()), \
+             patch.object(feed.candles, "seed"), \
+             patch.object(feed.htf_candles, "seed"), \
+             patch("ws_client.get_open_interest_history", return_value=history_sentinel) as oi_hist_mock, \
+             patch.object(feed.open_interest, "seed_from_history") as oi_seed_mock, \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", False), \
+             patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", True):
+            feed._seed_history()
+
+        oi_hist_mock.assert_called_once_with("BTCUSDT")
+        oi_seed_mock.assert_called_once_with("BTCUSDT", history_sentinel)
+
+    def test_oi_seeding_is_skipped_when_the_trigger_is_disabled(self):
+        feed = self._feed()
+
+        with patch("ws_client.get_klines", return_value=pd.DataFrame()), \
+             patch.object(feed.candles, "seed"), \
+             patch.object(feed.htf_candles, "seed"), \
+             patch("ws_client.get_open_interest_history") as oi_hist_mock, \
+             patch.object(feed.open_interest, "seed_from_history") as oi_seed_mock, \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", False), \
+             patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", False):
+            feed._seed_history()
+
+        oi_hist_mock.assert_not_called()
+        oi_seed_mock.assert_not_called()
+
+
+class LiquidationStreamUrlTests(unittest.TestCase):
+    """Real bug found live (2026-08-29): the liquidation stream used a
+    bare, unrouted wss://fstream.binance.com/ws/!forceOrder@arr URL.
+    Binance's WebSocket routing change (deadline 2026-04-23, already
+    passed) means an unrouted connection now only receives /public-
+    category data, and forceOrder is a /market-category stream (confirmed
+    against Binance's own docs) - so this silently delivered zero
+    liquidation events from that date forward (confirmed live: 0/191
+    resolved trades ever had liquidation data, 0 messages on a real 90s
+    connection to the old URL, real messages within seconds on the routed
+    one). Locks in that the stream now connects through the same routed
+    /market/stream?streams= base every other market-category stream
+    (kline/aggTrade) already uses, instead of its own hardcoded URL."""
+
+    def test_connects_to_the_routed_market_stream_url_not_the_legacy_bare_one(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+
+        def _raise_and_stop(*args, **kwargs):
+            feed.stop_event.set()
+            raise RuntimeError("boom")
+
+        with patch("websockets.sync.client.connect", side_effect=_raise_and_stop) as connect_mock:
+            feed._liquidation_stream_loop(feed.generation)
+
+        connect_mock.assert_called_once()
+        url = connect_mock.call_args.args[0]
+        self.assertEqual(url, "wss://fstream.binance.com/market/stream?streams=!forceOrder@arr")
+        self.assertNotIn("/ws/!forceOrder", url)
+
+
 if __name__ == "__main__":
     unittest.main()

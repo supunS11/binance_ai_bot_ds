@@ -116,5 +116,61 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(engine.snapshot("DOESNOTEXIST")["history"], [])
 
 
+class SeedFromHistoryTests(unittest.TestCase):
+    """Backs OI_DIVERGENCE_TRIGGER_ENABLED - real incident (2026-08-29):
+    0/3,068,258 OI_DIVERGENCE_DIAGNOSTIC log lines ever found matching
+    data, because _samples used to start empty on every restart while the
+    swing points it's compared against come from REST-seeded, restart-
+    surviving candle history. seed_from_history backfills _samples the
+    same way at startup, from exchange.get_open_interest_history's
+    return shape."""
+
+    def test_seeds_history_from_timestamp_oi_value_tuples(self):
+        engine = OpenInterestEngine()
+
+        engine.seed_from_history("BTCUSDT", [(100.0, 1000.0), (200.0, 1100.0)])
+
+        self.assertEqual(engine.history("BTCUSDT"), [(100.0, 1000.0), (200.0, 1100.0)])
+
+    def test_out_of_order_rows_are_sorted_ascending(self):
+        """External API response, not this module's own append path -
+        _oi_at_or_before's correctness depends on ascending order, so
+        this can't just trust the input's given order."""
+        engine = OpenInterestEngine()
+
+        engine.seed_from_history("BTCUSDT", [(200.0, 1100.0), (100.0, 1000.0)])
+
+        self.assertEqual(engine.history("BTCUSDT"), [(100.0, 1000.0), (200.0, 1100.0)])
+
+    def test_empty_or_none_history_rows_is_a_no_op(self):
+        engine = OpenInterestEngine()
+
+        engine.seed_from_history("BTCUSDT", [])
+        engine.seed_from_history("BTCUSDT", None)
+
+        self.assertEqual(engine.history("BTCUSDT"), [])
+
+    def test_seeded_history_is_bounded_by_oi_history_max_samples(self):
+        engine = OpenInterestEngine()
+
+        with patch.object(config, "OI_HISTORY_MAX_SAMPLES", 3):
+            engine.seed_from_history(
+                "BTCUSDT", [(float(i), 1000.0 + i) for i in range(5)]
+            )
+
+        self.assertEqual(len(engine.history("BTCUSDT")), 3)
+        self.assertEqual([ts for ts, _ in engine.history("BTCUSDT")], [2.0, 3.0, 4.0])
+
+    def test_a_later_live_sample_appends_after_the_seeded_history(self):
+        engine = OpenInterestEngine()
+        engine.seed_from_history("BTCUSDT", [(100.0, 1000.0)])
+
+        engine.record("BTCUSDT", 1200.0, timestamp=200.0)
+
+        self.assertEqual(
+            engine.history("BTCUSDT"), [(100.0, 1000.0), (200.0, 1200.0)]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

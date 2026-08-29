@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 import config
 from order_flow import CVDEngine
 
@@ -163,6 +165,65 @@ class CVDHistoryTests(unittest.TestCase):
         engine.reset()
 
         self.assertEqual(engine.cvd_history("BTCUSDT"), [])
+
+
+class SeedFromKlinesTests(unittest.TestCase):
+    """Backs config.CVD_DIVERGENCE_TRIGGER_ENABLED - real incident
+    (2026-08-29): 0/1,457,496 CVD_DIVERGENCE_DIAGNOSTIC log lines ever
+    found matching data, because cvd_history used to start empty on
+    every restart while the swing points it's compared against come from
+    REST-seeded, restart-surviving candle history. seed_from_klines
+    backfills cvd_history the same way at startup, from the same klines
+    DataFrame ws_client._seed_history() already fetches for candles - raw
+    'tbqav'/'qav' columns arrive as strings from exchange._klines_to_df,
+    exactly as mirrored here."""
+
+    def _klines_df(self, rows):
+        # (open_time, taker_buy_quote_asset_volume, quote_asset_volume) -
+        # deliberately left as strings, matching exchange._klines_to_df's
+        # real (unconverted) column dtypes for these two fields.
+        return pd.DataFrame([
+            {"time": t, "tbqav": str(tbqav), "qav": str(qav)}
+            for t, tbqav, qav in rows
+        ])
+
+    def test_computes_signed_notional_as_taker_buy_minus_taker_sell_quote_volume(self):
+        engine = CVDEngine()
+        df = self._klines_df([
+            (1000, 600, 1000),  # signed_notional = 2*600 - 1000 = 200
+            (2000, 300, 1000),  # signed_notional = 2*300 - 1000 = -400 -> running 200-400=-200
+        ])
+
+        engine.seed_from_klines("BTCUSDT", df)
+
+        self.assertEqual(engine.cvd_history("BTCUSDT"), [
+            {"open_time": 1000, "cumulative_cvd": 200.0},
+            {"open_time": 2000, "cumulative_cvd": -200.0},
+        ])
+
+    def test_none_or_empty_dataframe_is_a_no_op(self):
+        engine = CVDEngine()
+
+        engine.seed_from_klines("BTCUSDT", None)
+        engine.seed_from_klines("BTCUSDT", pd.DataFrame())
+
+        self.assertEqual(engine.cvd_history("BTCUSDT"), [])
+
+    def test_a_later_live_trade_continues_accumulating_from_the_seeded_baseline(self):
+        """Regression guard for the exact bug the plan called out: without
+        also seeding _cumulative (not just _cvd_history), the first live
+        record_trade after seeding would resume from 0 and create a fake
+        discontinuity the next finalize_candle would bake in permanently."""
+        engine = CVDEngine()
+        df = self._klines_df([(1000, 600, 1000)])  # seeds cumulative to 200
+
+        engine.seed_from_klines("BTCUSDT", df)
+        engine.record_trade("BTCUSDT", price=10, quantity=5, is_buyer_maker=False, timestamp=1500)  # +50
+        engine.finalize_candle("BTCUSDT", open_time=2000)
+
+        history = engine.cvd_history("BTCUSDT")
+
+        self.assertEqual(history[-1], {"open_time": 2000, "cumulative_cvd": 250.0})
 
 
 if __name__ == "__main__":

@@ -17,7 +17,25 @@ from collections import deque
 import config
 
 
-LIQUIDATION_STREAM_URL = "wss://fstream.binance.com/ws/!forceOrder@arr"
+# Real bug found live (2026-08-29): this used to be a complete, bare
+# wss://fstream.binance.com/ws/!forceOrder@arr URL. Binance's "Important
+# WebSocket Change Notice" requires every stream to connect through a
+# routed prefix (/public, /market, or /private) as of 2026-04-23 - an
+# unrouted /ws/ connection now only receives /public-category data, and
+# forceOrder (both !forceOrder@arr and <symbol>@forceOrder) is a /market-
+# category stream, confirmed against Binance's own docs. The bare URL
+# above silently stopped delivering any data on that date - confirmed via
+# a live 90s connection receiving zero messages, and confirmed fixed via
+# a live connection to the routed URL receiving real liquidation events
+# within seconds. ws_client.py's kline/aggTrade streams already migrated
+# to the routed /market/stream?streams= form (see its own _market_stream_
+# base()) when this same change presumably broke them too - this module
+# was evidently missed in that migration. Now just the stream name; the
+# full routed URL is built in ws_client._liquidation_stream_loop the same
+# way _market_stream_loop/_depth_stream_loop already build theirs, so it
+# shares the same testnet-aware base and doesn't need its own copy of
+# that logic.
+LIQUIDATION_STREAM_NAME = "!forceOrder@arr"
 
 
 def _safe_float(value, default=0.0):

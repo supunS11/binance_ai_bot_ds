@@ -621,6 +621,52 @@ class OpenInterestTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class OpenInterestHistoryTests(unittest.TestCase):
+    """Backs OpenInterestEngine.seed_from_history - fixes OI_DIVERGENCE_
+    TRIGGER_ENABLED never finding data because in-memory OI history used
+    to start empty on every restart (2026-08-29 finding: 0/3,068,258
+    OI_DIVERGENCE_DIAGNOSTIC log lines ever found data)."""
+
+    def setUp(self):
+        exchange._oi_unavailable_symbols.clear()
+
+    def tearDown(self):
+        exchange._oi_unavailable_symbols.clear()
+
+    def test_returns_ascending_seconds_timestamp_tuples(self):
+        rows = [
+            {"symbol": "BTCUSDT", "sumOpenInterest": "100.5", "timestamp": 1000000},
+            {"symbol": "BTCUSDT", "sumOpenInterest": "101.0", "timestamp": 1300000},
+        ]
+
+        with patch.object(exchange.client, "futures_open_interest_hist", return_value=rows):
+            result = exchange.get_open_interest_history("BTCUSDT")
+
+        self.assertEqual(result, [(1000.0, 100.5), (1300.0, 101.0)])
+
+    def test_returns_none_on_error_instead_of_raising(self):
+        with patch.object(exchange.client, "futures_open_interest_hist", side_effect=RuntimeError("boom")):
+            result = exchange.get_open_interest_history("BTCUSDT")
+
+        self.assertIsNone(result)
+
+    def test_shares_the_unavailable_cooldown_with_get_open_interest(self):
+        """A symbol marked unavailable via the current-value endpoint
+        must also skip the history endpoint during its cooldown, not
+        just the one that tripped it - same _oi_unavailable_symbols
+        state, deliberately."""
+        error = Exception("APIError(code=-4108): Symbol is on delivering or delivered or settling or closed or pre-trading.")
+
+        with patch.object(exchange.client, "futures_open_interest", side_effect=error):
+            exchange.get_open_interest("ALLOUSDT")
+
+        with patch.object(exchange.client, "futures_open_interest_hist") as mock_call:
+            result = exchange.get_open_interest_history("ALLOUSDT")
+
+        self.assertIsNone(result)
+        mock_call.assert_not_called()
+
+
 class OpenInterestUnavailableSymbolTests(unittest.TestCase):
     """Real bug found live (2026-08-08, WATCHING=519): a large watchlist
     includes symbols the OI endpoint permanently rejects (delisted/

@@ -922,6 +922,78 @@ def get_open_interest(symbol):
         return None
 
 
+def get_open_interest_history(symbol, period="5m", limit=288):
+    """Historical open interest (in contracts, same unit as get_open_
+    interest's current-value field) - backs OpenInterestEngine.seed_from_
+    history, which fixes OI_DIVERGENCE_TRIGGER_ENABLED never finding data
+    (see open_interest.py's own comment): unlike the REST-seeded candle
+    history swing points come from, OI's in-memory history used to start
+    empty on every restart. period="5m" matches WS_KLINE_INTERVAL's
+    granularity (this endpoint only accepts Binance's fixed enum periods,
+    not arbitrary intervals); limit=288 is ~24h of coverage at that
+    granularity, matching OI_HISTORY_MAX_SAMPLES's original ~24h intent -
+    confirmed live against the real endpoint (2026-08-29): count=288,
+    span=~24h, and limit=500 also succeeds, so 288 is comfortably under
+    the real per-request cap.
+
+    Shares the same unavailable-symbol cooldown as get_open_interest
+    above (_oi_unavailable_symbols) - a symbol already known permanently
+    invalid there should skip this endpoint too, not just the live one.
+
+    Returns a list of (timestamp_seconds, oi_value) tuples in ascending
+    time order, or None on failure - same failure contract as get_open_
+    interest. timestamp is converted from Binance's raw milliseconds to
+    real Unix seconds, matching OpenInterestEngine.history()'s own
+    documented convention."""
+    now = time.time()
+
+    with _oi_unavailable_lock:
+        unavailable_until = _oi_unavailable_symbols.get(symbol, 0.0)
+
+    if now < unavailable_until:
+        return None
+
+    try:
+        data = _public_rest_call(
+            f"futures_open_interest_hist:{symbol}",
+            client.futures_open_interest_hist,
+            symbol=symbol,
+            period=period,
+            limit=limit,
+            weight=1,
+        )
+
+        with _oi_unavailable_lock:
+            _oi_unavailable_symbols.pop(symbol, None)
+
+        return [
+            (float(row["timestamp"]) / 1000, float(row["sumOpenInterest"]))
+            for row in data
+        ]
+
+    except Exception as exc:
+        if _is_public_rest_backoff_error(exc):
+            return None
+
+        if _OI_UNAVAILABLE_SYMBOL_RE.search(str(exc)):
+            cooldown = max(float(config.OI_UNAVAILABLE_SYMBOL_COOLDOWN_SECONDS), 0)
+
+            with _oi_unavailable_lock:
+                _oi_unavailable_symbols[symbol] = now + cooldown
+
+            if _public_rest_log_allowed(f"oi_unavailable:{symbol}", cooldown=cooldown):
+                log_warning(
+                    f"{symbol} open interest history unavailable (delisted/settling/invalid) - "
+                    f"skipping for {int(cooldown / 60)}m | ERROR={exc}"
+                )
+
+            return None
+
+        _set_public_rest_backoff(exc, f"futures_open_interest_hist:{symbol}")
+        log_error(f"{symbol} open interest history error: {exc}")
+        return None
+
+
 def get_open_algo_orders(symbol):
     """Every open algo/conditional order (our SL/TP1/TP2) for a symbol -
     used to rebuild position tracking on startup reconciliation."""

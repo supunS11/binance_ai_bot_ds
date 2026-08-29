@@ -19,11 +19,14 @@ import time
 
 import config
 from logger import log_error, log_info, log_warning
-from exchange import get_klines, get_open_interest, get_24h_quote_volumes, get_funding_rates
+from exchange import (
+    get_klines, get_open_interest, get_open_interest_history,
+    get_24h_quote_volumes, get_funding_rates,
+)
 from order_flow import CVDEngine
 from orderbook import DepthImbalanceEngine
 from open_interest import OpenInterestEngine
-from liquidation_tracker import LiquidationEngine, LIQUIDATION_STREAM_URL
+from liquidation_tracker import LiquidationEngine, LIQUIDATION_STREAM_NAME
 from crash_detector import CrashDetector
 from volume_profile import VolumeProfileEngine
 import cross_exchange_oi
@@ -242,12 +245,22 @@ class RealtimeMarketData:
             )
             self.candles.seed(symbol, ltf_df)
 
+            if config.CVD_DIVERGENCE_TRIGGER_ENABLED:
+                # Reuses ltf_df above - no separate REST call needed, see
+                # CVDEngine.seed_from_klines's own comment.
+                self.cvd.seed_from_klines(symbol, ltf_df)
+
             htf_df = get_klines(
                 symbol,
                 config.HTF_KLINE_INTERVAL,
                 limit=config.HTF_KLINE_HISTORY_LIMIT,
             )
             self.htf_candles.seed(symbol, htf_df)
+
+            if config.OI_DIVERGENCE_TRIGGER_ENABLED:
+                self.open_interest.seed_from_history(
+                    symbol, get_open_interest_history(symbol)
+                )
 
     def _worker_active(self, generation):
         if self.stop_event.is_set():
@@ -850,10 +863,12 @@ class RealtimeMarketData:
     def _liquidation_stream_loop(self, generation):
         from websockets.sync.client import connect
 
+        url = f"{_market_stream_base()}{LIQUIDATION_STREAM_NAME}"
+
         while self._worker_active(generation):
             try:
                 with connect(
-                    LIQUIDATION_STREAM_URL,
+                    url,
                     open_timeout=10,
                     close_timeout=2,
                     ping_interval=20,

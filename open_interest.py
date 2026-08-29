@@ -47,6 +47,32 @@ class OpenInterestEngine:
         with self.lock:
             return list(self._samples.get(symbol, ()))
 
+    def seed_from_history(self, symbol, history_rows):
+        """Backfills _samples from REST history at startup - fixes OI_
+        DIVERGENCE_TRIGGER_ENABLED never finding data (see history()'s
+        own comment above): unlike the swing points it's compared
+        against (which come from REST-seeded, restart-surviving candle
+        history), OI's in-memory samples used to start empty on every
+        restart and take up to OI_HISTORY_MAX_SAMPLES samples of live
+        polling to rebuild - longer than this bot typically stays up
+        between restarts.
+
+        history_rows: exchange.get_open_interest_history's return shape -
+        a list of (timestamp_seconds, oi_value) tuples, not necessarily
+        ordered (external API response, not this module's own append
+        path) - sorted here defensively since _oi_at_or_before's
+        correctness depends on ascending order."""
+        if not history_rows:
+            return
+
+        symbol = symbol.upper()
+
+        with self.lock:
+            series = self._series(symbol)
+
+            for timestamp, oi_value in sorted(history_rows, key=lambda row: row[0]):
+                series.append((timestamp, oi_value))
+
     def snapshot(self, symbol, now=None):
         symbol = symbol.upper()
         now = time.time() if now is None else now

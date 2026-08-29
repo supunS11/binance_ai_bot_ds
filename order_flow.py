@@ -93,6 +93,56 @@ class CVDEngine:
         with self.lock:
             return list(self._cvd_history.get(symbol, ()))
 
+    def seed_from_klines(self, symbol, klines_df):
+        """Backfills cvd_history from REST kline data at startup - fixes
+        CVD_DIVERGENCE_TRIGGER_ENABLED never finding data (see cvd_
+        divergence.py's diagnostic_candidates comment): unlike the swing
+        points it's compared against (which come from REST-seeded,
+        restart-surviving candle history), _cvd_history used to start
+        empty on every restart and take up to CVD_HISTORY_MAXLEN candles
+        of live runtime to rebuild - longer than this bot typically stays
+        up between restarts.
+
+        klines_df: the same DataFrame ws_client._seed_history() already
+        fetches for CandleStore.seed() (exchange.get_klines's return
+        shape, columns include Binance's raw 'qav'/'tbqav' - quote asset
+        volume and taker buy quote asset volume - left as strings by
+        exchange._klines_to_df). No separate REST call needed here.
+
+        Approximates each candle's real tick-by-tick signed notional
+        (what record_trade actually accumulates) as taker-buy-quote minus
+        implied taker-sell-quote: 2*tbqav - qav. Same unit (signed
+        notional in USDT) as _cumulative already uses - not an exact
+        replay of the real tape, but internally consistent, which is all
+        divergence detection needs (it only ever compares deltas between
+        two points in the same series, never the absolute value - the
+        same reason starting live _cumulative at 0 on process boot has
+        never been a problem)."""
+        if klines_df is None or klines_df.empty:
+            return
+
+        symbol = symbol.upper()
+        running = 0.0
+        history = deque(maxlen=max(int(config.CVD_HISTORY_MAXLEN), 10))
+
+        for _, row in klines_df.iterrows():
+            tbqav = _safe_float(row["tbqav"])
+            qav = _safe_float(row["qav"])
+            running += 2 * tbqav - qav
+            history.append({
+                "open_time": int(row["time"]),
+                "cumulative_cvd": running,
+            })
+
+        with self.lock:
+            self._cvd_history[symbol] = history
+            # Seeds the live baseline too, not just the history line - a
+            # subsequent record_trade must continue accumulating from
+            # here, not silently reset to 0 and create a discontinuity
+            # right at the seed boundary the next finalize_candle would
+            # otherwise bake into history permanently.
+            self._cumulative[symbol] = running
+
     def snapshot(self, symbol, windows=(60, 300, 900), now=None):
         symbol = symbol.upper()
         now = time.time() if now is None else now
