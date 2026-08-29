@@ -341,6 +341,28 @@ def evaluate(
             cvd_snapshot, depth_snapshot.get("price_change_pct_1m")
         )
 
+    # config.DEPTH_TREND_TRACKING_ENABLED - fraction of recent RAW depth
+    # samples that agree with the current EMA'd depth_imbalance's sign (see
+    # orderbook.DepthImbalanceEngine._depth_consistency_pct). Direction-
+    # independent (like absorption_signal above) - only the per-direction
+    # depth_trend_aligned reading varies, computed inside _evaluate_
+    # direction below.
+    depth_consistency_pct = None
+
+    if config.DEPTH_TREND_TRACKING_ENABLED:
+        depth_consistency_pct = depth_snapshot.get("depth_consistency_pct")
+
+    # config.WHALE_TRADE_TRACKING_ENABLED - the single largest real trade
+    # in a short recent window and its aggressor side (see order_flow.
+    # CVDEngine.snapshot()). Direction-independent - only whale_aligned
+    # varies per direction, computed inside _evaluate_direction below.
+    whale_notional = None
+    whale_direction = None
+
+    if config.WHALE_TRADE_TRACKING_ENABLED:
+        whale_notional = cvd_snapshot.get("whale_notional")
+        whale_direction = cvd_snapshot.get("whale_direction")
+
     # config.VOLUME_PROFILE_TRACKING_ENABLED - descriptive fields only
     # (no directional "aligned" reading, see config.py's own docstring for
     # why). Direction-independent, same as absorption_signal above.
@@ -835,6 +857,26 @@ def evaluate(
         ):
             return _reject("CRASH_MODE")
 
+        # WHALE_AGAINST - config.WHALE_AGAINST_REJECT_ENABLED. A real
+        # outsized aggressive print firing opposite this candidate's own
+        # direction within the last WHALE_TRADE_WINDOW_SECONDS - not
+        # trigger-scoped (no trigger_gate_profiles() entry), same class as
+        # DEPTH_OPPOSING/CRASH_MODE above: a real institutional print
+        # dumping against a reversal trigger's own NEW direction is still
+        # bad news for that reversal, so unlike DEPTH_TREND_MIN_CONSISTENCY
+        # below this does NOT get the reversal-trigger exemption. Brand
+        # new, unvalidated mechanism - default OFF. Fail-open when whale
+        # data is unavailable or below the trust floor, same convention as
+        # every other gate here.
+        if (
+            config.WHALE_AGAINST_REJECT_ENABLED
+            and whale_notional is not None
+            and whale_notional >= config.WHALE_TRADE_MIN_NOTIONAL_USDT
+            and whale_direction is not None
+            and whale_direction != side
+        ):
+            return _reject("WHALE_AGAINST")
+
         # Liquidation clustering: informational only, NOT a gate - see
         # config.LIQUIDATION_CONFIRMATION_ENABLED for rationale. A
         # BULLISH break aligns with long-liquidation flow (forced SELL
@@ -940,6 +982,29 @@ def evaluate(
             if side == "SELL" and depth_imbalance > min_depth:
                 return _reject("DEPTH_OPPOSING")
 
+        # DEPTH_TREND_UNSTABLE - config.DEPTH_TREND_MIN_CONSISTENCY_REJECT_
+        # ENABLED. Catches the gap DEPTH_OPPOSING above can't: an
+        # instantaneous EMA'd reading that passes but was actually just a
+        # last-second flip, not a genuinely held book. Trigger-scoped via
+        # applicable_gates/config.trigger_gate_profiles() - exempted for
+        # the reversal triggers (see DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_
+        # REVERSAL_TRIGGERS_ENABLED's own config.py comment). Brand new,
+        # unvalidated mechanism - default OFF. Fail-open on missing data,
+        # same convention as every gate here.
+        if (
+            "DEPTH_TREND_MIN_CONSISTENCY" in applicable_gates
+            and config.DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED
+            and depth_imbalance is not None
+            and depth_consistency_pct is not None
+        ):
+            signed_depth_trend = depth_imbalance if side == "BUY" else -depth_imbalance
+
+            if (
+                signed_depth_trend > 0
+                and depth_consistency_pct < config.DEPTH_TREND_MIN_CONSISTENCY_PCT
+            ):
+                return _reject("DEPTH_TREND_UNSTABLE")
+
         # config.CHOCH_RETEST_MIN_DEPTH_IMBALANCE - real evidence
         # (2026-08-24, 32 resolved CHOCH_RETEST trades): depth_imbalance
         # clearly favorable (signed >=0.10 toward the trade's own side)
@@ -1021,6 +1086,28 @@ def evaluate(
         absorption_aligned = (
             absorption_signal == side if absorption_signal is not None else None
         )
+
+        # config.DEPTH_TREND_TRACKING_ENABLED - informational only by
+        # default (see DEPTH_TREND_UNSTABLE gate above for the live-gated
+        # version of this same comparison). True only when the book is
+        # BOTH currently favorable AND has held that way recently.
+        depth_trend_aligned = None
+
+        if depth_imbalance is not None and depth_consistency_pct is not None:
+            signed_depth_trend = depth_imbalance if side == "BUY" else -depth_imbalance
+            depth_trend_aligned = (
+                signed_depth_trend > 0
+                and depth_consistency_pct >= config.DEPTH_TREND_MIN_CONSISTENCY_PCT
+            )
+
+        # config.WHALE_TRADE_TRACKING_ENABLED - informational only by
+        # default (see WHALE_AGAINST gate above for the live-gated version
+        # of this same comparison). None (not False) below the trust floor
+        # - a small recent trade isn't evidence either way.
+        whale_aligned = None
+
+        if whale_notional is not None and whale_notional >= config.WHALE_TRADE_MIN_NOTIONAL_USDT:
+            whale_aligned = whale_direction == side
 
         # Funding rate: informational only, NOT a gate - see
         # config.FUNDING_RATE_ENABLED. Strongly positive means longs are
@@ -1131,6 +1218,11 @@ def evaluate(
             "btc_aligned": btc_aligned,
             "absorption_signal": absorption_signal,
             "absorption_aligned": absorption_aligned,
+            "depth_consistency_pct": depth_consistency_pct,
+            "depth_trend_aligned": depth_trend_aligned,
+            "whale_notional": whale_notional,
+            "whale_direction": whale_direction,
+            "whale_aligned": whale_aligned,
             "vp_poc_price": vp_poc_price,
             "vp_value_area_high": vp_value_area_high,
             "vp_value_area_low": vp_value_area_low,

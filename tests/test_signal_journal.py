@@ -177,6 +177,29 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["absorption_signal"], "BUY")
         self.assertEqual(rows[0]["absorption_aligned"], "True")
 
+    def test_append_signal_writes_depth_trend_and_whale_fields(self):
+        # config.DEPTH_TREND_TRACKING_ENABLED/WHALE_TRADE_TRACKING_ENABLED -
+        # real orderbook.py/order_flow.py/signal_engine.py logic covered in
+        # their own test files; this only proves the journal writes it
+        # through, same as absorption_signal above.
+        signal_journal.append_signal(
+            _signal(
+                depth_consistency_pct=0.8,
+                depth_trend_aligned=True,
+                whale_notional=25000,
+                whale_direction="BUY",
+                whale_aligned=True,
+            ),
+            _plan(),
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["depth_consistency_pct"], "0.8")
+        self.assertEqual(rows[0]["depth_trend_aligned"], "True")
+        self.assertEqual(rows[0]["whale_notional"], "25000")
+        self.assertEqual(rows[0]["whale_direction"], "BUY")
+        self.assertEqual(rows[0]["whale_aligned"], "True")
+
     def test_append_signal_writes_cross_exchange_oi_fields(self):
         # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED - real
         # cross_exchange_oi.py logic covered in test_cross_exchange_oi.py/

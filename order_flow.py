@@ -177,6 +177,23 @@ class CVDEngine:
             else None
         )
 
+        # config.WHALE_TRADE_TRACKING_ENABLED - the single largest trade in
+        # a short recent window, distinct from cvd_score above: net flow can
+        # look fine while missing one outsized aggressive print that just
+        # hit the tape. Reuses this same already-materialized `series` list
+        # - no new deque, no new stream. `signed_notional > 0` means the
+        # aggressor was a buyer (record_trade's own sign convention).
+        whale_window_seconds = max(float(config.WHALE_TRADE_WINDOW_SECONDS), 1)
+        whale_cutoff = now - whale_window_seconds
+        whale_trades = [trade for trade in series if trade[0] >= whale_cutoff]
+        whale_notional = None
+        whale_direction = None
+
+        if whale_trades:
+            _, whale_signed, whale_trade_notional = max(whale_trades, key=lambda trade: trade[2])
+            whale_notional = round(whale_trade_notional, 2)
+            whale_direction = "BUY" if whale_signed > 0 else "SELL"
+
         return {
             "available": cvd_score is not None,
             "symbol": symbol,
@@ -187,6 +204,8 @@ class CVDEngine:
             "notional_1m": round(notionals.get(windows[0], 0), 2),
             "sample_count": len(series),
             "history": self.cvd_history(symbol),
+            "whale_notional": whale_notional,
+            "whale_direction": whale_direction,
         }
 
     def reset(self, symbol=None):

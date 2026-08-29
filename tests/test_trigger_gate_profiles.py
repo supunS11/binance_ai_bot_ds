@@ -12,7 +12,11 @@ ALL_TRIGGERS = (
 ALL_VARIABLE_GATES = frozenset({
     "AGAINST_HTF_BIAS", "HTF_TREND_STALE", "MARKET_CHOPPY",
     "NOT_IN_OTE", "NO_ORDER_BLOCK_OR_FVG", "CVD_NOT_CONFIRMED",
+    "DEPTH_TREND_MIN_CONSISTENCY",
 })
+REVERSAL_EXEMPT_TRIGGERS = (
+    "CVD_DIVERGENCE", "OI_DIVERGENCE", "LIQUIDATION_SWEEP_CONFIRMED", "CHOCH_RETEST",
+)
 
 
 class TriggerGateProfilesTests(unittest.TestCase):
@@ -34,6 +38,7 @@ class TriggerGateProfilesTests(unittest.TestCase):
             "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED": True,
             "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED": True,
             "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED": True,
+            "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED": True,
         }
         for name, value in defaults.items():
             patcher = patch.object(config, name, value)
@@ -93,7 +98,8 @@ class TriggerGateProfilesTests(unittest.TestCase):
              patch.object(config, "HTF_TREND_STALE_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False), \
              patch.object(config, "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False), \
              patch.object(config, "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", False), \
-             patch.object(config, "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED", False):
+             patch.object(config, "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED", False), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False):
             profiles = config.trigger_gate_profiles()
 
         for trigger in ALL_TRIGGERS:
@@ -103,6 +109,21 @@ class TriggerGateProfilesTests(unittest.TestCase):
                 else ALL_VARIABLE_GATES
             )
             self.assertEqual(profiles[trigger], expected)
+
+    def test_depth_trend_min_consistency_exempt_only_for_reversal_group(self):
+        # Same _TREND_AGREEMENT_EXEMPT_TRIGGERS group AGAINST_HTF_BIAS/
+        # HTF_TREND_STALE already use (the 3 reversal triggers + CHOCH_
+        # RETEST) - a reversal trigger's whole thesis is that book
+        # pressure is CHANGING right now, so requiring it to have already
+        # been stable before the change punishes exactly the freshness
+        # that makes it a genuine reversal.
+        profiles = config.trigger_gate_profiles()
+
+        for trigger in ALL_TRIGGERS:
+            if trigger in REVERSAL_EXEMPT_TRIGGERS:
+                self.assertNotIn("DEPTH_TREND_MIN_CONSISTENCY", profiles[trigger])
+            else:
+                self.assertIn("DEPTH_TREND_MIN_CONSISTENCY", profiles[trigger])
 
     def test_recomputes_live_rather_than_caching_at_import_time(self):
         # Real bug caught 2026-08-17: an earlier version computed this

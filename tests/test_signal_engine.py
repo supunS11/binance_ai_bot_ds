@@ -1113,6 +1113,236 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(with_absorption["confluence_total"], without_absorption["confluence_total"])
         self.assertEqual(with_absorption["confluence_score"], without_absorption["confluence_score"])
 
+    # config.DEPTH_TREND_TRACKING_ENABLED - informational only by default.
+    # orderbook.DepthImbalanceEngine._depth_consistency_pct itself is
+    # covered directly in test_orderbook.py; these only prove signal_engine
+    # wires real depth_snapshot data through and compares it against the
+    # winning candidate's own side.
+
+    def test_depth_trend_aligned_true_when_book_favorable_and_consistent(self):
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.9}
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6):
+            result = self._run(depth=depth)
+
+        self.assertEqual(result["depth_consistency_pct"], 0.9)
+        self.assertTrue(result["depth_trend_aligned"])
+
+    def test_depth_trend_aligned_false_when_consistency_below_threshold(self):
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.3}
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6):
+            result = self._run(depth=depth)
+
+        self.assertFalse(result["depth_trend_aligned"])
+
+    def test_depth_trend_aligned_none_when_consistency_data_unavailable(self):
+        depth = {"available": True, "depth_imbalance": 0.2}  # no depth_consistency_pct key
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True):
+            result = self._run(depth=depth)
+
+        self.assertIsNone(result["depth_consistency_pct"])
+        self.assertIsNone(result["depth_trend_aligned"])
+
+    def test_depth_trend_disabled_by_config(self):
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.9}
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", False):
+            result = self._run(depth=depth)
+
+        self.assertIsNone(result["depth_consistency_pct"])
+        self.assertIsNone(result["depth_trend_aligned"])
+
+    # config.DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED - brand new,
+    # unvalidated mechanism, default OFF. Catches the gap DEPTH_OPPOSING
+    # can't: an instantaneous reading that passes but was actually just a
+    # last-second flip, not a genuinely held book.
+
+    def test_depth_trend_unstable_gate_is_a_noop_by_default(self):
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.1}
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED", False):
+            result = self._run(depth=depth)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_depth_trend_unstable_rejects_when_enabled_and_below_threshold(self):
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.1}
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED", True):
+            result = self._run(depth=depth)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "DEPTH_TREND_UNSTABLE")
+
+    def test_depth_trend_unstable_exempt_for_cvd_divergence(self):
+        # CVD_DIVERGENCE's whole thesis is that book pressure is CHANGING
+        # right now - requiring it to have already been stable before the
+        # change would punish the exact freshness that makes it a genuine
+        # reversal. See _TREND_AGREEMENT_EXEMPT_TRIGGERS.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.1}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                depth=depth,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CVD_DIVERGENCE")
+
+    def test_depth_trend_unstable_still_applies_to_cvd_divergence_when_exemption_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.1}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED", True), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                depth=depth,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "DEPTH_TREND_UNSTABLE")
+
+    # config.WHALE_TRADE_TRACKING_ENABLED - informational only by default.
+    # The whale-window scan itself is covered directly in
+    # test_order_flow.py; these only prove signal_engine wires real
+    # cvd_snapshot data through and compares it against the winning
+    # candidate's own side.
+
+    def test_whale_aligned_true_when_notional_clears_floor_and_matches_side(self):
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "BUY"}
+
+        with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000):
+            result = self._run(cvd=cvd)
+
+        self.assertEqual(result["whale_notional"], 25000)
+        self.assertEqual(result["whale_direction"], "BUY")
+        self.assertTrue(result["whale_aligned"])
+
+    def test_whale_aligned_false_when_direction_disagrees(self):
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "SELL"}
+
+        with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000):
+            result = self._run(cvd=cvd)
+
+        self.assertFalse(result["whale_aligned"])
+
+    def test_whale_aligned_none_when_below_notional_floor(self):
+        # A small recent trade isn't evidence either way - None, not False.
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 5000, "whale_direction": "BUY"}
+
+        with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000):
+            result = self._run(cvd=cvd)
+
+        self.assertIsNone(result["whale_aligned"])
+
+    def test_whale_disabled_by_config(self):
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "BUY"}
+
+        with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", False):
+            result = self._run(cvd=cvd)
+
+        self.assertIsNone(result["whale_notional"])
+        self.assertIsNone(result["whale_direction"])
+        self.assertIsNone(result["whale_aligned"])
+
+    # config.WHALE_AGAINST_REJECT_ENABLED - brand new, unvalidated
+    # mechanism, default OFF. Universal across triggers (same as
+    # DEPTH_OPPOSING/CRASH_MODE, no trigger_gate_profiles() entry).
+
+    def test_whale_against_gate_is_a_noop_by_default(self):
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "SELL"}
+
+        with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000), \
+             patch.object(config, "WHALE_AGAINST_REJECT_ENABLED", False):
+            result = self._run(cvd=cvd)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_whale_against_rejects_when_enabled_and_opposing(self):
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "SELL"}
+
+        with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000), \
+             patch.object(config, "WHALE_AGAINST_REJECT_ENABLED", True):
+            result = self._run(cvd=cvd)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "WHALE_AGAINST")
+
+    def test_whale_against_does_not_reject_when_direction_agrees(self):
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "BUY"}
+
+        with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000), \
+             patch.object(config, "WHALE_AGAINST_REJECT_ENABLED", True):
+            result = self._run(cvd=cvd)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_whale_against_still_applies_to_cvd_divergence(self):
+        # Unlike DEPTH_TREND_MIN_CONSISTENCY, WHALE_AGAINST does NOT get the
+        # reversal-trigger exemption - a real institutional print dumping
+        # against a reversal trigger's own NEW direction is still bad news
+        # for that reversal.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "SELL"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000), \
+             patch.object(config, "WHALE_AGAINST_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                cvd=cvd,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "WHALE_AGAINST")
+
+    def test_depth_trend_and_whale_never_added_to_confluence_scoring(self):
+        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.9}
+        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "BUY"}
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000):
+            with_fields = self._run(depth=depth, cvd=cvd)
+
+        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", False), \
+             patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", False):
+            without_fields = self._run(depth=depth, cvd=cvd)
+
+        self.assertEqual(with_fields["confluence_total"], without_fields["confluence_total"])
+        self.assertEqual(with_fields["confluence_score"], without_fields["confluence_score"])
+
     # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED - informational only.
     # cross_exchange_oi.compute_agreement() itself is covered directly in
     # test_cross_exchange_oi.py; these only prove signal_engine wires the

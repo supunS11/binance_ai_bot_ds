@@ -46,6 +46,13 @@ class DepthImbalanceEngine:
                 # did price actually move in the last ~60s", which candles
                 # (1h) are far too coarse for.
                 "mid_price_history": deque(),
+                # config.DEPTH_TREND_TRACKING_ENABLED - a short rolling
+                # (timestamp, raw_imbalance) series, pruned by DEPTH_TREND_
+                # HISTORY_SECONDS - the RAW per-update imbalance, before the
+                # EMA smoothing above, so _depth_consistency_pct can tell a
+                # genuinely held reading apart from a one-tick-old flip that
+                # the EMA hasn't caught up to yet.
+                "raw_imbalance_history": deque(),
             }
             self._book[symbol] = state
 
@@ -115,6 +122,13 @@ class DepthImbalanceEngine:
                 while history and history[0][0] < cutoff:
                     history.popleft()
 
+            raw_history = state["raw_imbalance_history"]
+            raw_history.append((recorded_at, imbalance))
+            raw_cutoff = recorded_at - max(float(config.DEPTH_TREND_HISTORY_SECONDS), 10)
+
+            while raw_history and raw_history[0][0] < raw_cutoff:
+                raw_history.popleft()
+
     def _price_change_pct(self, state, now):
         """config.ABSORPTION_TRACKING_ENABLED - % change from the oldest
         retained mid-price sample at or before `now - ABSORPTION_WINDOW_
@@ -147,6 +161,32 @@ class DepthImbalanceEngine:
 
         return (current - reference) / reference * 100
 
+    def _depth_consistency_pct(self, state, now):
+        """config.DEPTH_TREND_TRACKING_ENABLED - fraction (0.0-1.0) of the
+        raw imbalance samples within DEPTH_TREND_WINDOW_SECONDS that share
+        the CURRENT (EMA'd) imbalance's sign. None whenever there isn't yet
+        a real reading to compare against - a freshly (re)started engine or
+        a currently-flat book must never report a manufactured percentage.
+        Assumes the caller already holds self.lock (only called from within
+        snapshot() below)."""
+        history = state["raw_imbalance_history"]
+        current_imbalance = state["imbalance"]
+
+        if not history or current_imbalance == 0:
+            return None
+
+        window_seconds = max(float(config.DEPTH_TREND_WINDOW_SECONDS), 1)
+        cutoff = now - window_seconds
+        in_window = [value for sample_time, value in history if sample_time >= cutoff]
+
+        if not in_window:
+            return None
+
+        current_sign = current_imbalance > 0
+        matching = sum(1 for value in in_window if (value > 0) == current_sign)
+
+        return round(matching / len(in_window), 4)
+
     def snapshot(self, symbol, now=None):
         symbol = symbol.upper()
         now = time.time() if now is None else now
@@ -171,6 +211,7 @@ class DepthImbalanceEngine:
                 "samples": state["samples"],
                 "age_seconds": round(age, 1),
                 "price_change_pct_1m": self._price_change_pct(state, now),
+                "depth_consistency_pct": self._depth_consistency_pct(state, now),
             }
 
     def reset(self, symbol=None):

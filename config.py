@@ -196,6 +196,85 @@ ABSORPTION_MIN_CVD_RATIO = env_float("ABSORPTION_MIN_CVD_RATIO", 0.5)
 ABSORPTION_MAX_PRICE_MOVE_PCT = env_float("ABSORPTION_MAX_PRICE_MOVE_PCT", 0.05)
 
 # =========================
+# DEPTH TREND (informational)
+# =========================
+# 2026-08-29: orderbook.DepthImbalanceEngine's own `imbalance` is a single
+# EMA-blended point value - it can't distinguish "the book has favored this
+# side for the last minute" from "it flipped one tick before entry", which
+# is exactly the gap a real bad entry (XPINUSDT) fell into: every gate
+# passed on the instantaneous reading while several other signals quietly
+# disagreed. depth_consistency_pct answers that directly: what fraction of
+# the RAW (pre-EMA) imbalance samples in the last DEPTH_TREND_WINDOW_
+# SECONDS shared the current reading's sign. Informational/journaled only,
+# same "evidence before gate" convention as absorption_signal - default
+# True since it's a read-only computation, never changes entry/exit
+# behavior by itself.
+DEPTH_TREND_TRACKING_ENABLED = env_bool("DEPTH_TREND_TRACKING_ENABLED", "True")
+# Retention for the new raw-imbalance history deque - must comfortably
+# exceed DEPTH_TREND_WINDOW_SECONDS below, same relationship as
+# ABSORPTION_PRICE_HISTORY_SECONDS/ABSORPTION_WINDOW_SECONDS.
+DEPTH_TREND_HISTORY_SECONDS = env_int("DEPTH_TREND_HISTORY_SECONDS", 90)
+# The lookback window depth_consistency_pct measures over - deliberately
+# matches ABSORPTION_WINDOW_SECONDS/CVDEngine's own ratio_1m window so
+# every "recent order flow" reading describes the same interval.
+DEPTH_TREND_WINDOW_SECONDS = env_int("DEPTH_TREND_WINDOW_SECONDS", 60)
+# How consistent the book has to have been (0.0-1.0) for depth_trend_
+# aligned to read True / for the reject gate below to pass. Starting
+# value, not yet calibrated against real trade data.
+DEPTH_TREND_MIN_CONSISTENCY_PCT = env_float("DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.60)
+# Brand new, unvalidated mechanism - default OFF, same convention as every
+# other fresh reject gate in this file. Reject-only (can only make a
+# trigger fire LESS often than today, never more) once real evidence
+# justifies turning it on.
+DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED = env_bool(
+    "DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED", "False"
+)
+# Same reversal-trigger exemption reasoning as AGAINST_HTF_BIAS_SKIP_FOR_
+# REVERSAL_TRIGGERS_ENABLED/HTF_TREND_STALE_SKIP_FOR_REVERSAL_TRIGGERS_
+# ENABLED (see trigger_gate_profiles() below): a reversal trigger's whole
+# thesis is that book pressure is CHANGING right now - requiring it to
+# have already been stable before the change punishes the exact freshness
+# that makes it a genuine reversal.
+DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED = env_bool(
+    "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", "True"
+)
+
+# =========================
+# WHALE / LARGE-PRINT DETECTION (informational)
+# =========================
+# 2026-08-29: order_flow.CVDEngine already receives every individual
+# aggTrade tick (record_trade) to compute net CVD - but a net ratio can
+# look fine while missing "one outsized aggressive print just hit the tape
+# going the other way" right before entry. whale_notional/whale_direction
+# answer a different, more timing-specific question than cvd_score: was
+# there a single real large taker order recently, and which way did it go.
+# Reuses CVDEngine's existing per-trade deque - no new stream, no new
+# engine. Informational/journaled only - default True, same reasoning as
+# DEPTH_TREND_TRACKING_ENABLED above.
+WHALE_TRADE_TRACKING_ENABLED = env_bool("WHALE_TRADE_TRACKING_ENABLED", "True")
+# A real recent print is a much more instantaneous question than CVD's own
+# net-flow ratios (60s/300s/900s) - deliberately short.
+WHALE_TRADE_WINDOW_SECONDS = env_int("WHALE_TRADE_WINDOW_SECONDS", 30)
+# 4x ORDER_FLOW_MIN_NOTIONAL_USDT (5000) - that number is an already-
+# validated trust floor on this exact trade tape (used to decide whether a
+# whole 60s CVD ratio window is trustworthy at all). Requiring a SINGLE
+# trade to clear 4x what a whole windowed ratio normally needs is a
+# reasoned starting point, not a guess presented as calibrated - unlike
+# LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT (invented from nothing, turned out
+# ~200x too high for this bot's real symbol set: real distribution median
+# $227, p95 $6,039, 0/997 real events ever cleared it). Only floors
+# whale_aligned/WHALE_AGAINST_REJECT_ENABLED below; whale_notional itself
+# is never floored, so real evidence keeps accumulating in the journal
+# regardless of where this number turns out to be wrong.
+WHALE_TRADE_MIN_NOTIONAL_USDT = env_float("WHALE_TRADE_MIN_NOTIONAL_USDT", 20000)
+# Brand new, unvalidated mechanism - default OFF. Universal across
+# triggers (same as DEPTH_OPPOSING/CRASH_MODE, no trigger_gate_profiles()
+# entry) - a real institutional print dumping against a reversal trigger's
+# own NEW direction is still bad news for that reversal, so this doesn't
+# get the reversal-trigger exemption DEPTH_TREND_MIN_CONSISTENCY gets.
+WHALE_AGAINST_REJECT_ENABLED = env_bool("WHALE_AGAINST_REJECT_ENABLED", "False")
+
+# =========================
 # CROSS-EXCHANGE OPEN INTEREST (informational)
 # =========================
 # 2026-08-26: OI_RISING (above) is a real, evidence-backed gate, but it
@@ -941,6 +1020,7 @@ def trigger_gate_profiles():
     all_variable_gates = frozenset({
         "AGAINST_HTF_BIAS", "HTF_TREND_STALE", "MARKET_CHOPPY",
         "NOT_IN_OTE", "NO_ORDER_BLOCK_OR_FVG", "CVD_NOT_CONFIRMED",
+        "DEPTH_TREND_MIN_CONSISTENCY",
     })
     profiles = {}
 
@@ -968,6 +1048,12 @@ def trigger_gate_profiles():
 
         if CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED and trigger == "CVD_DIVERGENCE":
             gates.discard("CVD_NOT_CONFIRMED")
+
+        if (
+            DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED
+            and trigger in _TREND_AGREEMENT_EXEMPT_TRIGGERS
+        ):
+            gates.discard("DEPTH_TREND_MIN_CONSISTENCY")
 
         profiles[trigger] = frozenset(gates)
 

@@ -153,5 +153,76 @@ class PriceChangePctTests(unittest.TestCase):
         self.assertNotIn("price_change_pct_1m", snapshot)
 
 
+class DepthConsistencyPctTests(unittest.TestCase):
+    """config.DEPTH_TREND_TRACKING_ENABLED - the short rolling RAW (pre-EMA)
+    imbalance history that answers "was the book stable this whole window,
+    or did it just flip"."""
+
+    def test_fully_consistent_samples_report_full_consistency(self):
+        engine = DepthImbalanceEngine()
+        for ts in (1000, 1010, 1020):
+            engine.record_depth("BTCUSDT", bids=[["100", "100"]], asks=[["101", "1"]], timestamp=ts)
+
+        with patch.object(config, "DEPTH_TREND_WINDOW_SECONDS", 60):
+            snapshot = engine.snapshot("BTCUSDT", now=1020)
+
+        self.assertEqual(snapshot["depth_consistency_pct"], 1.0)
+
+    def test_a_recent_flip_reduces_consistency_below_full(self):
+        engine = DepthImbalanceEngine()
+        for ts in (1000, 1010, 1020):
+            engine.record_depth("BTCUSDT", bids=[["100", "100"]], asks=[["101", "1"]], timestamp=ts)
+        # One opposite (ask-heavy) sample right before the snapshot - not
+        # enough on its own to flip the EMA's sign, but it should still
+        # show up as a mismatch in the raw consistency count.
+        engine.record_depth("BTCUSDT", bids=[["100", "1"]], asks=[["101", "100"]], timestamp=1030)
+
+        with patch.object(config, "DEPTH_TREND_WINDOW_SECONDS", 60):
+            snapshot = engine.snapshot("BTCUSDT", now=1030)
+
+        self.assertGreater(snapshot["depth_imbalance"], 0)
+        self.assertLess(snapshot["depth_consistency_pct"], 1.0)
+        self.assertGreater(snapshot["depth_consistency_pct"], 0.0)
+
+    def test_current_imbalance_of_exactly_zero_is_none(self):
+        engine = DepthImbalanceEngine()
+        engine.record_depth("BTCUSDT", bids=[["100", "5"]], asks=[["100", "5"]], timestamp=1000)
+
+        with patch.object(config, "DEPTH_TREND_WINDOW_SECONDS", 60):
+            snapshot = engine.snapshot("BTCUSDT", now=1000)
+
+        self.assertEqual(snapshot["depth_imbalance"], 0)
+        self.assertIsNone(snapshot["depth_consistency_pct"])
+
+    def test_no_samples_within_the_window_is_none(self):
+        engine = DepthImbalanceEngine()
+        engine.record_depth("BTCUSDT", bids=[["100", "10"]], asks=[["101", "1"]], timestamp=1000)
+
+        with patch.object(config, "DEPTH_TREND_WINDOW_SECONDS", 60):
+            # Long after the one sample - outside the measurement window,
+            # even though it may still be within retention.
+            snapshot = engine.snapshot("BTCUSDT", now=2000)
+
+        self.assertIsNone(snapshot["depth_consistency_pct"])
+
+    def test_samples_older_than_the_retention_window_are_pruned(self):
+        engine = DepthImbalanceEngine()
+        engine.record_depth("BTCUSDT", bids=[["100", "10"]], asks=[["101", "1"]], timestamp=1000)
+
+        with patch.object(config, "DEPTH_TREND_HISTORY_SECONDS", 10):
+            # 100s later - way past the 10s retention window, so the first
+            # sample should have been pruned already.
+            engine.record_depth("BTCUSDT", bids=[["100", "1"]], asks=[["101", "10"]], timestamp=1100)
+
+        state = engine._book["BTCUSDT"]
+        self.assertEqual(len(state["raw_imbalance_history"]), 1)
+
+    def test_missing_symbol_has_no_depth_consistency_key_error(self):
+        engine = DepthImbalanceEngine()
+        snapshot = engine.snapshot("NOPE")
+
+        self.assertNotIn("depth_consistency_pct", snapshot)
+
+
 if __name__ == "__main__":
     unittest.main()

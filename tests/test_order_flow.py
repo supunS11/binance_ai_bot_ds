@@ -88,6 +88,57 @@ class CVDEngineTests(unittest.TestCase):
             self.assertTrue(engine.snapshot("ETHUSDT", now=1001)["available"])
 
 
+class WhaleTradeTests(unittest.TestCase):
+    """config.WHALE_TRADE_TRACKING_ENABLED - the single largest real trade
+    in a short recent window, reusing CVDEngine's own trade deque. Distinct
+    from cvd_score: a net ratio can look fine while missing one outsized
+    aggressive print that just hit the tape."""
+
+    def test_largest_notional_trade_identified_even_when_not_most_recent(self):
+        engine = CVDEngine()
+        engine.record_trade("BTCUSDT", price=100, quantity=1, is_buyer_maker=False, timestamp=1000)  # notional 100, BUY
+        engine.record_trade("BTCUSDT", price=100, quantity=50, is_buyer_maker=True, timestamp=1010)  # notional 5000, SELL
+        engine.record_trade("BTCUSDT", price=100, quantity=1, is_buyer_maker=False, timestamp=1020)  # notional 100, BUY
+
+        with patch.object(config, "WHALE_TRADE_WINDOW_SECONDS", 30):
+            snapshot = engine.snapshot("BTCUSDT", now=1020)
+
+        self.assertEqual(snapshot["whale_notional"], 5000.0)
+        self.assertEqual(snapshot["whale_direction"], "SELL")
+
+    def test_trade_outside_the_whale_window_is_excluded(self):
+        engine = CVDEngine()
+        engine.record_trade("BTCUSDT", price=100, quantity=100, is_buyer_maker=False, timestamp=900)  # notional 10000, outside window
+        engine.record_trade("BTCUSDT", price=100, quantity=1, is_buyer_maker=True, timestamp=1020)  # notional 100, inside window
+
+        with patch.object(config, "WHALE_TRADE_WINDOW_SECONDS", 30):
+            snapshot = engine.snapshot("BTCUSDT", now=1020)
+
+        self.assertEqual(snapshot["whale_notional"], 100.0)
+        self.assertEqual(snapshot["whale_direction"], "SELL")
+
+    def test_no_trade_in_the_whale_window_is_none_even_when_available_from_wider_windows(self):
+        engine = CVDEngine()
+        # notional 10000 - clears the real default ORDER_FLOW_MIN_NOTIONAL_
+        # USDT (5000) so the wider 300s/900s ratio windows report real
+        # values without needing to patch that threshold away.
+        engine.record_trade("BTCUSDT", price=100, quantity=100, is_buyer_maker=False, timestamp=700)
+
+        with patch.object(config, "WHALE_TRADE_WINDOW_SECONDS", 30):
+            snapshot = engine.snapshot("BTCUSDT", now=1000)
+
+        self.assertTrue(snapshot["available"])
+        self.assertIsNone(snapshot["whale_notional"])
+        self.assertIsNone(snapshot["whale_direction"])
+
+    def test_empty_series_has_no_whale_keys(self):
+        engine = CVDEngine()
+        snapshot = engine.snapshot("DOESNOTEXIST")
+
+        self.assertNotIn("whale_notional", snapshot)
+        self.assertNotIn("whale_direction", snapshot)
+
+
 class CVDHistoryTests(unittest.TestCase):
     """Backs config.CVD_DIVERGENCE_TRIGGER_ENABLED - a persistent, per-
     candle-close cumulative CVD series (independent of the recent-window
