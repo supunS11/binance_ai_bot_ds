@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -277,6 +277,141 @@ class RealtimeMarketDataMessageHandlingTests(unittest.TestCase):
         feed.generation += 1
 
         self.assertFalse(feed._worker_active(generation))
+
+
+class WatchdogLoopTests(unittest.TestCase):
+    """Real incident (2026-08-28 20:07 - 2026-08-29 03:06): the depth
+    websocket stream hung for ~7 hours with zero detection, because
+    _watchdog_loop only ever read last_market_message_at - last_depth_
+    message_at was written on every depth message but never checked
+    anywhere. These lock in that both streams are now watched, and that
+    the reset reason correctly names only the stream(s) that are actually
+    stale."""
+
+    def _feed(self):
+        return RealtimeMarketData(["BTCUSDT"])
+
+    def test_both_streams_fresh_does_not_reset(self):
+        feed = self._feed()
+        feed.running = True
+        feed.last_market_message_at = 1_000.0
+        feed.last_depth_message_at = 1_000.0
+
+        with patch.object(config, "WS_WATCHDOG_INTERVAL_SECONDS", 5), \
+             patch.object(config, "WS_STALE_SECONDS", 45), \
+             patch.object(feed, "reset_connection") as reset_mock, \
+             patch("ws_client.time.time", return_value=1_010.0), \
+             patch.object(feed.stop_event, "wait", side_effect=[False, True]):
+            feed._watchdog_loop()
+
+        reset_mock.assert_not_called()
+
+    def test_depth_stale_market_fresh_names_only_depth_in_reason(self):
+        feed = self._feed()
+        feed.running = True
+        feed.last_market_message_at = 1_000.0
+        feed.last_depth_message_at = 900.0  # 100s old
+
+        with patch.object(config, "WS_WATCHDOG_INTERVAL_SECONDS", 5), \
+             patch.object(config, "WS_STALE_SECONDS", 45), \
+             patch.object(feed, "reset_connection") as reset_mock, \
+             patch("ws_client.time.time", return_value=1_000.0), \
+             patch.object(feed.stop_event, "wait", side_effect=[False, True]):
+            feed._watchdog_loop()
+
+        reset_mock.assert_called_once()
+        reason = reset_mock.call_args.args[0]
+        self.assertIn("depth=", reason)
+        self.assertNotIn("market=", reason)
+
+    def test_market_stale_depth_fresh_names_only_market_in_reason(self):
+        feed = self._feed()
+        feed.running = True
+        feed.last_market_message_at = 900.0  # 100s old
+        feed.last_depth_message_at = 1_000.0
+
+        with patch.object(config, "WS_WATCHDOG_INTERVAL_SECONDS", 5), \
+             patch.object(config, "WS_STALE_SECONDS", 45), \
+             patch.object(feed, "reset_connection") as reset_mock, \
+             patch("ws_client.time.time", return_value=1_000.0), \
+             patch.object(feed.stop_event, "wait", side_effect=[False, True]):
+            feed._watchdog_loop()
+
+        reset_mock.assert_called_once()
+        reason = reset_mock.call_args.args[0]
+        self.assertIn("market=", reason)
+        self.assertNotIn("depth=", reason)
+
+    def test_both_streams_stale_names_both_in_reason(self):
+        feed = self._feed()
+        feed.running = True
+        feed.last_market_message_at = 900.0
+        feed.last_depth_message_at = 900.0
+
+        with patch.object(config, "WS_WATCHDOG_INTERVAL_SECONDS", 5), \
+             patch.object(config, "WS_STALE_SECONDS", 45), \
+             patch.object(feed, "reset_connection") as reset_mock, \
+             patch("ws_client.time.time", return_value=1_000.0), \
+             patch.object(feed.stop_event, "wait", side_effect=[False, True]):
+            feed._watchdog_loop()
+
+        reset_mock.assert_called_once()
+        reason = reset_mock.call_args.args[0]
+        self.assertIn("market=", reason)
+        self.assertIn("depth=", reason)
+
+
+class ResetConnectionTests(unittest.TestCase):
+    """Same 2026-08-28 incident: _reset_connection only ever closed/
+    restarted the market stream, but always bumped the single shared
+    generation counter both stream types key off - so any watchdog reset
+    silently and permanently killed the depth stream, since _start_depth_
+    streams() was never called to bring it back. These lock in that a
+    reset now closes and restarts both."""
+
+    def _feed(self):
+        return RealtimeMarketData(["BTCUSDT"])
+
+    def test_reset_restarts_both_market_and_depth_streams(self):
+        feed = self._feed()
+
+        with patch.object(feed, "_start_market_streams") as start_market, \
+             patch.object(feed, "_start_depth_streams") as start_depth, \
+             patch.object(feed.stop_event, "wait", return_value=False):
+            feed._reset_connection("test reason")
+
+        start_market.assert_called_once()
+        start_depth.assert_called_once()
+
+    def test_reset_closes_existing_market_and_depth_sockets(self):
+        feed = self._feed()
+        market_socket = Mock()
+        depth_socket = Mock()
+        feed.market_websockets = {1: market_socket}
+        feed.depth_websockets = {2: depth_socket}
+
+        with patch.object(feed, "_start_market_streams"), \
+             patch.object(feed, "_start_depth_streams"), \
+             patch.object(feed.stop_event, "wait", return_value=False):
+            feed._reset_connection("test reason")
+
+        market_socket.close.assert_called_once()
+        depth_socket.close.assert_called_once()
+        self.assertEqual(feed.market_websockets, {})
+        self.assertEqual(feed.depth_websockets, {})
+
+    def test_reset_refreshes_both_last_message_timestamps(self):
+        feed = self._feed()
+        feed.last_market_message_at = 0.0
+        feed.last_depth_message_at = 0.0
+
+        with patch.object(feed, "_start_market_streams"), \
+             patch.object(feed, "_start_depth_streams"), \
+             patch.object(feed.stop_event, "wait", return_value=False):
+            feed._reset_connection("test reason")
+
+        self.assertGreater(feed.last_market_message_at, 0.0)
+        self.assertGreater(feed.last_depth_message_at, 0.0)
 
 
 if __name__ == "__main__":

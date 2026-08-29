@@ -201,6 +201,7 @@ class RealtimeMarketData:
             self.running = True
             self.generation += 1
             self.last_market_message_at = time.time()
+            self.last_depth_message_at = time.time()
 
         self._start_market_streams()
         self._start_depth_streams()
@@ -291,16 +292,35 @@ class RealtimeMarketData:
             now = time.time()
 
             with self.lock:
-                age = (
+                market_age = (
                     now - self.last_market_message_at
                     if self.last_market_message_at
+                    else stale_seconds + 1
+                )
+                depth_age = (
+                    now - self.last_depth_message_at
+                    if self.last_depth_message_at
                     else stale_seconds + 1
                 )
                 running = self.running
                 resetting = self.resetting
 
-            if not resetting and (not running or age >= stale_seconds):
-                self.reset_connection(f"watchdog stale={round(age, 1)}s")
+            market_stale = market_age >= stale_seconds
+            depth_stale = depth_age >= stale_seconds
+
+            if not resetting and (not running or market_stale or depth_stale):
+                reason_parts = ["watchdog stale"]
+
+                if market_stale:
+                    reason_parts.append(f"market={round(market_age, 1)}s")
+
+                if depth_stale:
+                    reason_parts.append(f"depth={round(depth_age, 1)}s")
+
+                if not running:
+                    reason_parts.append("not running")
+
+                self.reset_connection(" ".join(reason_parts))
 
     def reset_connection(self, reason):
         now = time.time()
@@ -328,9 +348,11 @@ class RealtimeMarketData:
                 self.running = False
                 self.generation += 1
                 market_sockets = list(self.market_websockets.values())
+                depth_sockets = list(self.depth_websockets.values())
                 self.market_websockets = {}
+                self.depth_websockets = {}
 
-            self._close_websockets(market_sockets)
+            self._close_websockets(market_sockets + depth_sockets)
 
             if self.stop_event.wait(2):
                 return
@@ -338,12 +360,15 @@ class RealtimeMarketData:
             with self.lock:
                 self.running = True
                 self.last_market_message_at = time.time()
+                self.last_depth_message_at = time.time()
 
             self._start_market_streams()
+            self._start_depth_streams()
 
             log_info(
                 f"Realtime market data websocket restored | "
-                f"MARKET_SOCKETS={len(self.market_threads)}"
+                f"MARKET_SOCKETS={len(self.market_threads)} | "
+                f"DEPTH_SOCKETS={len(self.depth_threads)}"
             )
 
         except Exception as exc:
