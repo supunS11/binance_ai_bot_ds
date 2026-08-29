@@ -770,6 +770,61 @@ class PositionManager:
                 f"order(s) preserved"
             )
 
+    def reconcile_closed_positions(self):
+        """Catches what poll_live structurally cannot: a tracked real
+        (non-shadow) position closed OUTSIDE the bot entirely (manual
+        close, ADL, liquidation). poll_live only ever detects a close by
+        watching specific remembered order ids reach FINISHED - Binance
+        auto-cancels/expires those same orders instead when something
+        else closes the position first, so poll_live's checks silently
+        fall through to None forever for exactly this case. Found live
+        2026-08-29 (TRXUSDT/XPINUSDT: both closed by hand on the
+        exchange, left an orphaned resting DCA order live indefinitely
+        with nothing cancelling it).
+
+        Must run AFTER the poll_live loop has already run for every
+        symbol this tick (see main._poll_positions) - a position whose
+        TP/SL genuinely finished THIS tick needs poll_live's own
+        specific FINISHED check to claim it first and produce its real
+        outcome (STATIC_TP_HIT, SL_HIT, DCA_TP_HIT, etc.); only a
+        position still tracked after that loop gets checked here.
+        Getting this ordering wrong would mislabel every ordinary TP/SL
+        fill as CLOSED_EXTERNALLY.
+
+        Fails OPEN: a failed/timed-out account-wide fetch is never
+        treated as "no positions are open" (that would mass-close every
+        real tracked position this tick on a transient API blip) - uses
+        exchange._fetch_all_open_positions (raises) instead of
+        get_all_open_positions (swallows to []) specifically so failure
+        can be told apart from a genuinely empty account and skipped for
+        this cycle instead."""
+        try:
+            real_open_symbols = {p["symbol"] for p in exchange._fetch_all_open_positions()}
+        except Exception as exc:
+            log_warning(
+                f"reconcile_closed_positions: account-wide position fetch "
+                f"failed, skipping this cycle: {exc}"
+            )
+            return
+
+        for symbol, position in list(self.positions.items()):
+            if position["shadow"]:
+                continue
+
+            if position["stage"] not in (TP1_PENDING, BREAKEVEN_ACTIVE, DCA_PENDING, DCA_ACTIVE):
+                continue
+
+            if symbol in real_open_symbols:
+                continue
+
+            log_warning(
+                f"{symbol} tracked as {position['stage']} but has no real "
+                f"open position on the exchange - closed externally (manual "
+                f"close, ADL, or liquidation) - cleaning up leftover orders"
+            )
+            exchange.cancel_all_open_orders(symbol)
+            self._close(symbol, "CLOSED_EXTERNALLY")
+
     def _try_restore_from_saved_state(self, symbol, live_position, saved_state):
         """Restores position_manager's own last-saved snapshot for
         `symbol` verbatim, if one exists and passes a cheap sanity check

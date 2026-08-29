@@ -57,6 +57,12 @@ LOSS_OUTCOMES = {
 # fallback means these can ONLY happen via a genuine pre-fill invalidation
 # (price already reached the stop before the limit ever touched) - never
 # a plain unfilled expiry, unlike the LIMIT_ENTRY_MODE_ENABLED pair.
+# CLOSED_EXTERNALLY (position_manager.PositionManager.
+# reconcile_closed_positions) is also deliberately absent from all three
+# sets below - a manual close/ADL/liquidation off-bot has no tracked fill
+# price for the actual close, so this vantage point can't classify it as
+# win/loss/breakeven and it deliberately falls through to classify()'s
+# UNKNOWN instead of being guessed at.
 BREAKEVEN_OUTCOMES = {
     "BREAKEVEN_STOP_HIT", "SHADOW_BREAKEVEN_STOP_HIT",
     "BREAKEVEN_TRIGGER_MARKET_CLOSE",

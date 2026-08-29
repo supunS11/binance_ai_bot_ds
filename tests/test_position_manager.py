@@ -802,6 +802,120 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertIsNone(position["dca_trail_order_id"])
 
 
+class ReconcileClosedPositionsTests(unittest.TestCase):
+    """poll_live only ever detects a real position's close by watching
+    specific remembered order ids reach FINISHED - a manual close on the
+    exchange (or ADL/liquidation) auto-cancels those same orders instead,
+    which poll_live's checks can never recognize. reconcile_closed_positions
+    is the separate reconciliation pass that catches exactly that gap -
+    real incident (2026-08-29): TRXUSDT/XPINUSDT both closed by hand on the
+    exchange, left an orphaned resting DCA order live indefinitely."""
+
+    def _tracked_position(self, stage, shadow=False):
+        manager = PositionManager()
+        manager.positions["BTCUSDT"] = dict(_plan(), stage=stage, shadow=shadow, trade_id="t1")
+        return manager
+
+    def test_position_still_real_is_left_alone(self):
+        manager = self._tracked_position(DCA_PENDING)
+
+        with patch.object(exchange, "_fetch_all_open_positions", return_value=[{"symbol": "BTCUSDT"}]), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            manager.reconcile_closed_positions()
+
+        self.assertIn("BTCUSDT", manager.positions)
+        cancel_all.assert_not_called()
+
+    def test_position_gone_in_eligible_stage_is_cleaned_up_and_closed(self):
+        for stage in (TP1_PENDING, BREAKEVEN_ACTIVE, DCA_PENDING, DCA_ACTIVE):
+            with self.subTest(stage=stage):
+                manager = self._tracked_position(stage)
+
+                with patch.object(exchange, "_fetch_all_open_positions", return_value=[]), \
+                     patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+                    manager.reconcile_closed_positions()
+
+                cancel_all.assert_called_once_with("BTCUSDT")
+                self.assertNotIn("BTCUSDT", manager.positions)
+
+    def test_shadow_position_is_never_touched(self):
+        manager = self._tracked_position(DCA_PENDING, shadow=True)
+
+        with patch.object(exchange, "_fetch_all_open_positions", return_value=[]), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            manager.reconcile_closed_positions()
+
+        self.assertIn("BTCUSDT", manager.positions)
+        cancel_all.assert_not_called()
+
+    def test_pending_limit_fill_stage_is_never_touched(self):
+        manager = self._tracked_position(PENDING_LIMIT_FILL)
+
+        with patch.object(exchange, "_fetch_all_open_positions", return_value=[]), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            manager.reconcile_closed_positions()
+
+        self.assertIn("BTCUSDT", manager.positions)
+        cancel_all.assert_not_called()
+
+    def test_retracement_pending_stage_is_never_touched(self):
+        manager = self._tracked_position(RETRACEMENT_PENDING)
+
+        with patch.object(exchange, "_fetch_all_open_positions", return_value=[]), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            manager.reconcile_closed_positions()
+
+        self.assertIn("BTCUSDT", manager.positions)
+        cancel_all.assert_not_called()
+
+    def test_failed_fetch_fails_open_not_closed(self):
+        manager = self._tracked_position(DCA_PENDING)
+
+        with patch.object(exchange, "_fetch_all_open_positions", side_effect=Exception("timeout")), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            manager.reconcile_closed_positions()  # must not raise
+
+        self.assertIn("BTCUSDT", manager.positions)
+        cancel_all.assert_not_called()
+
+    def test_outcome_string_is_closed_externally(self):
+        manager = self._tracked_position(DCA_ACTIVE)
+
+        with patch.object(exchange, "_fetch_all_open_positions", return_value=[]), \
+             patch.object(exchange, "cancel_all_open_orders"), \
+             patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            manager.reconcile_closed_positions()
+
+        append_outcome.assert_called_once()
+        self.assertEqual(append_outcome.call_args.args[1], "CLOSED_EXTERNALLY")
+
+    def test_tp_finished_this_tick_gets_its_real_outcome_not_the_generic_one(self):
+        # Regression guard for the exact ordering main._poll_positions
+        # relies on: poll_live must get first crack at a real fill before
+        # reconcile_closed_positions ever runs, or every ordinary TP/SL
+        # fill would get mislabeled CLOSED_EXTERNALLY.
+        manager = PositionManager()
+        manager.positions["BTCUSDT"] = dict(
+            _plan(), stage=DCA_PENDING, shadow=False, trade_id="t1",
+            single_tp=True, tp_order_id="tp_order_1",
+        )
+
+        with patch.object(exchange, "get_algo_order_status", return_value="FINISHED"), \
+             patch.object(exchange, "cancel_all_open_orders"), \
+             patch("position_manager.signal_journal.append_outcome") as append_outcome:
+            outcome = manager.poll_live("BTCUSDT")
+
+            # Simulates the exchange snapshot fetched moments later this
+            # same tick already reflecting the fill.
+            with patch.object(exchange, "_fetch_all_open_positions", return_value=[]):
+                manager.reconcile_closed_positions()
+
+        self.assertEqual(outcome, "STATIC_TP_HIT")
+        self.assertNotIn("BTCUSDT", manager.positions)  # already closed by poll_live
+        append_outcome.assert_called_once()
+        self.assertEqual(append_outcome.call_args.args[1], "STATIC_TP_HIT")  # not CLOSED_EXTERNALLY
+
+
 class ReentryCooldownTests(unittest.TestCase):
     def test_symbol_never_closed_is_not_in_cooldown(self):
         manager = PositionManager()

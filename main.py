@@ -403,6 +403,14 @@ def _poll_positions(feed, positions):
                 crash_snapshot=crash_snapshot,
             )
 
+    # Catches a real (non-shadow) position closed OUTSIDE the bot
+    # entirely (manual close, ADL, liquidation) - poll_live's own checks
+    # structurally can't see this (see PositionManager.
+    # reconcile_closed_positions's own docstring). Must run AFTER the
+    # loop above so a genuine TP/SL fill this same tick gets its real
+    # specific outcome from poll_live first, not the generic one here.
+    positions.reconcile_closed_positions()
+
     # Full-fidelity snapshot for the next restart - see position_manager.
     # STATE_PATH's own comment for why this beats reconstructing from bare
     # exchange order shape. Once per poll cycle (not per-symbol/per-

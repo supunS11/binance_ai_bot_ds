@@ -411,6 +411,29 @@ class PrivateRestWeightTests(unittest.TestCase):
 
         self.rate_limit_mock.assert_called_once_with(5)
 
+    def test_fetch_all_open_positions_is_weighted(self):
+        with patch.object(exchange.client, "futures_position_information", return_value=[]):
+            exchange._fetch_all_open_positions()
+
+        self.rate_limit_mock.assert_called_once_with(5)
+
+    def test_fetch_all_open_positions_raises_but_get_all_open_positions_swallows(self):
+        # PositionManager.reconcile_closed_positions needs to tell "the
+        # account is confirmed empty" apart from "the fetch failed" - a
+        # failed fetch must never be read as zero real positions (that
+        # would mass-close every tracked position on a transient API
+        # blip). _fetch_all_open_positions is the raising primitive for
+        # that; get_all_open_positions stays the swallowing wrapper every
+        # other caller already relies on.
+        with patch.object(
+            exchange.client, "futures_position_information",
+            side_effect=Exception("timeout"),
+        ):
+            with self.assertRaises(Exception):
+                exchange._fetch_all_open_positions()
+
+            self.assertEqual(exchange.get_all_open_positions(), [])
+
     def test_setup_leverage_is_weighted(self):
         # setup_leverage now caches per symbol (see SetupLeverageCachingTests)
         # - an empty cache here guarantees the real call actually happens,

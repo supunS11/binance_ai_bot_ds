@@ -1132,8 +1132,12 @@ class SignalEngineTests(unittest.TestCase):
     def test_depth_trend_aligned_false_when_consistency_below_threshold(self):
         depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.3}
 
+        # REJECT_ENABLED pinned False - this test is about the
+        # informational field reading False, not about the (separately
+        # tested) live gate rejecting the signal outright.
         with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
-             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6):
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_PCT", 0.6), \
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED", False):
             result = self._run(depth=depth)
 
         self.assertFalse(result["depth_trend_aligned"])
@@ -1244,8 +1248,12 @@ class SignalEngineTests(unittest.TestCase):
     def test_whale_aligned_false_when_direction_disagrees(self):
         cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "SELL"}
 
+        # REJECT_ENABLED pinned False - this test is about the
+        # informational field reading False, not about the (separately
+        # tested) live gate rejecting the signal outright.
         with patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
-             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000):
+             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000), \
+             patch.object(config, "WHALE_AGAINST_REJECT_ENABLED", False):
             result = self._run(cvd=cvd)
 
         self.assertFalse(result["whale_aligned"])

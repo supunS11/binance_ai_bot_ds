@@ -830,34 +830,44 @@ def has_open_position(symbol, force=True):
     return get_open_position_detail(symbol, force=force) is not None
 
 
+def _fetch_all_open_positions():
+    """Raises on a REST failure instead of swallowing it - same
+    "confirmed empty" vs "couldn't check right now" distinction as
+    _fetch_open_position_detail. Callers that would take a destructive
+    action on absence (PositionManager.reconcile_closed_positions
+    treating a symbol's absence here as "closed externally") must call
+    this directly, not get_all_open_positions, which collapses both
+    cases to []."""
+    positions = _private_rest_call(
+        "futures_position_information:all",
+        client.futures_position_information,
+        weight=5,
+    )
+    result = []
+
+    for position in positions or []:
+        amount = float(position.get("positionAmt", 0) or 0)
+
+        if amount == 0:
+            continue
+
+        result.append({
+            "symbol": position["symbol"],
+            "side": "BUY" if amount > 0 else "SELL",
+            "quantity": abs(amount),
+            "entry_price": float(position.get("entryPrice", 0) or 0),
+        })
+
+    return result
+
+
 def get_all_open_positions():
     """Every non-zero position on the account, account-wide, in one call
     - used for startup reconciliation instead of checking symbol by
     symbol (and catches a position outside the current watchlist too, if
     SCAN_SYMBOLS changed since it was opened)."""
     try:
-        positions = _private_rest_call(
-            "futures_position_information:all",
-            client.futures_position_information,
-            weight=5,
-        )
-        result = []
-
-        for position in positions or []:
-            amount = float(position.get("positionAmt", 0) or 0)
-
-            if amount == 0:
-                continue
-
-            result.append({
-                "symbol": position["symbol"],
-                "side": "BUY" if amount > 0 else "SELL",
-                "quantity": abs(amount),
-                "entry_price": float(position.get("entryPrice", 0) or 0),
-            })
-
-        return result
-
+        return _fetch_all_open_positions()
     except Exception as exc:
         log_error(f"account-wide open positions fetch error: {exc}")
         return []
