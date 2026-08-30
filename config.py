@@ -42,6 +42,19 @@ SECRET_KEY = os.getenv("SECRET_KEY", "")
 # are a different key pair than your real account, generated separately
 # at https://testnet.binancefuture.com).
 BINANCE_TESTNET = env_bool("BINANCE_TESTNET", "False")
+# Real incident (2026-08-30): python-binance's Client had no requests_params
+# set, so the underlying `requests` session used NO timeout at all - a
+# single stalled TCP connection on any REST call (order-status checks, mark
+# price, etc. - all made from the main eval loop) could block the entire
+# bot indefinitely. Confirmed live: 3 separate hangs in ~24h (22min, 27min,
+# and one 3.2-HOUR outage), every one requiring a manual restart since
+# nothing on the VPS supervises this process. The websocket layer already
+# had proper timeouts throughout (open_timeout/ping_timeout/recv timeout)
+# and self-heals via the existing watchdog - only the REST layer was
+# unbounded. This turns an indefinite hang into a bounded, real exception
+# (still needs a process supervisor to actually recover - see the bot's
+# own deployment docs/run script for that half of the fix).
+BINANCE_REQUEST_TIMEOUT_SECONDS = env_float("BINANCE_REQUEST_TIMEOUT_SECONDS", 15.0)
 
 # =========================
 # RATE LIMITING (ported convention from v7/v8 exchange.py)

@@ -22,7 +22,16 @@ import config
 from logger import log_error, log_info, log_warning
 
 
-client = Client(config.API_KEY, config.SECRET_KEY, ping=False)
+# config.BINANCE_REQUEST_TIMEOUT_SECONDS - see its own config.py comment
+# for the real incident this fixes (an unbounded REST call could hang the
+# entire bot indefinitely; requests_params is python-binance's own hook
+# for threading a timeout into every request, spot and futures alike -
+# confirmed against the installed library's _get_request_kwargs, which
+# merges this into every single call's kwargs).
+client = Client(
+    config.API_KEY, config.SECRET_KEY, ping=False,
+    requests_params={"timeout": config.BINANCE_REQUEST_TIMEOUT_SECONDS},
+)
 
 if config.BINANCE_TESTNET:
     # python-binance's own `testnet=` constructor flag does NOT redirect
