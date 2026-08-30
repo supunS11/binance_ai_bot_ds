@@ -1511,10 +1511,15 @@ class ComputeRetracementPriceTests(unittest.TestCase):
     def test_prefer_deeper_picks_the_farther_qualifying_level_for_buy(self):
         # Both candidates qualify (0.3R and 0.15R, both under the 0.35 cap) -
         # prefer_deeper must pick the FARTHER one (97), the opposite of the
-        # default (nearest-entry) selection above.
+        # default (nearest-entry) selection above. RETRACEMENT_STRUCTURE_
+        # MAX_DEEP_R pinned to the same 0.35 here specifically so this stays
+        # isolated from that separate cap (see its own dedicated tests below) -
+        # the gap's own "bottom" edge (96, 0.4R) would otherwise also
+        # qualify under the deep cap's real default and change this result.
         with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
              patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
-             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_DEEP_R", 0.35):
             price = risk_manager.compute_retracement_price(
                 100, 90, "BUY",
                 fvgs=[{"top": 97, "bottom": 96}],
@@ -1589,6 +1594,39 @@ class ComputeRetracementPriceTests(unittest.TestCase):
             price = risk_manager.compute_retracement_price(100, 110, "SELL", prefer_deeper=True)
 
         self.assertEqual(price, 102.0)  # 100 + 0.2 * 10
+
+    def test_prefer_deeper_uses_the_deep_cap_to_include_a_level_beyond_the_shallow_cap(self):
+        # 2026-08-30: RETRACEMENT_STRUCTURE_MAX_DEEP_R - a pool at 0.38R
+        # (96.2) sits beyond the shallow cap (0.35R) but within the deep
+        # cap (0.4R). prefer_deeper must pick this real level, not fall
+        # through to the blind fixed-R fallback (99.0). A pool (single
+        # price candidate) is used here instead of an FVG so the result
+        # isn't also influenced by a gap's second (top/bottom) edge.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_DEEP_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_DEEP_R", 0.4):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY", pools=[{"type": "SELL_SIDE", "price": 96.2, "touches": 2}],
+                prefer_deeper=True,
+            )
+
+        self.assertEqual(price, 96.2)
+
+    def test_non_deep_selection_still_uses_only_the_shallow_cap(self):
+        # Same candidate/fixture as above, but prefer_deeper=False - must
+        # NOT reach into the deeper cap, same shallow-path behavior as
+        # before this setting existed.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35), \
+             patch.object(config, "RETRACEMENT_STRUCTURE_MAX_DEEP_R", 0.4):
+            price = risk_manager.compute_retracement_price(
+                100, 90, "BUY", pools=[{"type": "SELL_SIDE", "price": 96.2, "touches": 2}],
+            )
+
+        self.assertEqual(price, 99.0)  # falls back - 96.2 is beyond the 0.35R shallow cap
 
 
 class PriceAtRoiPctTests(unittest.TestCase):

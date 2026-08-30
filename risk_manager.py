@@ -200,15 +200,21 @@ def _nearest_structure_retracement_level(
     calculation).
 
     config.RETRACEMENT_DEPTH_AWARE_ENABLED - `prefer_deeper=True` picks the
-    FARTHEST qualifying level instead (still real, still within the exact
-    same RETRACEMENT_STRUCTURE_MAX_R cap - no new/blind distance, only
-    which already-real candidate gets selected changes). See that flag's
-    own config.py comment for the real evidence behind using this for a
-    weak-depth_imbalance entry."""
+    FARTHEST qualifying level instead - still real, but now checked
+    against RETRACEMENT_STRUCTURE_MAX_DEEP_R instead of RETRACEMENT_
+    STRUCTURE_MAX_R (2026-08-30 - a separate, deeper cap so a real level
+    between the two caps isn't excluded in favor of the blind fixed-R
+    fallback just because the shallow-path cap is tighter). See that
+    setting's own config.py comment for the reasoning, and RETRACEMENT_
+    DEPTH_AWARE_ENABLED's for the real evidence behind using any of this
+    for a weak-depth_imbalance entry."""
     if risk_distance <= 0:
         return None
 
-    max_r = max(float(config.RETRACEMENT_STRUCTURE_MAX_R), 0)
+    max_r = max(
+        float(config.RETRACEMENT_STRUCTURE_MAX_DEEP_R if prefer_deeper else config.RETRACEMENT_STRUCTURE_MAX_R),
+        0,
+    )
     candidates = []
 
     for gap in (fvgs or []):

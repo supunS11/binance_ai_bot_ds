@@ -2069,6 +2069,19 @@ RETRACEMENT_STRUCTURE_TARGET_ENABLED = env_bool("RETRACEMENT_STRUCTURE_TARGET_EN
 # "sane" and the fixed-R fallback is used instead. Starting value, not
 # outcome-validated - revisit once this has run live.
 RETRACEMENT_STRUCTURE_MAX_R = env_float("RETRACEMENT_STRUCTURE_MAX_R", 0.35)
+# 2026-08-30: a separate, deeper cap for the depth-aware (prefer_deeper)
+# selection only - RETRACEMENT_STRUCTURE_MAX_R above stays exactly as the
+# 2026-08-22 investigation calibrated it for the ordinary/shallow path.
+# Without this, a real structural level between RETRACEMENT_STRUCTURE_
+# MAX_R and RETRACEMENT_ENTRY_OFFSET_DEEP_R would be excluded from
+# consideration even though it's real - a deep-routed trade would jump
+# straight to the blind fixed-R fallback despite a real, closer level
+# existing. Defaulted to match RETRACEMENT_ENTRY_OFFSET_DEEP_R itself, so
+# a real level is always preferred over the blind fallback within the
+# exact same reach the fallback itself is willing to go. Not
+# outcome-validated - same starting-value status as every other number in
+# this mechanism.
+RETRACEMENT_STRUCTURE_MAX_DEEP_R = env_float("RETRACEMENT_STRUCTURE_MAX_DEEP_R", 0.4)
 # 2026-08-30: real evidence this session - trades with depth_imbalance
 # (signed toward the trade's own side) >=0.30 at entry hit 92.3% (12/13)
 # with consistently low adverse excursion; checked for confounds (10-day
