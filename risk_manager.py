@@ -260,10 +260,13 @@ def compute_retracement_price(entry_price, sl_price, side, fvgs=None, pools=None
     level) over this fixed-R calculation; falls back to it when the flag
     is off, no fvgs/pools were supplied, or nothing qualifies. `prefer_deeper`
     (config.RETRACEMENT_DEPTH_AWARE_ENABLED) is threaded straight through to
-    that same function - the fallback here is unchanged either way, still
-    the plain fixed-R calculation, never a second/deeper guessed offset."""
+    that same function for the structural pick; the fixed-R fallback ALSO
+    widens to RETRACEMENT_ENTRY_OFFSET_DEEP_R when prefer_deeper is True
+    (2026-08-30 - the BANKUSDT case study showed the base 0.1R fallback
+    never even got reached by price for a weak-depth trade)."""
     risk_distance = abs(entry_price - sl_price)
-    offset = risk_distance * max(float(config.RETRACEMENT_ENTRY_OFFSET_R), 0)
+    offset_r = config.RETRACEMENT_ENTRY_OFFSET_DEEP_R if prefer_deeper else config.RETRACEMENT_ENTRY_OFFSET_R
+    offset = risk_distance * max(float(offset_r), 0)
     fallback_price = entry_price - offset if side == "BUY" else entry_price + offset
 
     if not config.RETRACEMENT_STRUCTURE_TARGET_ENABLED:

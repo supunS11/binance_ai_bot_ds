@@ -3842,6 +3842,31 @@ class PositionManager:
 
         return latest_candle["high"] >= sl_price
 
+    @staticmethod
+    def _retracement_runaway(position, latest_candle):
+        """config.RETRACEMENT_REJECT_ON_RUNAWAY_R - only meaningful for a
+        used_deep_retracement position, and only checked by callers once
+        already expired (never while still resting - matches exactly what
+        was asked for). Candle CLOSE, not high/low - see that config's own
+        comment for why."""
+        if not latest_candle or not position.get("used_deep_retracement"):
+            return False
+
+        plan = position["plan"]
+        side = position["side"]
+        trigger_price = plan["entry_price"]
+        risk_distance = plan.get("risk_distance") or abs(trigger_price - plan["sl_price"])
+
+        if risk_distance <= 0:
+            return False
+
+        offset = config.RETRACEMENT_REJECT_ON_RUNAWAY_R * risk_distance
+
+        if side == "BUY":
+            return latest_candle["close"] >= trigger_price + offset
+
+        return latest_candle["close"] <= trigger_price - offset
+
     def _resolve_retracement_market_fallback(self, position, filled_quantity, filled_avg_price):
         """Places a market order for whatever quantity the resting
         retracement limit did NOT fill (all of it, if none) - the
@@ -4008,20 +4033,27 @@ class PositionManager:
 
         return None
 
-    def _drop_unfilled_retracement_entry(self, position, shadow=False):
+    def _drop_unfilled_retracement_entry(
+        self, position, shadow=False,
+        outcome="RETRACEMENT_INVALIDATED_UNFILLED", reason="invalidated before filling",
+    ):
         """Genuinely zero-fill invalidation before the retracement limit
         ever touched - nothing was protected, nothing to unwind beyond the
         cancel already issued by the caller. Gets the same cooldown
         treatment as a real SL hit (the level failed before entry even
         happened) - see _drop_unfilled_pending_entry's identical
-        reasoning for its own invalidated branch."""
+        reasoning for its own invalidated branch. `outcome`/`reason`
+        default to the original SL-side-invalidation case; also reused
+        (2026-08-30) for the RETRACEMENT_REJECT_ON_RUNAWAY_R expiry case
+        with its own distinct outcome tag - same "nothing to unwind"
+        shape either way."""
         symbol = position["symbol"]
         self.positions.pop(symbol, None)
         self._closed_at[symbol] = time.time()
         prefix = " [SHADOW]" if shadow else ""
-        log_info(f"{symbol}{prefix} retracement entry invalidated before filling - never entered")
-        signal_journal.append_outcome(symbol, "RETRACEMENT_INVALIDATED_UNFILLED", position.get("trade_id"))
-        return "RETRACEMENT_INVALIDATED_UNFILLED"
+        log_info(f"{symbol}{prefix} retracement entry {reason} - never entered")
+        signal_journal.append_outcome(symbol, outcome, position.get("trade_id"))
+        return outcome
 
     def poll_retracement_pending(self, symbol, latest_candle):
         """Returns an outcome string if this call closed things out
@@ -4069,6 +4101,34 @@ class PositionManager:
             # protected, and never falls back to market into a broken
             # setup.
             return self._drop_unfilled_retracement_entry(position)
+
+        # config.RETRACEMENT_REJECT_ON_RUNAWAY_R (2026-08-30) - a
+        # deep-routed limit that timed out with price already having run
+        # favorably past the reject threshold: the setup already played
+        # out without us, so don't chase a now-materially-worse entry.
+        # `not fully_filled` - nothing to reject if it already filled in
+        # full. `not invalidated` - the SL-side invalidation case above
+        # (or its partial-fill fallthrough below) is a different, already
+        # -handled failure mode.
+        if (
+            expired and not invalidated and not fully_filled
+            and self._retracement_runaway(position, latest_candle)
+        ):
+            if filled_quantity <= 0:
+                return self._drop_unfilled_retracement_entry(
+                    position,
+                    outcome="RETRACEMENT_EXPIRED_REJECTED_RUNAWAY",
+                    reason="expired unfilled - price already ran favorably past the reject threshold, not chasing",
+                )
+
+            log_info(
+                f"{symbol} retracement expired with a partial fill and price already "
+                f"ran favorably past the reject threshold - keeping the partial, not "
+                f"chasing the remainder"
+            )
+            return self._finalize_retracement_entry(
+                position, filled_avg_price, filled_quantity, "PARTIAL_NO_CHASE"
+            )
 
         # Every other resolution (full fill, partial fill + invalidated,
         # partial/zero fill + expired) ends here: market-fallback for
@@ -4139,6 +4199,13 @@ class PositionManager:
         ) >= max(float(position.get("retracement_timeout_seconds", config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS)), 0)
 
         if expired:
+            if self._retracement_runaway(position, latest_candle):
+                return self._drop_unfilled_retracement_entry(
+                    position, shadow=True,
+                    outcome="SHADOW_RETRACEMENT_EXPIRED_REJECTED_RUNAWAY",
+                    reason="expired unfilled - price already ran favorably past the reject threshold, not chasing",
+                )
+
             log_info(
                 f"{symbol} [SHADOW] retracement entry expired unfilled - "
                 f"market fallback @ {latest_candle['close']}"

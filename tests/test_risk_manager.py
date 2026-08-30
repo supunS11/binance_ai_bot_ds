@@ -1541,9 +1541,12 @@ class ComputeRetracementPriceTests(unittest.TestCase):
 
     def test_prefer_deeper_still_falls_back_when_nothing_qualifies(self):
         # Same fixture as test_structure_target_falls_back_when_no_level_is_
-        # in_the_risk_window - prefer_deeper must never invent a new
-        # fallback distance, only change which real candidate wins.
+        # in_the_risk_window - prefer_deeper must never invent a candidate
+        # that isn't real, only change which real candidate wins (or, when
+        # none qualify, which fixed-R offset the fallback itself uses -
+        # see the DEEP-offset-specific tests below for that piece).
         with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_DEEP_R", 0.1), \
              patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
              patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
             price = risk_manager.compute_retracement_price(
@@ -1558,6 +1561,7 @@ class ComputeRetracementPriceTests(unittest.TestCase):
         # doesn't exempt a candidate from the same real-structure cap every
         # other selection already respects.
         with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_DEEP_R", 0.1), \
              patch.object(config, "RETRACEMENT_STRUCTURE_TARGET_ENABLED", True), \
              patch.object(config, "RETRACEMENT_STRUCTURE_MAX_R", 0.35):
             price = risk_manager.compute_retracement_price(
@@ -1566,6 +1570,25 @@ class ComputeRetracementPriceTests(unittest.TestCase):
             )
 
         self.assertEqual(price, 99.0)
+
+    def test_prefer_deeper_fallback_uses_the_deep_offset_not_the_base_one(self):
+        # 2026-08-30: prefer_deeper's fixed-R fallback (nothing structural
+        # qualifies) now widens to RETRACEMENT_ENTRY_OFFSET_DEEP_R instead
+        # of reusing RETRACEMENT_ENTRY_OFFSET_R.
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_DEEP_R", 0.2):
+            shallow_price = risk_manager.compute_retracement_price(100, 90, "BUY")
+            deep_price = risk_manager.compute_retracement_price(100, 90, "BUY", prefer_deeper=True)
+
+        self.assertEqual(shallow_price, 99.0)  # 100 - 0.1 * 10, base offset
+        self.assertEqual(deep_price, 98.0)  # 100 - 0.2 * 10, deep offset
+
+    def test_prefer_deeper_fallback_sell_uses_the_deep_offset(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_OFFSET_R", 0.1), \
+             patch.object(config, "RETRACEMENT_ENTRY_OFFSET_DEEP_R", 0.2):
+            price = risk_manager.compute_retracement_price(100, 110, "SELL", prefer_deeper=True)
+
+        self.assertEqual(price, 102.0)  # 100 + 0.2 * 10
 
 
 class PriceAtRoiPctTests(unittest.TestCase):

@@ -2082,13 +2082,32 @@ RETRACEMENT_STRUCTURE_MAX_R = env_float("RETRACEMENT_STRUCTURE_MAX_R", 0.35)
 # is a gate on top of a gate, both currently default OFF.
 RETRACEMENT_DEPTH_AWARE_ENABLED = env_bool("RETRACEMENT_DEPTH_AWARE_ENABLED", "False")
 RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE = env_float("RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE", 0.30)
-# Starting value, NOT evidence-backed - there is no existing fill-lag
-# analysis for the retracement mechanism at all yet (depth-aware or
-# otherwise) to calibrate this against. 2x the base timeout, a
-# reasoned-but-unvalidated placeholder. Revisit once real deep-routed
-# fill-lag data exists (see used_deep_retracement, journaled specifically
-# so this can be checked later instead of guessed at again).
-RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS = env_int("RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 600)
+# 2026-08-30: 600s proved too short in practice (BANKUSDT case study -
+# price never got within reach of the resting price even across a full
+# 600s+ window checked). Bumped to 1200s (20min). Still NOT evidence-
+# backed - there is no deep-routed fill-lag data yet to calibrate against
+# (see used_deep_retracement, journaled specifically so this can be
+# checked later instead of guessed at again).
+RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS = env_int("RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 1200)
+# Fallback-only (fixed-R) offset for a deep-routed trade when no real
+# structural FVG/pool level qualifies - see risk_manager.compute_
+# retracement_price. A real structural level, when one qualifies, is
+# still picked exactly as before; this only widens the fixed-R fallback
+# used when nothing does (the actual BANKUSDT case - 0.1R was never even
+# reached by price). 2x the base RETRACEMENT_ENTRY_OFFSET_R, a
+# reasoned-but-unvalidated placeholder.
+RETRACEMENT_ENTRY_OFFSET_DEEP_R = env_float("RETRACEMENT_ENTRY_OFFSET_DEEP_R", 0.2)
+# If, once a deep-routed limit's timeout expires, price has already
+# CLOSED beyond this many R (of the original trigger-instant risk
+# distance) past the trigger price in the trade's favorable direction,
+# the setup already ran without us - reject the unfilled remainder
+# instead of market-chasing a now-materially-worse entry. Candle CLOSE,
+# not high/low - deliberately less trigger-happy than
+# _retracement_entry_invalidated's own wick-sensitive check, since a
+# false positive here permanently gives up a trade instead of protecting
+# one. Only ever evaluated for used_deep_retracement positions, and only
+# once already expired - never checked while still resting.
+RETRACEMENT_REJECT_ON_RUNAWAY_R = env_float("RETRACEMENT_REJECT_ON_RUNAWAY_R", 0.5)
 
 # =========================
 # LOGGING / ALERTING

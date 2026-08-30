@@ -4664,6 +4664,147 @@ class PollRetracementPendingTests(unittest.TestCase):
 
         self.assertEqual(append_settle.call_args.args[3], "MARKET_FALLBACK")
 
+    # config.RETRACEMENT_REJECT_ON_RUNAWAY_R (2026-08-30) - a deep-routed
+    # limit that timed out with price already closed favorably past the
+    # reject threshold must not chase a market fallback.
+
+    def test_expiry_with_runaway_and_zero_fill_rejects_without_chasing(self):
+        manager = _retracement_manager(
+            dca=True, single_tp=False, retracement_timeout_seconds=300, used_deep_retracement=True,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+        # entry=100, sl=98, risk=2 -> default RETRACEMENT_REJECT_ON_RUNAWAY_R
+        # (0.5) threshold is 101; close=102 is past it.
+        candle = _candle(high=102, low=101.8, close=102)
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW", executed_qty=0.0)), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_market_order") as market_order:
+            outcome = manager.poll_retracement_pending("BTCUSDT", latest_candle=candle)
+
+        self.assertEqual(outcome, "RETRACEMENT_EXPIRED_REJECTED_RUNAWAY")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        cancel_order.assert_called_once_with("BTCUSDT", "limit1")
+        market_order.assert_not_called()
+
+    def test_expiry_with_runaway_and_a_partial_fill_keeps_the_partial_without_chasing(self):
+        manager = _retracement_manager(
+            dca=True, single_tp=False, retracement_timeout_seconds=300, used_deep_retracement=True,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+        candle = _candle(high=102, low=101.8, close=102)
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("PARTIALLY_FILLED", executed_qty=0.4, avg_price=99.5)), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_market_order") as market_order, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            outcome = manager.poll_retracement_pending("BTCUSDT", latest_candle=candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["quantity"], 0.4)
+        self.assertEqual(position["entry_price"], 99.5)
+        market_order.assert_not_called()
+        self.assertEqual(append_settle.call_args.args[3], "PARTIAL_NO_CHASE")
+
+    def test_expiry_without_runaway_still_chases_the_market_fallback(self):
+        # used_deep_retracement=True but price never closed past the
+        # reject threshold - existing chase behavior must be unchanged.
+        manager = _retracement_manager(
+            dca=True, single_tp=False, retracement_timeout_seconds=300, used_deep_retracement=True,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+        candle = _candle(high=100.5, low=100.2, close=100.5)  # short of the 101 threshold
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW", executed_qty=0.0)), \
+             patch.object(exchange, "cancel_order"), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 2}) as market_order, \
+             patch.object(exchange, "resolve_market_fill_price", return_value=101.0), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            outcome = manager.poll_retracement_pending("BTCUSDT", latest_candle=candle)
+
+        self.assertIsNone(outcome)
+        market_order.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+
+    def test_invalidated_takes_priority_over_runaway(self):
+        # Same candle carries both signals (an unusually wide range) - the
+        # SL-side invalidation must still win, same as before this feature
+        # existed.
+        manager = _retracement_manager(
+            dca=True, single_tp=False, retracement_timeout_seconds=300, used_deep_retracement=True,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+        candle = _candle(high=105, low=97, close=102)  # low touches sl=98, close past runaway threshold
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW", executed_qty=0.0)), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_market_order") as market_order:
+            outcome = manager.poll_retracement_pending("BTCUSDT", latest_candle=candle)
+
+        self.assertEqual(outcome, "RETRACEMENT_INVALIDATED_UNFILLED")
+        cancel_order.assert_called_once_with("BTCUSDT", "limit1")
+        market_order.assert_not_called()
+
+    def test_full_fill_at_expiry_is_not_rejected_even_past_the_runaway_threshold(self):
+        manager = _retracement_manager(
+            dca=True, single_tp=False, retracement_timeout_seconds=300, used_deep_retracement=True,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+        candle = _candle(high=102, low=101.8, close=102)
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("FILLED", executed_qty=1.0, avg_price=99.8)), \
+             patch.object(exchange, "cancel_order"), \
+             patch.object(exchange, "place_market_order") as market_order, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            outcome = manager.poll_retracement_pending("BTCUSDT", latest_candle=candle)
+
+        self.assertIsNone(outcome)
+        market_order.assert_not_called()
+        self.assertEqual(append_settle.call_args.args[3], "LIMIT")
+
+
+class RetracementRunawayTests(unittest.TestCase):
+    """PositionManager._retracement_runaway - config.RETRACEMENT_REJECT_ON_RUNAWAY_R."""
+
+    def test_true_for_buy_once_close_clears_the_threshold(self):
+        manager = _retracement_manager(used_deep_retracement=True)
+        position = manager.positions["BTCUSDT"]  # entry=100, sl=98, risk=2
+
+        with patch.object(config, "RETRACEMENT_REJECT_ON_RUNAWAY_R", 0.5):
+            self.assertTrue(manager._retracement_runaway(position, _candle(high=101.5, low=101.2, close=101.5)))
+
+    def test_false_for_buy_short_of_the_threshold(self):
+        manager = _retracement_manager(used_deep_retracement=True)
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "RETRACEMENT_REJECT_ON_RUNAWAY_R", 0.5):
+            self.assertFalse(manager._retracement_runaway(position, _candle(high=100.9, low=100.5, close=100.9)))
+
+    def test_true_for_sell_once_close_clears_the_threshold(self):
+        manager = _retracement_manager(side="SELL", used_deep_retracement=True)
+        position = manager.positions["BTCUSDT"]  # entry=100, sl=102, risk=2
+
+        with patch.object(config, "RETRACEMENT_REJECT_ON_RUNAWAY_R", 0.5):
+            self.assertTrue(manager._retracement_runaway(position, _candle(high=98.5, low=98.2, close=98.5)))
+
+    def test_false_when_used_deep_retracement_is_false_regardless_of_price(self):
+        manager = _retracement_manager(used_deep_retracement=False)
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "RETRACEMENT_REJECT_ON_RUNAWAY_R", 0.5):
+            self.assertFalse(manager._retracement_runaway(position, _candle(high=110, low=109, close=110)))
+
+    def test_false_when_no_candle_is_available(self):
+        manager = _retracement_manager(used_deep_retracement=True)
+        position = manager.positions["BTCUSDT"]
+
+        self.assertFalse(manager._retracement_runaway(position, None))
+
 
 class PollShadowRetracementPendingTests(unittest.TestCase):
     def test_touches_retracement_price_settles_immediately(self):
@@ -4751,6 +4892,42 @@ class PollShadowRetracementPendingTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], RETRACEMENT_PENDING)
+
+    # config.RETRACEMENT_REJECT_ON_RUNAWAY_R (2026-08-30)
+
+    def test_expiry_with_runaway_rejects_without_a_simulated_fallback_fill(self):
+        manager = _retracement_manager(
+            dca=True, single_tp=False, shadow=True, retracement_price=99.8,
+            retracement_timeout_seconds=300, used_deep_retracement=True,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+        # entry=100, sl=98, risk=2 -> default RETRACEMENT_REJECT_ON_RUNAWAY_R
+        # (0.5) threshold is 101; close=102 is past it. High/low kept short
+        # of both retracement (99.8) and sl (98) so neither of those fires
+        # first.
+        candle = _candle(high=102, low=101.8, close=102)
+
+        outcome = manager.poll_shadow_retracement_pending("BTCUSDT", candle)
+
+        self.assertEqual(outcome, "SHADOW_RETRACEMENT_EXPIRED_REJECTED_RUNAWAY")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_expiry_without_runaway_still_falls_back_to_the_candle_close(self):
+        manager = _retracement_manager(
+            dca=True, single_tp=False, shadow=True, retracement_price=99.8,
+            retracement_timeout_seconds=300, used_deep_retracement=True,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
+        candle = _candle(high=100.5, low=100.2, close=100.3)  # short of the 101 threshold
+
+        with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            outcome = manager.poll_shadow_retracement_pending("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["entry_price"], 100.3)
+        self.assertEqual(append_settle.call_args.args[3], "MARKET_FALLBACK")
 
     def test_deep_timeout_still_expires_once_its_own_window_elapses(self):
         manager = _retracement_manager(
