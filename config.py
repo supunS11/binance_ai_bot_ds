@@ -2069,6 +2069,26 @@ RETRACEMENT_STRUCTURE_TARGET_ENABLED = env_bool("RETRACEMENT_STRUCTURE_TARGET_EN
 # "sane" and the fixed-R fallback is used instead. Starting value, not
 # outcome-validated - revisit once this has run live.
 RETRACEMENT_STRUCTURE_MAX_R = env_float("RETRACEMENT_STRUCTURE_MAX_R", 0.35)
+# 2026-08-30: real evidence this session - trades with depth_imbalance
+# (signed toward the trade's own side) >=0.30 at entry hit 92.3% (12/13)
+# with consistently low adverse excursion; checked for confounds (10-day
+# span, 5 different triggers, no single day/trigger dominates) and it
+# held up. Below that, trades still win reasonably often (76-89%) but
+# with more adverse movement - not worth rejecting outright (would cut
+# real trade volume ~90% for a modest win-rate gain), but worth being
+# more patient about the entry price. Implicitly a no-op unless
+# RETRACEMENT_STRUCTURE_TARGET_ENABLED is also True - see that flag's
+# own comment for why it isn't independently validated yet either; this
+# is a gate on top of a gate, both currently default OFF.
+RETRACEMENT_DEPTH_AWARE_ENABLED = env_bool("RETRACEMENT_DEPTH_AWARE_ENABLED", "False")
+RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE = env_float("RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE", 0.30)
+# Starting value, NOT evidence-backed - there is no existing fill-lag
+# analysis for the retracement mechanism at all yet (depth-aware or
+# otherwise) to calibrate this against. 2x the base timeout, a
+# reasoned-but-unvalidated placeholder. Revisit once real deep-routed
+# fill-lag data exists (see used_deep_retracement, journaled specifically
+# so this can be checked later instead of guessed at again).
+RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS = env_int("RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 600)
 
 # =========================
 # LOGGING / ALERTING

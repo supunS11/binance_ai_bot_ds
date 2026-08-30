@@ -396,9 +396,32 @@ def enter_trade_retracement(plan):
     comment for the full mechanism and the real evidence behind it."""
     symbol = plan["symbol"]
     side = plan["side"]
+
+    # config.RETRACEMENT_DEPTH_AWARE_ENABLED - see config.py's own comment
+    # for the real evidence behind the 0.30 threshold. depth_imbalance is
+    # None (data unavailable) -> use_deep stays False -> today's shallow/
+    # base-timeout behavior unchanged - missing data must never
+    # independently trigger different order placement, same fail-open
+    # convention as every gate in signal_engine.py.
+    depth_imbalance = plan.get("depth_imbalance")
+    signed_depth = (
+        (depth_imbalance if side == "BUY" else -depth_imbalance)
+        if depth_imbalance is not None else None
+    )
+    use_deep = (
+        config.RETRACEMENT_DEPTH_AWARE_ENABLED
+        and signed_depth is not None
+        and signed_depth < config.RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE
+    )
+    timeout_seconds = (
+        config.RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS if use_deep
+        else config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS
+    )
+
     retracement_price = risk_manager.compute_retracement_price(
         plan["entry_price"], plan["sl_price"], side,
         fvgs=plan.get("fair_value_gaps"), pools=plan.get("liquidity_pools"),
+        prefer_deeper=use_deep,
     )
 
     if _is_shadow_mode(plan):
@@ -410,6 +433,8 @@ def enter_trade_retracement(plan):
         return {
             "ok": True, "shadow": True, "entry_order": None,
             "retracement_price": retracement_price,
+            "retracement_timeout_seconds": timeout_seconds,
+            "used_deep_retracement": use_deep,
         }
 
     # Same abort-before-any-order-attempt discipline as enter_trade.
@@ -427,10 +452,12 @@ def enter_trade_retracement(plan):
     log_info(
         f"{symbol} retracement entry placed {side} qty={plan['quantity']} "
         f"@ {retracement_price} (trigger was {plan['entry_price']}) | "
-        f"expires in {config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS}s -> market fallback"
+        f"expires in {timeout_seconds}s -> market fallback"
     )
 
     return {
         "ok": True, "shadow": False, "entry_order": entry_order,
         "retracement_price": retracement_price,
+        "retracement_timeout_seconds": timeout_seconds,
+        "used_deep_retracement": use_deep,
     }

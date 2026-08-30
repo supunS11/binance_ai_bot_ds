@@ -390,7 +390,111 @@ class EnterTradeRetracementLiveModeTests(unittest.TestCase):
         compute_price.assert_called_once_with(
             100, 98, "BUY",
             fvgs=plan["fair_value_gaps"], pools=plan["liquidity_pools"],
+            prefer_deeper=False,
         )
+
+
+class EnterTradeRetracementDepthAwareTests(unittest.TestCase):
+    """config.RETRACEMENT_DEPTH_AWARE_ENABLED - a weak depth_imbalance at
+    entry routes to a deeper structural level (risk_manager.compute_
+    retracement_price's own prefer_deeper) and a longer resting timeout
+    instead of today's shallow/base-timeout default."""
+
+    def test_weak_depth_imbalance_routes_deeper_with_longer_timeout(self):
+        plan = dict(_plan(), depth_imbalance=0.10)  # signed BUY: 0.10 < 0.30
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE", 0.30), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 600), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}), \
+             patch.object(risk_manager, "compute_retracement_price", return_value=99.0) as compute_price:
+            result = execution.enter_trade_retracement(plan)
+
+        compute_price.assert_called_once_with(
+            100, 98, "BUY", fvgs=None, pools=None, prefer_deeper=True,
+        )
+        self.assertEqual(result["retracement_timeout_seconds"], 600)
+        self.assertTrue(result["used_deep_retracement"])
+
+    def test_strong_depth_imbalance_stays_shallow(self):
+        plan = dict(_plan(), depth_imbalance=0.40)  # signed BUY: 0.40 >= 0.30
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE", 0.30), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 600), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}), \
+             patch.object(risk_manager, "compute_retracement_price", return_value=99.8) as compute_price:
+            result = execution.enter_trade_retracement(plan)
+
+        compute_price.assert_called_once_with(
+            100, 98, "BUY", fvgs=None, pools=None, prefer_deeper=False,
+        )
+        self.assertEqual(result["retracement_timeout_seconds"], 300)
+        self.assertFalse(result["used_deep_retracement"])
+
+    def test_missing_depth_imbalance_fails_open_to_shallow(self):
+        # No depth_imbalance key at all - unavailable data must never
+        # independently trigger different order placement.
+        plan = _plan()
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 600), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}), \
+             patch.object(risk_manager, "compute_retracement_price", return_value=99.8) as compute_price:
+            result = execution.enter_trade_retracement(plan)
+
+        compute_price.assert_called_once_with(
+            100, 98, "BUY", fvgs=None, pools=None, prefer_deeper=False,
+        )
+        self.assertEqual(result["retracement_timeout_seconds"], 300)
+        self.assertFalse(result["used_deep_retracement"])
+
+    def test_flag_disabled_ignores_depth_imbalance_entirely(self):
+        plan = dict(_plan(), depth_imbalance=0.10)  # would be "weak" if the flag were on
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_ENABLED", False), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 600), \
+             patch.object(exchange, "setup_leverage", return_value=True), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 1, "status": "NEW"}), \
+             patch.object(risk_manager, "compute_retracement_price", return_value=99.8) as compute_price:
+            result = execution.enter_trade_retracement(plan)
+
+        compute_price.assert_called_once_with(
+            100, 98, "BUY", fvgs=None, pools=None, prefer_deeper=False,
+        )
+        self.assertEqual(result["retracement_timeout_seconds"], 300)
+        self.assertFalse(result["used_deep_retracement"])
+
+    def test_shadow_mode_also_carries_the_deep_timeout(self):
+        # Real requirement: shadow trades are exactly what this mechanism
+        # needs to be evaluated on before it's ever trusted live - if the
+        # shadow branch silently reverted to the base timeout, it could
+        # never be evidence-checked pre-live.
+        plan = dict(_plan(), depth_imbalance=0.10)
+
+        with patch.object(config, "EXECUTION_MODE", "SHADOW"), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_ENABLED", True), \
+             patch.object(config, "RETRACEMENT_DEPTH_AWARE_MIN_IMBALANCE", 0.30), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_DEEP_SECONDS", 600), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            result = execution.enter_trade_retracement(plan)
+
+        self.assertTrue(result["shadow"])
+        self.assertEqual(result["retracement_timeout_seconds"], 600)
+        self.assertTrue(result["used_deep_retracement"])
+        limit_order.assert_not_called()
 
 
 class EnterTradeRetracementShadowOnlyTriggerTests(unittest.TestCase):

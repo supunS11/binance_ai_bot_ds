@@ -184,7 +184,9 @@ def compute_dca_sl_price(dca_fill_price, side, pools, atr=0, buffer_atr_multiple
     return _apply_min_stop_distance(sl_price, dca_fill_price, side, atr=atr)
 
 
-def _nearest_structure_retracement_level(entry_price, sl_price, side, risk_distance, fvgs, pools):
+def _nearest_structure_retracement_level(
+    entry_price, sl_price, side, risk_distance, fvgs, pools, prefer_deeper=False
+):
     """config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - candidate real levels
     are FVG top/bottom edges and liquidity pool prices (order blocks
     deliberately excluded from v1 - enumerating them costs a real extra
@@ -195,7 +197,14 @@ def _nearest_structure_retracement_level(entry_price, sl_price, side, risk_dista
     most likely to actually fill) - same selection logic validated against
     real signals in the 2026-08-22 investigation this was built from.
     Returns None if nothing qualifies (caller falls back to the fixed-R
-    calculation)."""
+    calculation).
+
+    config.RETRACEMENT_DEPTH_AWARE_ENABLED - `prefer_deeper=True` picks the
+    FARTHEST qualifying level instead (still real, still within the exact
+    same RETRACEMENT_STRUCTURE_MAX_R cap - no new/blind distance, only
+    which already-real candidate gets selected changes). See that flag's
+    own config.py comment for the real evidence behind using this for a
+    weak-depth_imbalance entry."""
     if risk_distance <= 0:
         return None
 
@@ -231,10 +240,13 @@ def _nearest_structure_retracement_level(entry_price, sl_price, side, risk_dista
     if not qualifying:
         return None
 
+    if prefer_deeper:
+        return min(qualifying) if side == "BUY" else max(qualifying)
+
     return max(qualifying) if side == "BUY" else min(qualifying)
 
 
-def compute_retracement_price(entry_price, sl_price, side, fvgs=None, pools=None):
+def compute_retracement_price(entry_price, sl_price, side, fvgs=None, pools=None, prefer_deeper=False):
     """config.RETRACEMENT_ENTRY_ENABLED - a small pullback toward the stop
     from the planned (trigger-instant) entry price, in RETRACEMENT_ENTRY_
     OFFSET_R units of the planned risk distance (entry to sl_price) - see
@@ -246,7 +258,10 @@ def compute_retracement_price(entry_price, sl_price, side, fvgs=None, pools=None
     config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - when on, prefers the
     nearest real structural level (see _nearest_structure_retracement_
     level) over this fixed-R calculation; falls back to it when the flag
-    is off, no fvgs/pools were supplied, or nothing qualifies."""
+    is off, no fvgs/pools were supplied, or nothing qualifies. `prefer_deeper`
+    (config.RETRACEMENT_DEPTH_AWARE_ENABLED) is threaded straight through to
+    that same function - the fallback here is unchanged either way, still
+    the plain fixed-R calculation, never a second/deeper guessed offset."""
     risk_distance = abs(entry_price - sl_price)
     offset = risk_distance * max(float(config.RETRACEMENT_ENTRY_OFFSET_R), 0)
     fallback_price = entry_price - offset if side == "BUY" else entry_price + offset
@@ -255,7 +270,7 @@ def compute_retracement_price(entry_price, sl_price, side, fvgs=None, pools=None
         return fallback_price
 
     structure_price = _nearest_structure_retracement_level(
-        entry_price, sl_price, side, risk_distance, fvgs, pools
+        entry_price, sl_price, side, risk_distance, fvgs, pools, prefer_deeper=prefer_deeper
     )
 
     return fallback_price if structure_price is None else structure_price

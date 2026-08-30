@@ -44,6 +44,7 @@ FIELDNAMES = [
     "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
     "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed",
     "dca_pressure_confirmed", "retracement_fill_type", "retracement_fill_lag_seconds",
+    "used_deep_retracement",
     "outcome",
 ]
 
@@ -228,7 +229,9 @@ def append_signal(signal, plan, execution_result=None):
     return trade_id
 
 
-def append_retracement_settle(symbol, trade_id, entry_price, fill_type, fill_lag_seconds):
+def append_retracement_settle(
+    symbol, trade_id, entry_price, fill_type, fill_lag_seconds, used_deep_retracement=False
+):
     """config.RETRACEMENT_ENTRY_ENABLED - a second, partial row for the
     same trade_id, appended once a retracement-pending signal actually
     settles into a real position (position_manager._finalize_retracement_
@@ -250,7 +253,13 @@ def append_retracement_settle(symbol, trade_id, entry_price, fill_type, fill_lag
     the quantity (`fill_type="MARKET_FALLBACK"`), and how many seconds
     elapsed between placing the resting order and this resolution -
     previously only reconstructible (partially - roughly half the time)
-    by cross-referencing log lines after the fact."""
+    by cross-referencing log lines after the fact.
+
+    config.RETRACEMENT_DEPTH_AWARE_ENABLED - `used_deep_retracement` records
+    whether this specific trade was routed to the deeper/longer-timeout
+    path (weak depth_imbalance at entry) or the normal shallow one - what
+    makes that mechanism evidence-checkable later (fill lag / outcome by
+    routing) instead of guessed at, same as every other mechanism here."""
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
     row["trade_id"] = trade_id or ""
@@ -258,6 +267,7 @@ def append_retracement_settle(symbol, trade_id, entry_price, fill_type, fill_lag
     row["entry_price"] = entry_price
     row["retracement_fill_type"] = fill_type
     row["retracement_fill_lag_seconds"] = fill_lag_seconds
+    row["used_deep_retracement"] = used_deep_retracement
     _append_row(row)
 
 

@@ -601,6 +601,15 @@ class PositionManager:
             "plan": plan,
             "is_dca": bool(config.DCA_ENABLED),
             "retracement_price": execution_result.get("retracement_price"),
+            # config.RETRACEMENT_DEPTH_AWARE_ENABLED - per-trade timeout
+            # (longer for a weak-depth_imbalance entry routed deeper) -
+            # falls back to the global default for any execution_result
+            # that doesn't carry it, same convention as retracement_price
+            # above.
+            "retracement_timeout_seconds": execution_result.get(
+                "retracement_timeout_seconds", config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS
+            ),
+            "used_deep_retracement": execution_result.get("used_deep_retracement", False),
             "limit_order_id": (
                 exchange._accepted_order_id(execution_result.get("entry_order"))
                 if not shadow else None
@@ -3946,7 +3955,8 @@ class PositionManager:
         # failure below still gets this recorded instead of losing it.
         fill_lag_seconds = round(time.time() - position["limit_placed_at"], 1)
         signal_journal.append_retracement_settle(
-            symbol, trade_id, entry_price, fill_type, fill_lag_seconds
+            symbol, trade_id, entry_price, fill_type, fill_lag_seconds,
+            used_deep_retracement=position.get("used_deep_retracement", False),
         )
 
         if plan.get("single_tp"):
@@ -4037,7 +4047,7 @@ class PositionManager:
         invalidated = self._retracement_entry_invalidated(position, latest_candle)
         expired = (
             time.time() - position["limit_placed_at"]
-        ) >= max(float(config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS), 0)
+        ) >= max(float(position.get("retracement_timeout_seconds", config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS)), 0)
 
         if not fully_filled and not invalidated and not expired:
             return None  # keep resting
@@ -4126,7 +4136,7 @@ class PositionManager:
 
         expired = (
             time.time() - position["limit_placed_at"]
-        ) >= max(float(config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS), 0)
+        ) >= max(float(position.get("retracement_timeout_seconds", config.RETRACEMENT_ENTRY_TIMEOUT_SECONDS)), 0)
 
         if expired:
             log_info(

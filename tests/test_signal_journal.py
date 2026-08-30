@@ -143,6 +143,23 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[1]["retracement_fill_type"], "MARKET_FALLBACK")
         self.assertEqual(rows[1]["retracement_fill_lag_seconds"], "300.4")
 
+    def test_append_retracement_settle_writes_used_deep_retracement(self):
+        # config.RETRACEMENT_DEPTH_AWARE_ENABLED
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_retracement_settle(
+            "BTCUSDT", trade_id, 99.5, "LIMIT", 184.2, used_deep_retracement=True,
+        )
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["used_deep_retracement"], "True")
+
+    def test_append_retracement_settle_defaults_used_deep_retracement_to_false(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_retracement_settle("BTCUSDT", trade_id, 99.5, "LIMIT", 184.2)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["used_deep_retracement"], "False")
+
     def test_append_signal_writes_quote_volume_usdt(self):
         signal_journal.append_signal(_signal(quote_volume_usdt=12_500_000), _plan())
         rows = self._read_rows()

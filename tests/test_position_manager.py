@@ -4038,13 +4038,22 @@ def _retracement_plan(side="BUY", dca=True, single_tp=False):
     return plan
 
 
-def _retracement_manager(side="BUY", dca=True, single_tp=False, retracement_price=99.8, shadow=False):
+def _retracement_manager(
+    side="BUY", dca=True, single_tp=False, retracement_price=99.8, shadow=False,
+    retracement_timeout_seconds=None, used_deep_retracement=None,
+):
     manager = PositionManager()
     execution_result = {
         "shadow": shadow,
         "entry_order": None if shadow else {"orderId": "limit1"},
         "retracement_price": retracement_price,
     }
+
+    if retracement_timeout_seconds is not None:
+        execution_result["retracement_timeout_seconds"] = retracement_timeout_seconds
+
+    if used_deep_retracement is not None:
+        execution_result["used_deep_retracement"] = used_deep_retracement
 
     with patch.object(config, "DCA_ENABLED", dca):
         manager.register_retracement_pending(
@@ -4086,6 +4095,22 @@ class RegisterRetracementPendingTests(unittest.TestCase):
 
         self.assertTrue(manager.has_open_position("BTCUSDT"))
         self.assertEqual(manager.open_count(), 1)
+
+    def test_stores_timeout_seconds_and_deep_flag_from_execution_result(self):
+        # config.RETRACEMENT_DEPTH_AWARE_ENABLED
+        manager = _retracement_manager(retracement_timeout_seconds=600, used_deep_retracement=True)
+        position = manager.positions["BTCUSDT"]
+
+        self.assertEqual(position["retracement_timeout_seconds"], 600)
+        self.assertTrue(position["used_deep_retracement"])
+
+    def test_defaults_timeout_seconds_when_execution_result_omits_it(self):
+        with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300):
+            manager = _retracement_manager()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["retracement_timeout_seconds"], 300)
+        self.assertFalse(position["used_deep_retracement"])
 
 
 class ResolveRetracementMarketFallbackTests(unittest.TestCase):
@@ -4452,6 +4477,44 @@ class PollRetracementPendingTests(unittest.TestCase):
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], RETRACEMENT_PENDING)
         cancel_order.assert_not_called()
 
+    def test_deep_timeout_keeps_resting_past_the_global_base_timeout(self):
+        # config.RETRACEMENT_DEPTH_AWARE_ENABLED - the per-position value
+        # must win, not the global config. Global patched to a SHORTER
+        # value than elapsed time to prove that: if the code accidentally
+        # still read the global, this would incorrectly expire.
+        manager = _retracement_manager(dca=True, single_tp=False, retracement_timeout_seconds=600)
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 400
+
+        with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW", executed_qty=0.0)), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_market_order") as market_order:
+            outcome = manager.poll_retracement_pending("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], RETRACEMENT_PENDING)
+        cancel_order.assert_not_called()
+        market_order.assert_not_called()
+
+    def test_deep_timeout_still_expires_once_its_own_window_elapses(self):
+        manager = _retracement_manager(dca=True, single_tp=False, retracement_timeout_seconds=600)
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 700
+
+        with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(exchange, "get_order_status", return_value=_pending_order_status("NEW", executed_qty=0.0)), \
+             patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 2}) as market_order, \
+             patch.object(exchange, "resolve_market_fill_price", return_value=101.0), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            outcome = manager.poll_retracement_pending("BTCUSDT", latest_candle=None)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        cancel_order.assert_called_once_with("BTCUSDT", "limit1")
+        market_order.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+
     def test_full_fill_settles_with_the_real_fill_price_and_no_market_fallback(self):
         manager = _retracement_manager(dca=True, single_tp=False)
 
@@ -4671,6 +4734,41 @@ class PollShadowRetracementPendingTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], RETRACEMENT_PENDING)
+
+    def test_deep_timeout_keeps_waiting_past_the_global_base_timeout(self):
+        # config.RETRACEMENT_DEPTH_AWARE_ENABLED - same per-position-wins
+        # proof as the live poller's version: global patched to a SHORTER
+        # value than elapsed time.
+        manager = _retracement_manager(
+            dca=True, single_tp=False, shadow=True, retracement_price=99.8,
+            retracement_timeout_seconds=600,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 400
+        candle = _candle(high=100.5, low=100.2)  # never reaches retracement or sl
+
+        with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300):
+            outcome = manager.poll_shadow_retracement_pending("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], RETRACEMENT_PENDING)
+
+    def test_deep_timeout_still_expires_once_its_own_window_elapses(self):
+        manager = _retracement_manager(
+            dca=True, single_tp=False, shadow=True, retracement_price=99.8,
+            retracement_timeout_seconds=600,
+        )
+        manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 700
+        candle = _candle(high=100.5, low=100.2, close=100.3)  # never reaches retracement or sl
+
+        with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            outcome = manager.poll_shadow_retracement_pending("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        self.assertEqual(position["entry_price"], 100.3)
 
 
 def _dca_plan(side="BUY"):

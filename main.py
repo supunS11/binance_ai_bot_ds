@@ -270,6 +270,10 @@ def _evaluate_symbol(
     # config.SHADOW_ONLY_TRIGGERS - execution._is_shadow_mode reads this
     # off plan, not result, to decide per-trigger shadow routing.
     plan["signal_trigger"] = result.get("signal_trigger")
+    # config.RETRACEMENT_DEPTH_AWARE_ENABLED - execution.enter_trade_
+    # retracement reads this off plan, not result, to decide whether to
+    # rest deeper/wait longer for a weak-depth_imbalance entry.
+    plan["depth_imbalance"] = result.get("depth_imbalance")
 
     # config.TP_STATIC_ROI_ENABLED - see position_manager's heartbeat log
     # comment for why single-TP plans need their own display.
