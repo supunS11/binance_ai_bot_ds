@@ -327,6 +327,20 @@ class PositionManager:
     def open_count(self):
         return len(self.positions)
 
+    def real_open_count(self):
+        """config.SHADOW_ONLY_TRIGGERS - a per-trigger-forced-shadow trade
+        (or the whole bot in EXECUTION_MODE=SHADOW) is fully evaluated,
+        sized, and tracked here exactly like a real one, so open_count()
+        alone conflates "how many real orders are actually on the
+        exchange" with "how many setups are being watched at all". Real
+        gap found live (2026-08-29): the heartbeat's own OPEN_POSITIONS
+        read as "N real trades" when several of those N were shadow-only
+        CVD_DIVERGENCE positions that never touched the exchange."""
+        return sum(1 for position in self.positions.values() if not position["shadow"])
+
+    def shadow_open_count(self):
+        return sum(1 for position in self.positions.values() if position["shadow"])
+
     def register(self, plan, execution_result, trade_id=None):
         symbol = plan["symbol"]
         shadow = execution_result.get("shadow", True)

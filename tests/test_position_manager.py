@@ -802,6 +802,50 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertIsNone(position["dca_trail_order_id"])
 
 
+class RealShadowOpenCountTests(unittest.TestCase):
+    """open_count() alone conflates real exchange exposure with shadow-only
+    tracking (config.SHADOW_ONLY_TRIGGERS) - real_open_count()/
+    shadow_open_count() split it so the heartbeat's OPEN_POSITIONS can mean
+    "real trades" again."""
+
+    def _add(self, manager, symbol, shadow):
+        manager.positions[symbol] = dict(_plan(), stage=DCA_PENDING, shadow=shadow, trade_id=symbol)
+
+    def test_all_real_counts_only_as_real(self):
+        manager = PositionManager()
+        self._add(manager, "BTCUSDT", shadow=False)
+        self._add(manager, "ETHUSDT", shadow=False)
+
+        self.assertEqual(manager.real_open_count(), 2)
+        self.assertEqual(manager.shadow_open_count(), 0)
+        self.assertEqual(manager.open_count(), 2)
+
+    def test_all_shadow_counts_only_as_shadow(self):
+        manager = PositionManager()
+        self._add(manager, "BTCUSDT", shadow=True)
+        self._add(manager, "ETHUSDT", shadow=True)
+
+        self.assertEqual(manager.real_open_count(), 0)
+        self.assertEqual(manager.shadow_open_count(), 2)
+        self.assertEqual(manager.open_count(), 2)
+
+    def test_mixed_real_and_shadow_split_correctly(self):
+        manager = PositionManager()
+        self._add(manager, "BTCUSDT", shadow=False)
+        self._add(manager, "ETHUSDT", shadow=True)
+        self._add(manager, "SOLUSDT", shadow=True)
+
+        self.assertEqual(manager.real_open_count(), 1)
+        self.assertEqual(manager.shadow_open_count(), 2)
+        self.assertEqual(manager.open_count(), 3)
+
+    def test_empty_manager_is_zero_both(self):
+        manager = PositionManager()
+
+        self.assertEqual(manager.real_open_count(), 0)
+        self.assertEqual(manager.shadow_open_count(), 0)
+
+
 class ReconcileClosedPositionsTests(unittest.TestCase):
     """poll_live only ever detects a real position's close by watching
     specific remembered order ids reach FINISHED - a manual close on the

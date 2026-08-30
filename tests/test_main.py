@@ -51,10 +51,11 @@ class _FakeFeed:
 
 
 class _FakePositions:
-    def __init__(self, has_open=False, in_cooldown=False, count=0):
+    def __init__(self, has_open=False, in_cooldown=False, count=0, shadow_count=0):
         self._has_open = has_open
         self._in_cooldown = in_cooldown
         self._count = count
+        self._shadow_count = shadow_count
         self.registered = []
         self.registered_pending = []
         self.registered_dca_pending = []
@@ -69,6 +70,12 @@ class _FakePositions:
 
     def open_count(self):
         return self._count
+
+    def real_open_count(self):
+        return self._count
+
+    def shadow_open_count(self):
+        return self._shadow_count
 
     def mark_entry_failure(self, symbol):
         pass
@@ -296,6 +303,32 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
         main._evaluate_symbol(feed, "BTCUSDT", _FakePositions(has_open=True), 1000, reject_counts)
         main._evaluate_symbol(feed, "BTCUSDT", _FakePositions(in_cooldown=True), 1000, reject_counts)
         main._evaluate_symbol(feed, "BTCUSDT", _FakePositions(count=999), 1000, reject_counts)
+
+        self.assertEqual(len(reject_counts), 0)
+
+    def test_shadow_positions_do_not_count_toward_max_total_positions_capacity(self):
+        # config.SHADOW_ONLY_TRIGGERS - a shadow trade never touches the
+        # exchange, so it must not compete with real trades for real
+        # capacity. ltf_candles=[] forces NO_CANDLE_DATA once past the
+        # capacity gate - reaching it proves evaluation wasn't blocked
+        # there, since a block is a silent operational skip (see
+        # test_operational_skips_are_not_tallied above).
+        feed = _FakeFeed(ltf_candles=[])
+        reject_counts = Counter()
+        positions = _FakePositions(count=1, shadow_count=5)
+
+        with patch.object(config, "MAX_TOTAL_POSITIONS", 2):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts)
+
+        self.assertEqual(reject_counts.get("NO_CANDLE_DATA"), 1)
+
+    def test_real_positions_alone_still_hit_the_capacity_cap(self):
+        feed = _FakeFeed(ltf_candles=[])
+        reject_counts = Counter()
+        positions = _FakePositions(count=2, shadow_count=0)
+
+        with patch.object(config, "MAX_TOTAL_POSITIONS", 2):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, reject_counts)
 
         self.assertEqual(len(reject_counts), 0)
 

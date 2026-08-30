@@ -159,7 +159,12 @@ def _evaluate_symbol(
     if positions.is_in_cooldown(symbol):
         return
 
-    if positions.open_count() >= config.MAX_TOTAL_POSITIONS:
+    # Real (non-shadow) positions only - a shadow trade (config.
+    # SHADOW_ONLY_TRIGGERS or EXECUTION_MODE=SHADOW) never touches the
+    # exchange, so it shouldn't compete with real trades for real capital
+    # capacity. Real positions can still fill every MAX_TOTAL_POSITIONS
+    # slot regardless of how many shadow trades are also being tracked.
+    if positions.real_open_count() >= config.MAX_TOTAL_POSITIONS:
         return
 
     ltf_candles = feed.candles.get(symbol)
@@ -445,9 +450,17 @@ def _log_heartbeat(
     reject_trigger_counts=None, reject_trigger_symbols=None,
     oi_rising_block_total=None,
 ):
+    # OPEN_POSITIONS is real (non-shadow) only - a shadow trade (config.
+    # SHADOW_ONLY_TRIGGERS or EXECUTION_MODE=SHADOW) never touches the
+    # exchange, so counting it here reads as "N real trades" when it
+    # isn't. SHADOW_POSITIONS is the separate count for those.
+    # real_open_count() is also what MAX_TOTAL_POSITIONS capacity checks
+    # against in _evaluate_symbol - shadow trades don't compete with real
+    # ones for capacity. positions.open_count() (both combined) still
+    # exists but nothing reads it live-behaviorally anymore.
     log_info(
-        f"Heartbeat | WATCHING={len(symbols)} | OPEN_POSITIONS={positions.open_count()} "
-        f"| MODE={config.EXECUTION_MODE}"
+        f"Heartbeat | WATCHING={len(symbols)} | OPEN_POSITIONS={positions.real_open_count()} "
+        f"| SHADOW_POSITIONS={positions.shadow_open_count()} | MODE={config.EXECUTION_MODE}"
     )
 
     if reject_counts:
