@@ -417,19 +417,6 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(result["signal"], "BUY")
 
-    def test_htf_trend_swing_age_is_never_added_to_confluence_scoring(self):
-        htf_candles = [{"open_time": i * 14_400_000} for i in range(20)]
-        htf_structure = dict(
-            HTF_BULLISH, last_event={"index": 17, "type": "BOS", "direction": "BULLISH", "price": 100},
-        )
-
-        with patch.object(config, "HTF_TREND_SWING_AGE_REJECT_ENABLED", True):
-            with_age = self._run(htf_structure=htf_structure, htf_candles=htf_candles)
-
-        without_age = self._run()
-
-        self.assertEqual(with_age["confluence_total"], without_age["confluence_total"])
-        self.assertEqual(with_age["confluence_score"], without_age["confluence_score"])
 
     # config.HTF_TREND_EMA_PRIMARY_ENABLED - EXPLICIT LIVE TEST, zero
     # resolved-trade evidence (see config.py's own comment). Replaces
@@ -527,17 +514,6 @@ class SignalEngineTests(unittest.TestCase):
         # Swing age here is still 76h > 72h (same as the dedicated
         # swing-age test), which would normally reject - must not here.
         self.assertEqual(result["signal"], "BUY")
-
-    def test_htf_trend_live_is_never_added_to_confluence_scoring(self):
-        htf_candles = [{"open_time": 0, "close": 100}]
-
-        with_live = self._run(
-            htf_candles=htf_candles, htf_trend_ema=95.0, htf_trend_ema_primary_enabled=True,
-        )
-        without_live = self._run()
-
-        self.assertEqual(with_live["confluence_total"], without_live["confluence_total"])
-        self.assertEqual(with_live["confluence_score"], without_live["confluence_score"])
 
     def test_market_choppy_rejects_below_the_threshold(self):
         analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
@@ -1094,25 +1070,6 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["absorption_signal"])
         self.assertIsNone(result["absorption_aligned"])
 
-    def test_absorption_is_never_added_to_confluence_scoring(self):
-        # 2026-08-26 - brand new, unvalidated field, same "evidence before
-        # confluence" discipline as efficiency_favorable/funding_favorable/
-        # long_short_favorable (see signal_engine.py's own comment on
-        # confluence_fields). Only ema_aligned/oi_rising/btc_aligned feed
-        # confluence_total's denominator - a real absorption reading must
-        # not silently change confluence_ratio.
-        cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
-        depth = {"available": True, "depth_imbalance": 0.2, "price_change_pct_1m": 0.01}
-
-        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", True):
-            with_absorption = self._run(cvd=cvd, depth=depth)
-
-        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", False):
-            without_absorption = self._run(cvd=cvd, depth=depth)
-
-        self.assertEqual(with_absorption["confluence_total"], without_absorption["confluence_total"])
-        self.assertEqual(with_absorption["confluence_score"], without_absorption["confluence_score"])
-
     # config.DEPTH_TREND_TRACKING_ENABLED - informational only by default.
     # orderbook.DepthImbalanceEngine._depth_consistency_pct itself is
     # covered directly in test_orderbook.py; these only prove signal_engine
@@ -1335,22 +1292,6 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["signal"])
         self.assertEqual(result["reason"], "WHALE_AGAINST")
 
-    def test_depth_trend_and_whale_never_added_to_confluence_scoring(self):
-        depth = {"available": True, "depth_imbalance": 0.2, "depth_consistency_pct": 0.9}
-        cvd = {"available": True, "cvd_score": 0.5, "whale_notional": 25000, "whale_direction": "BUY"}
-
-        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", True), \
-             patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", True), \
-             patch.object(config, "WHALE_TRADE_MIN_NOTIONAL_USDT", 20000):
-            with_fields = self._run(depth=depth, cvd=cvd)
-
-        with patch.object(config, "DEPTH_TREND_TRACKING_ENABLED", False), \
-             patch.object(config, "WHALE_TRADE_TRACKING_ENABLED", False):
-            without_fields = self._run(depth=depth, cvd=cvd)
-
-        self.assertEqual(with_fields["confluence_total"], without_fields["confluence_total"])
-        self.assertEqual(with_fields["confluence_score"], without_fields["confluence_score"])
-
     # config.CROSS_EXCHANGE_OI_TRACKING_ENABLED - informational only.
     # cross_exchange_oi.compute_agreement() itself is covered directly in
     # test_cross_exchange_oi.py; these only prove signal_engine wires the
@@ -1402,19 +1343,6 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["oi_change_pct_bybit"])
         self.assertIsNone(result["oi_change_pct_okx"])
         self.assertIsNone(result["cross_exchange_oi_agree"])
-
-    def test_cross_exchange_oi_is_never_added_to_confluence_scoring(self):
-        bybit = {"available": True, "oi_change_pct": 2.0}
-        okx = {"available": True, "oi_change_pct": 1.0}
-
-        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", True):
-            with_cross = self._run(oi_snapshot_bybit=bybit, oi_snapshot_okx=okx)
-
-        with patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False):
-            without_cross = self._run(oi_snapshot_bybit=bybit, oi_snapshot_okx=okx)
-
-        self.assertEqual(with_cross["confluence_total"], without_cross["confluence_total"])
-        self.assertEqual(with_cross["confluence_score"], without_cross["confluence_score"])
 
     # config.CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED - informational
     # only, same shape as CROSS_EXCHANGE_OI_TRACKING_ENABLED above (reuses
@@ -1477,19 +1405,6 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["liquidation_notional_net_bybit"])
         self.assertIsNone(result["cross_exchange_liquidation_agree"])
 
-    def test_cross_exchange_liquidation_is_never_added_to_confluence_scoring(self):
-        binance = {"available": True, "net_liquidation_notional": 1000.0}
-        bybit = {"available": True, "net_liquidation_notional": 500.0}
-
-        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", True):
-            with_cross = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
-
-        with patch.object(config, "CROSS_EXCHANGE_LIQUIDATION_TRACKING_ENABLED", False):
-            without_cross = self._run(liquidation_snapshot=binance, liquidation_snapshot_bybit=bybit)
-
-        self.assertEqual(with_cross["confluence_total"], without_cross["confluence_total"])
-        self.assertEqual(with_cross["confluence_score"], without_cross["confluence_score"])
-
     # config.VOLUME_PROFILE_TRACKING_ENABLED - descriptive only, no
     # "aligned" field (see config.py's own reasoning). volume_profile.py's
     # own bucketing/POC/value-area math is covered directly in
@@ -1529,20 +1444,6 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["vp_poc_price"])
         self.assertIsNone(result["vp_position"])
 
-    def test_volume_profile_is_never_added_to_confluence_scoring(self):
-        snapshot = {
-            "available": True, "poc_price": 100.0, "value_area_high": 105.0,
-            "value_area_low": 95.0, "position": "INSIDE_VALUE_AREA",
-        }
-
-        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True):
-            with_vp = self._run(volume_profile_snapshot=snapshot)
-
-        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", False):
-            without_vp = self._run(volume_profile_snapshot=snapshot)
-
-        self.assertEqual(with_vp["confluence_total"], without_vp["confluence_total"])
-        self.assertEqual(with_vp["confluence_score"], without_vp["confluence_score"])
 
     # config.CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED - EXPLICIT LIVE TEST,
     # no resolved-trade evidence (see config.py's own comment). Real
@@ -1661,10 +1562,16 @@ class SignalEngineTests(unittest.TestCase):
     def test_vp_extension_does_not_reject_the_opposite_sides_extension(self):
         # BUY candidate, price already BELOW the value area (not extended
         # in ITS own direction) - must not reject.
+        # VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED disabled here to isolate
+        # this test to VP_EXTENSION_REJECT_ENABLED alone - it defaults
+        # True and would otherwise also reject this same fixture (a
+        # favorable, not unfavorable, extension) for its own separate
+        # reason - see VpInsideValueAreaRequiredTests below.
         snapshot = {"available": True, "position": "BELOW_VALUE_AREA"}
 
         with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
-             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", True):
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", True), \
+             patch.object(config, "VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", False):
             result = self._run(volume_profile_snapshot=snapshot)
 
         self.assertEqual(result["signal"], "BUY")
@@ -1686,22 +1593,72 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
 
     def test_vp_extension_reject_disabled_by_default_flag(self):
+        # VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED disabled here too - see the
+        # comment on test_vp_extension_does_not_reject_the_opposite_sides_
+        # extension above for why.
         snapshot = {"available": True, "position": "ABOVE_VALUE_AREA"}
 
         with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
-             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", False):
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", False), \
+             patch.object(config, "VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", False):
             result = self._run(volume_profile_snapshot=snapshot)
 
         self.assertEqual(result["signal"], "BUY")
 
-    def test_btc_aligned_counts_toward_confluence_score(self):
-        result = self._run(symbol="ETHUSDT", btc_return=0.05)  # aligned
+    # config.VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED - 2026-08-31, real
+    # evidence (see config.py's own comment). Independent of (stricter
+    # than) VP_EXTENSION_REJECT_ENABLED above.
 
-        # confluence_fields is [ema_aligned, oi_rising, btc_aligned] -
-        # sweep_confluence/liquidation_aligned removed 2026-08-25 (see
-        # signal_engine.py's own comment). All 3 remaining defaults agree.
-        self.assertEqual(result["confluence_score"], 3)
-        self.assertEqual(result["confluence_total"], 3)
+    def test_vp_inside_required_rejects_above_value_area_on_a_buy(self):
+        snapshot = {"available": True, "position": "ABOVE_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", False), \
+             patch.object(config, "VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", True):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "VP_NOT_INSIDE_VALUE_AREA")
+
+    def test_vp_inside_required_rejects_the_favorable_extension_too(self):
+        # BELOW_VALUE_AREA on a BUY is the case VP_EXTENSION_REJECT_ENABLED
+        # allows through (not "chasing" in the trade's own direction) -
+        # this gate is stricter and requires actually-inside regardless.
+        snapshot = {"available": True, "position": "BELOW_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", False), \
+             patch.object(config, "VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", True):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "VP_NOT_INSIDE_VALUE_AREA")
+
+    def test_vp_inside_required_does_not_reject_inside_value_area(self):
+        snapshot = {"available": True, "position": "INSIDE_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", True):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_vp_inside_required_does_not_reject_when_unavailable(self):
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", False), \
+             patch.object(config, "VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", True):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_vp_inside_required_disabled_by_flag(self):
+        snapshot = {"available": True, "position": "ABOVE_VALUE_AREA"}
+
+        with patch.object(config, "VOLUME_PROFILE_TRACKING_ENABLED", True), \
+             patch.object(config, "VP_EXTENSION_REJECT_ENABLED", False), \
+             patch.object(config, "VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", False):
+            result = self._run(volume_profile_snapshot=snapshot)
+
+        self.assertEqual(result["signal"], "BUY")
 
     def test_funding_rate_is_carried_through(self):
         result = self._run(funding_rate=0.0003)
@@ -1783,85 +1740,6 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertIsNone(result["funding_favorable"])
 
-    def test_new_favorable_booleans_are_not_added_to_confluence(self):
-        # Operator-confirmed decision: efficiency_favorable/funding_favorable/
-        # long_short_favorable stay independently journaled, NOT mixed into
-        # confluence_fields/confluence_ratio (that mechanism is disabled on
-        # real negative evidence from its existing 5 fields - see
-        # config.CONFLUENCE_SIZING_ENABLED). This locks the decision in so
-        # a future edit can't silently reintroduce it.
-        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.9)
-        result = self._run(ltf_analysis=analysis, funding_rate=0.0001)
-
-        self.assertTrue(result["efficiency_favorable"])
-        self.assertTrue(result["funding_favorable"])
-        # Same confluence_total as test_confluence_score_full_agreement_
-        # gives_ratio_one below (2: ema/oi - default symbol is the BTC
-        # reference symbol itself, so btc_aligned is skipped, and
-        # sweep_confluence/liquidation_aligned are no longer confluence
-        # inputs - see signal_engine.py's own comment) - unaffected by
-        # either new favorable boolean being true.
-        self.assertEqual(result["confluence_total"], 2)
-
-
-    def test_confluence_score_full_agreement_gives_ratio_one(self):
-        # confluence_fields is [ema_aligned, oi_rising, btc_aligned] -
-        # sweep_confluence/liquidation_aligned removed 2026-08-25, no
-        # longer confluence inputs (see signal_engine.py's own comment).
-        # Defaults: ema_value=85 < ltf_close=93 (aligned for BUY),
-        # OI_RISING - both agree; btc_aligned skipped (default symbol is
-        # the BTC reference symbol itself).
-        result = self._run()
-
-        self.assertEqual(result["confluence_score"], 2)
-        self.assertEqual(result["confluence_total"], 2)
-        self.assertAlmostEqual(result["confluence_ratio"], 1.0)
-
-    def test_confluence_score_counts_only_disagreeing_fields_against_it(self):
-        # symbol="ETHUSDT" brings btc_aligned into play (default symbol
-        # skips it as a self-correlation) so there's a genuine mix: ema/oi
-        # both disagree, only btc agrees.
-        result = self._run(
-            symbol="ETHUSDT", btc_return=0.05,  # aligned for a BUY
-            ema_alignment_value=95.0,  # 93 < 95 -> misaligned for a BUY
-            oi_snapshot={"available": True, "oi_change_pct": -3.0},  # falling
-        )
-
-        self.assertEqual(result["signal"], "BUY")
-        self.assertEqual(result["confluence_score"], 1)  # only btc agrees
-        self.assertEqual(result["confluence_total"], 3)
-        self.assertAlmostEqual(result["confluence_ratio"], 1 / 3)
-
-    def test_unavailable_fields_are_excluded_from_the_denominator(self):
-        # symbol="ETHUSDT" keeps btc_aligned available/agreeing so the test
-        # can show ema/oi being excluded without emptying the denominator
-        # entirely.
-        result = self._run(
-            symbol="ETHUSDT",  # btc_return defaults to 0.02 -> aligned for BUY
-            ema_value=None,
-            ema_alignment_value=None,
-            oi_snapshot={"available": False},
-        )
-
-        self.assertEqual(result["signal"], "BUY")
-        self.assertEqual(result["confluence_score"], 1)  # btc only
-        self.assertEqual(result["confluence_total"], 1)
-        self.assertAlmostEqual(result["confluence_ratio"], 1.0)
-
-    def test_disabled_confirmations_shrink_the_denominator_not_the_score(self):
-        # symbol="ETHUSDT": btc_aligned isn't gated by any of these three
-        # flags (BTC_CORRELATION_ENABLED is separate), so it's the one
-        # field left to show the denominator shrinking without also
-        # dropping the score.
-        with patch.object(config, "EMA_CONFIRMATION_ENABLED", False), \
-             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
-             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False):
-            result = self._run(symbol="ETHUSDT")  # btc_return default 0.02 -> aligned
-
-        self.assertEqual(result["signal"], "BUY")
-        self.assertEqual(result["confluence_score"], 1)
-        self.assertEqual(result["confluence_total"], 1)
-        self.assertAlmostEqual(result["confluence_ratio"], 1.0)
 
     def test_no_signal_when_order_flow_data_unavailable(self):
         result = self._run(cvd={"available": False})

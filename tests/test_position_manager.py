@@ -377,7 +377,7 @@ class ReconcileOnStartupTests(unittest.TestCase):
 
     def test_adopted_position_has_no_break_confirmation_data(self):
         # No original signal/candle to check this against - stays
-        # unresolved forever, same honesty policy as confluence_ratio.
+        # unresolved forever, same honesty policy as risk_distance above.
         manager = PositionManager()
         open_orders = [{"type": "STOP_MARKET", "triggerPrice": "98", "algoId": "sl1"}]
 
@@ -801,6 +801,96 @@ class ReconcileOnStartupTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertIsNone(position["dca_trail_order_id"])
 
+    # 2026-08-31: RECOVERED trade_id fix - a saved snapshot that fails
+    # _try_restore_from_saved_state's own sanity check (stale quantity,
+    # e.g. DCA fired on the real position after the last periodic
+    # save_state() but before this restart) must still hand its trade_id
+    # through to _adopt_position's guessing, instead of _adopt_position
+    # minting a brand-new _RECOVERED_ id that severs the link back to the
+    # original signal.
+
+    def test_plain_adoption_preserves_saved_trade_id_despite_quantity_mismatch(self):
+        manager = PositionManager()
+        saved = {"side": "BUY", "quantity": 5.0, "trade_id": "BTCUSDT_ORIGINAL_1"}
+        open_orders = [{"type": "STOP_MARKET", "triggerPrice": "98", "algoId": "sl1"}]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(qty=1.0)]), \
+             patch.object(PositionManager, "load_state", return_value={"BTCUSDT": saved}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["trade_id"], "BTCUSDT_ORIGINAL_1")
+
+    def test_dca_pending_recovery_preserves_saved_trade_id_despite_quantity_mismatch(self):
+        manager = PositionManager()
+        feed = self._FakeFeed(["candle"])
+        saved = {"side": "BUY", "quantity": 5.0, "trade_id": "BTCUSDT_ORIGINAL_2"}
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0, qty=1.0)]), \
+             patch.object(PositionManager, "load_state", return_value={"BTCUSDT": saved}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.5), \
+             patch.object(risk_manager, "compute_dca_price", return_value=96.0):
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        self.assertEqual(position["trade_id"], "BTCUSDT_ORIGINAL_2")
+
+    def test_single_tp_dca_pending_recovery_preserves_saved_trade_id(self):
+        manager = PositionManager()
+        feed = self._FakeFeed(["candle"])
+        saved = {"side": "BUY", "quantity": 5.0, "trade_id": "BTCUSDT_ORIGINAL_3"}
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0, qty=1.0)]), \
+             patch.object(PositionManager, "load_state", return_value={"BTCUSDT": saved}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._single_tp_dca_shape_open_orders()), \
+             patch.object(config, "DCA_ENABLED", True), \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.5), \
+             patch.object(risk_manager, "compute_dca_price", return_value=96.0):
+            manager.reconcile_on_startup(feed)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        self.assertEqual(position["trade_id"], "BTCUSDT_ORIGINAL_3")
+
+    def test_dca_active_recovery_preserves_saved_trade_id_despite_quantity_mismatch(self):
+        manager = PositionManager()
+        saved = {"side": "BUY", "quantity": 5.0, "trade_id": "BTCUSDT_ORIGINAL_4"}
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404, qty=1.0)]), \
+             patch.object(PositionManager, "load_state", return_value={"BTCUSDT": saved}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._dca_active_open_orders()):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_ACTIVE)
+        self.assertEqual(position["trade_id"], "BTCUSDT_ORIGINAL_4")
+
+    def test_saved_trade_id_not_reused_when_side_does_not_match(self):
+        # A symbol that fully closed and reopened in the OPPOSITE
+        # direction between the last save and this restart must not
+        # inherit the old (wrong) trade's identity - same guard
+        # _try_restore_from_saved_state itself already applies for a full
+        # restore.
+        manager = PositionManager()
+        saved = {"side": "SELL", "quantity": 1.0, "trade_id": "BTCUSDT_ORIGINAL_5"}
+        open_orders = [{"type": "STOP_MARKET", "triggerPrice": "98", "algoId": "sl1"}]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(side="BUY", qty=1.0)]), \
+             patch.object(PositionManager, "load_state", return_value={"BTCUSDT": saved}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=open_orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertTrue(position["trade_id"].startswith("BTCUSDT_RECOVERED_"))
+
 
 class RealShadowOpenCountTests(unittest.TestCase):
     """open_count() alone conflates real exchange exposure with shadow-only
@@ -1135,13 +1225,6 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(position["tp1_order_id"], "tp1_1")
         self.assertEqual(position["tp2_order_id"], "tp2_1")
 
-    def test_confluence_ratio_is_carried_from_the_plan(self):
-        manager = PositionManager()
-        position = manager.register(dict(_plan(), confluence_ratio=0.25), {"shadow": True})
-
-        self.assertEqual(position["confluence_ratio"], 0.25)
-        self.assertFalse(position["early_breakeven_applied"])
-
     def test_risk_distance_is_read_from_the_plan_when_present(self):
         manager = PositionManager()
         position = manager.register(dict(_plan(), risk_distance=1.75), {"shadow": True})
@@ -1184,7 +1267,6 @@ class EarlyBreakevenEligibilityTests(unittest.TestCase):
             "sl_price": 98,
             "breakeven_price": 100.02,
             "stage": TP1_PENDING,
-            "confluence_ratio": 0.25,
             "early_breakeven_applied": False,
         }
         position.update(overrides)
@@ -1243,24 +1325,6 @@ class EarlyBreakevenEligibilityTests(unittest.TestCase):
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
             self.assertFalse(manager._is_early_breakeven_candidate(
                 self._position(entry_price=100, sl_price=100)
-            ))
-
-    def test_any_confluence_ratio_is_a_candidate_including_none(self):
-        # Real bug this replaces: gating on confluence_ratio meant a
-        # position with no original signal (e.g. startup-reconciliation-
-        # adopted) or a high-confluence trade never got this protection
-        # at all - neither restriction is evidence-backed anymore.
-        manager = PositionManager()
-
-        with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True):
-            self.assertTrue(manager._is_early_breakeven_candidate(
-                self._position(confluence_ratio=None)
-            ))
-            self.assertTrue(manager._is_early_breakeven_candidate(
-                self._position(confluence_ratio=0.75)
-            ))
-            self.assertTrue(manager._is_early_breakeven_candidate(
-                self._position(confluence_ratio=0.25)
             ))
 
 
@@ -2361,9 +2425,9 @@ class PollShadowTests(unittest.TestCase):
         self.early_breakeven_patcher.stop()
         self.profit_protection_patcher.stop()
 
-    def _manager_with_position(self, side="BUY", confluence_ratio=None):
+    def _manager_with_position(self, side="BUY"):
         manager = PositionManager()
-        manager.register(dict(_plan(side), confluence_ratio=confluence_ratio), {"shadow": True})
+        manager.register(_plan(side), {"shadow": True})
         return manager
 
     def test_tp1_pending_sl_hit_closes_as_sl(self):
@@ -2490,14 +2554,14 @@ class PollShadowTests(unittest.TestCase):
         self.assertEqual(position["stage"], TP1_PENDING)
         self.assertFalse(position["early_breakeven_applied"])
 
-    def test_triggers_regardless_of_confluence_ratio(self):
+    def test_triggers_unconditionally_once_armed(self):
         # No longer gated on confluence - real evidence (2026-08-10)
         # showed confluence didn't predict outcome, while MFE distribution
         # did: 28% of losses ran 1.0R+ before fully reversing, completely
-        # unprotected. A high-confluence trade gets the same protection.
+        # unprotected. Every qualifying trade gets the same protection.
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 0.5):
-            manager = self._manager_with_position(confluence_ratio=0.75)
+            manager = self._manager_with_position()
             outcome = manager.poll_shadow("BTCUSDT", _candle(high=101.5, low=99, close=101))
 
         self.assertIsNone(outcome)
@@ -2777,7 +2841,7 @@ class PollLiveTests(unittest.TestCase):
         self.mae_tracking_patcher.stop()
         self.profit_protection_patcher.stop()
 
-    def _manager_with_position(self, confluence_ratio=None):
+    def _manager_with_position(self):
         manager = PositionManager()
         execution_result = {
             "shadow": False,
@@ -2785,7 +2849,7 @@ class PollLiveTests(unittest.TestCase):
             "tp1_order": {"algoId": "tp1_1"},
             "tp2_order": {"algoId": "tp2_1"},
         }
-        manager.register(dict(_plan(), confluence_ratio=confluence_ratio), execution_result)
+        manager.register(_plan(), execution_result)
         return manager
 
     def test_tp1_finished_promotes_to_breakeven(self):
@@ -3123,12 +3187,12 @@ class PollLiveTests(unittest.TestCase):
         # Never reached the normal TP1/SL/TP2 status checks this cycle.
         status_mock.assert_not_called()
 
-    def test_triggers_regardless_of_confluence_ratio(self):
+    def test_triggers_unconditionally_once_armed(self):
         # No longer gated on confluence - real evidence (2026-08-10)
         # showed confluence didn't predict outcome, while MFE distribution
         # did: 28% of losses ran 1.0R+ before fully reversing, completely
-        # unprotected. A high-confluence trade gets the same protection.
-        manager = self._manager_with_position(confluence_ratio=0.75)
+        # unprotected. Every qualifying trade gets the same protection.
+        manager = self._manager_with_position()
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", True), \
              patch.object(config, "EARLY_BREAKEVEN_R_MULTIPLE", 1.0), \
@@ -3186,7 +3250,7 @@ class PollLiveTests(unittest.TestCase):
         cancel_all.assert_called_once_with("BTCUSDT")
 
     def test_mark_price_never_fetched_when_both_mae_tracking_and_early_breakeven_are_off(self):
-        manager = self._manager_with_position(confluence_ratio=0.25)
+        manager = self._manager_with_position()
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", False), \
              patch.object(config, "MAE_TRACKING_ENABLED", False), \
@@ -3197,7 +3261,7 @@ class PollLiveTests(unittest.TestCase):
         mark_price_mock.assert_not_called()
 
     def test_mae_tracking_still_fetches_mark_price_when_early_breakeven_is_off(self):
-        manager = self._manager_with_position(confluence_ratio=0.25)
+        manager = self._manager_with_position()
 
         with patch.object(config, "EARLY_BREAKEVEN_ENABLED", False), \
              patch.object(config, "MAE_TRACKING_ENABLED", True), \

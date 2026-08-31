@@ -551,7 +551,6 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _breakdown_lines(resolved, "OI rising (informational)", lambda t: t.get("oi_rising", "unknown") or "False")
     lines += _breakdown_lines(resolved, "liquidation cluster (informational)", lambda t: t.get("liquidation_cluster", "unknown") or "False")
     lines += _breakdown_lines(resolved, "liquidation aligned (informational)", lambda t: t.get("liquidation_aligned", "unknown") or "False")
-    lines += _breakdown_lines(resolved, "confluence score (drives position sizing)", lambda t: t.get("confluence_score", "unknown") or "0")
     lines += _breakdown_lines(resolved, "24h quote volume (liquidity floor)", lambda t: _bucket_volume(t.get("quote_volume_usdt")))
     lines += _breakdown_lines(resolved, "efficiency ratio (chop vs trend)", lambda t: _bucket_efficiency(t.get("efficiency_ratio")))
     lines += _breakdown_lines(resolved, "efficiency favorable (informational)", lambda t: t.get("efficiency_favorable", "unknown") or "False")

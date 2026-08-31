@@ -416,6 +416,20 @@ VOLUME_PROFILE_VALUE_AREA_PCT = env_float("VOLUME_PROFILE_VALUE_AREA_PCT", 70.0)
 # evidence-backed MAX_ENTRY_EXTENSION_R reject, but unproven here.
 # Implicitly a no-op unless VOLUME_PROFILE_TRACKING_ENABLED is also True.
 VP_EXTENSION_REJECT_ENABLED = env_bool("VP_EXTENSION_REJECT_ENABLED", "False")
+# 2026-08-31, real evidence (225 resolved trades, restart-orphaned trades
+# relinked to their original trigger): signed by side (separating the
+# already-excluded "chasing an extension" case VP_EXTENSION_REJECT_ENABLED
+# above rejects from the currently-allowed "favorable extension" case),
+# INSIDE_VALUE_AREA wins 96.5% (n=57) vs 71-87% (n=23) for a favorable
+# extension - positive and consistent across every trigger checked (not
+# trigger-specific like depth_imbalance/ema_aligned turned out to be).
+# Independent of VP_EXTENSION_REJECT_ENABLED above - that one only
+# excludes the specific unfavorable extension; this one is stricter,
+# requiring actually-inside instead of merely not-unfavorably-outside.
+# Reject-only, safe-by-construction - same "ship on real evidence
+# immediately" precedent as OI_RISING_REJECT_ENABLED. Implicitly a no-op
+# unless VOLUME_PROFILE_TRACKING_ENABLED is also True.
+VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED = env_bool("VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED", "True")
 
 # =========================
 # MARKET STRUCTURE (ICT/SMC)
@@ -683,16 +697,27 @@ FUNDING_POLL_INTERVAL_SECONDS = env_int("FUNDING_POLL_INTERVAL_SECONDS", 300)
 # cycle, the exact shape of traffic this bot spent real effort avoiding
 # elsewhere - see exchange._rate_limit_public_request). Fetched on-demand
 # in main.py, only for a candidate that's already passed every other
-# check, right before it would actually trade. Informational only.
+# check, right before it would actually trade.
 LONG_SHORT_RATIO_ENABLED = env_bool("LONG_SHORT_RATIO_ENABLED", "True")
+# 2026-08-31, real evidence (225 resolved trades): long_short_favorable
+# True won 78.9% (n=204) vs 61.9% (n=21) when False - consistent direction
+# on every trigger checked, though the False bucket is thin everywhere
+# except OB_FVG_RETEST (85.4% vs 28.6%, n=7 - a real, clean split). Reject
+# only on an explicit False (crowded-market reading) - None (data
+# unavailable) never blocks, same fail-open convention as every gate here.
+# Reject-only, safe-by-construction - same "ship on real evidence
+# immediately" precedent as OI_RISING_REJECT_ENABLED. Checked in main.py,
+# not here in signal_engine, since long_short_ratio itself is only ever
+# fetched on-demand there (see this flag's own sibling above).
+LONG_SHORT_FAVORABLE_REJECT_ENABLED = env_bool("LONG_SHORT_FAVORABLE_REJECT_ENABLED", "True")
 # Boolean "favorable" readings derived from efficiency_ratio/funding_rate/
-# long_short_ratio - informational only, journaled but NOT fed into
-# confluence_fields/confluence_ratio (see CONFLUENCE_SIZING_ENABLED below:
-# that mechanism is disabled on real negative evidence already, so mixing
-# new unvalidated fields into it would contaminate any future read of
-# either). funding_rate/long_short_ratio stay informational-only for now;
-# efficiency_ratio was promoted to a real gate below - see
-# EFFICIENCY_RATIO_GATE_ENABLED.
+# long_short_ratio - journaled independently (the blended confluence_score
+# these used to deliberately stay out of was removed entirely 2026-08-31,
+# see MAX_SL_ROI_PCT's own comment - real negative evidence on the blend
+# itself, not on any individual field). funding_rate stays informational-
+# only for now; efficiency_ratio was promoted to a real gate below (see
+# EFFICIENCY_RATIO_GATE_ENABLED) and long_short_favorable to a real reject
+# above (see LONG_SHORT_FAVORABLE_REJECT_ENABLED).
 EFFICIENCY_RATIO_CHOP_THRESHOLD = env_float("EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3)
 # 2026-08-16, real evidence: a 29h window where every single signal read
 # htf_trend=BULLISH while BTC (and a directly-traced traded symbol,
@@ -867,8 +892,9 @@ OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT = env_float("OB_FVG_RETEST_MIN_CLOSE_THROUGH
 # than the brand-new triggers have, so it's held to the same bar starting
 # now rather than grandfathered in - a conscious, evidence-first behavior
 # change on something already live, not an accident. Real evidence this
-# codebase already has (CONFLUENCE_SIZING_ENABLED disabled on flat-to-
-# inverse confluence-vs-outcome data; MIN_STOP_DISTANCE_PCT's comment on
+# codebase already has (confluence-weighted sizing removed 2026-08-31 on
+# flat-to-inverse confluence-vs-outcome data, see MAX_SL_ROI_PCT's own
+# comment; MIN_STOP_DISTANCE_PCT's comment on
 # CVD/sweep confirmation being statistically identical between winners and
 # losers) means the accuracy gain from adding more triggers has to come
 # from here and from each trigger's own detection strictness - NOT from
@@ -1311,31 +1337,18 @@ MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
 # leverage), just not one that fights an already-proven mechanism by
 # default.
 MAX_SL_ROI_PCT = env_float("MAX_SL_ROI_PCT", 30)
-# Confluence-weighted position sizing - see signal_engine.py's
-# confluence_ratio (how many of EMA/OI/BTC agree with the signal, out of
-# how many were actually available to check - sweep_confluence and
-# liquidation_aligned were removed from this list 2026-08-25, see
-# signal_engine.py's own comment on confluence_fields for the evidence).
-# Scales the
-# risk taken per trade instead of gating entry on any of these
-# individually: every signal that qualifies today still trades, a
-# 0-confluence one just risks less and a fully-aligned one risks more.
-# Chosen over a hard gate specifically because it's testable against the
-# existing trade count immediately (every trade gets sized, not just a
-# rejected subset), reversible at zero cost if the score turns out
-# uncorrelated with outcome, and can extract information from these
-# fields collectively even before any one of them individually clears a
-# significance bar on its own.
-# DISABLED 2026-08-09 on real evidence: a 54-trade journal_analysis.py
-# pull showed confluence_score trending flat-to-inverse against outcome
-# (score=1 80% loss, score=2 96% loss, score=3 89% loss) - the opposite
-# of what this multiplier assumes. Exercising the "reversible at zero
-# cost" design above. confluence_score/ratio is still computed and
-# journaled either way - re-enable only if a larger, cleaner sample
-# (see MAE_TRACKING_ENABLED below) actually shows separation.
-CONFLUENCE_SIZING_ENABLED = env_bool("CONFLUENCE_SIZING_ENABLED", "False")
-CONFLUENCE_SIZING_MIN_MULTIPLIER = env_float("CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5)
-CONFLUENCE_SIZING_MAX_MULTIPLIER = env_float("CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25)
+# 2026-08-31: confluence-weighted position sizing (and the confluence_
+# score/total/ratio journal fields it was built on) removed entirely.
+# DISABLED since 2026-08-09 on real evidence (a 54-trade pull showed
+# confluence_score trending flat-to-inverse against outcome - score=1 80%
+# loss, score=2 96% loss, score=3 89% loss, the opposite of what this
+# multiplier assumed) and never re-validated: a fresh, much larger check
+# this session (225 resolved trades, per-trigger) found no trigger where
+# confluence_ratio showed a real positive relationship with outcome -
+# several inverted. ema_aligned/btc_aligned themselves are still
+# independently computed and journaled (signal_engine.py) for whatever
+# future per-condition (not blended) analysis might use them - only the
+# blended score and its sizing consumer are gone.
 MAX_TOTAL_POSITIONS = env_int("MAX_TOTAL_POSITIONS", 2)
 # After ANY position closes (win, loss, or breakeven), that symbol is
 # skipped for this long before it can be re-entered. Evidence (2026-08-08

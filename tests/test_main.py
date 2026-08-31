@@ -658,6 +658,65 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
 
         ratio_mock.assert_not_called()
 
+    # config.LONG_SHORT_FAVORABLE_REJECT_ENABLED - 2026-08-31, real
+    # evidence (see config.py's own comment).
+
+    def test_long_short_unfavorable_rejects_before_building_a_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+        reject_counts = Counter()
+        reject_symbols = {}
+        reject_trigger_counts = Counter()
+        reject_trigger_symbols = {}
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", True), \
+             patch.object(config, "LONG_SHORT_FAVORABLE_REJECT_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_long_short_ratio", return_value=5.0), \
+             patch.object(signal_engine, "long_short_favorable", return_value=False), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(len(positions.registered), 0)
+        self.assertEqual(reject_counts["LONG_SHORT_UNFAVORABLE"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["LONG_SHORT_UNFAVORABLE"])
+        self.assertEqual(reject_trigger_counts["LONG_SHORT_UNFAVORABLE | triggers=EMA_PULLBACK"], 1)
+
+    def test_long_short_favorable_none_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", True), \
+             patch.object(config, "LONG_SHORT_FAVORABLE_REJECT_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_long_short_ratio", return_value=None), \
+             patch.object(signal_engine, "long_short_favorable", return_value=None), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_long_short_favorable_reject_disabled_by_flag(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", True), \
+             patch.object(config, "LONG_SHORT_FAVORABLE_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_long_short_ratio", return_value=5.0), \
+             patch.object(signal_engine, "long_short_favorable", return_value=False), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
     def test_stability_none_behaves_like_the_original_ungated_behavior(self):
         feed = _FakeFeed()
         positions = _FakePositions()

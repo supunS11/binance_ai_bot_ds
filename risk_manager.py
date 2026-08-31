@@ -686,27 +686,6 @@ def _stop_roi_too_high(risk_distance, entry_price):
     return _roi_pct(entry_price, risk_distance) > max_roi_pct
 
 
-def _confluence_size_multiplier(signal):
-    """Scales risk per trade by how much of sweep/EMA/OI/liquidation
-    confluence agrees with this signal (signal_engine's confluence_ratio),
-    instead of gating entry on any of them individually - every signal
-    that reaches build_trade_plan still trades, only the size adapts.
-    Linear between CONFLUENCE_SIZING_MIN_MULTIPLIER (no confluence) and
-    CONFLUENCE_SIZING_MAX_MULTIPLIER (full confluence). See
-    config.CONFLUENCE_SIZING_ENABLED for the rationale."""
-    if not config.CONFLUENCE_SIZING_ENABLED:
-        return 1.0
-
-    ratio = signal.get("confluence_ratio")
-
-    if ratio is None:
-        return 1.0
-
-    min_mult = float(config.CONFLUENCE_SIZING_MIN_MULTIPLIER)
-    max_mult = float(config.CONFLUENCE_SIZING_MAX_MULTIPLIER)
-    return min_mult + (max_mult - min_mult) * ratio
-
-
 def build_trade_plan(signal, balance):
     """`signal` is a dict from signal_engine.evaluate() where
     signal["signal"] is "BUY" or "SELL" (never call this for a rejected
@@ -793,15 +772,13 @@ def build_trade_plan(signal, balance):
         signal.get("liquidity_pools"), entry_price, side, risk_distance
     )
 
-    size_multiplier = _confluence_size_multiplier(signal)
-
     if config.RISK_BASED_POSITION_SIZING_ENABLED:
-        risk_budget = get_position_risk_budget(balance) * size_multiplier
         quantity = calculate_position_size(
-            balance, entry_price, sl_price, symbol, risk_budget_override=risk_budget
+            balance, entry_price, sl_price, symbol,
+            risk_budget_override=get_position_risk_budget(balance),
         )
     else:
-        margin = max(float(config.MARGIN_PER_TRADE), 0) * size_multiplier
+        margin = max(float(config.MARGIN_PER_TRADE), 0)
         quantity = calculate_position_size(
             balance, entry_price, sl_price, symbol, margin_override=margin
         )
@@ -854,8 +831,6 @@ def build_trade_plan(signal, balance):
         "tp1_quantity": tp1_quantity,
         "tp2_quantity": tp2_quantity,
         "risk_distance": risk_distance,
-        "size_multiplier": size_multiplier,
-        "confluence_ratio": signal.get("confluence_ratio"),
         # How far entry_price already ran from the structure level, in R -
         # main.py uses this (against config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R)
         # to route a moderately-extended entry to a limit order instead of

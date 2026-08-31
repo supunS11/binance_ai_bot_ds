@@ -234,6 +234,20 @@ def _evaluate_symbol(
             result["signal"], result["long_short_ratio"]
         )
 
+        # config.LONG_SHORT_FAVORABLE_REJECT_ENABLED - 2026-08-31, real
+        # evidence (see that flag's own config.py comment). Checked here,
+        # not inside signal_engine, since long_short_ratio itself is only
+        # ever fetched on-demand at this point - reject only on an
+        # explicit False; None (data unavailable) never blocks, same
+        # fail-open convention as every gate in signal_engine.py.
+        if config.LONG_SHORT_FAVORABLE_REJECT_ENABLED and result["long_short_favorable"] is False:
+            _tally_reject(reject_counts, reject_symbols, symbol, "LONG_SHORT_UNFAVORABLE")
+            _tally_reject(
+                reject_trigger_counts, reject_trigger_symbols, symbol,
+                f"LONG_SHORT_UNFAVORABLE | triggers={result.get('signal_trigger')}",
+            )
+            return
+
     plan, status = risk_manager.build_trade_plan(result, balance)
 
     if status != "OK":

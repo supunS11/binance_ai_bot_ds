@@ -30,7 +30,7 @@ from logger import log_error, log_info, log_warning
 # fundamentally ambiguous for some real cases (DCA_ACTIVE vs an ordinary
 # post-TP1 BREAKEVEN_ACTIVE position look identical on the exchange - see
 # _recover_dca_active_position's own docstring) and lossy for all of them
-# (structure_level, confluence_ratio, risk_distance, MAE/MFE tracking,
+# (structure_level, risk_distance, MAE/MFE tracking,
 # profit-protection arm state etc. have no exchange-side representation
 # at all). A restart now prefers this file wholesale over guessing,
 # falling back to the existing exchange-shape reconciliation only for a
@@ -375,7 +375,6 @@ class PositionManager:
             "stage": TP1_PENDING,
             "shadow": shadow,
             "opened_at": time.time(),
-            "confluence_ratio": plan.get("confluence_ratio"),
             "early_breakeven_applied": False,
             # Set True only if EARLY_BREAKEVEN_LOCK_R_MULTIPLE was actually
             # > 0 at the moment of promotion - distinguishes a genuine
@@ -481,7 +480,6 @@ class PositionManager:
             "stage": DCA_PENDING,
             "shadow": shadow,
             "opened_at": time.time(),
-            "confluence_ratio": plan.get("confluence_ratio"),
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
             "profit_protection_applied": False,
@@ -536,7 +534,6 @@ class PositionManager:
             "stage": PENDING_LIMIT_FILL,
             "shadow": shadow,
             "opened_at": time.time(),
-            "confluence_ratio": plan.get("confluence_ratio"),
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
             # config.PROFIT_PROTECTION_ENABLED - mirrors the two keys
@@ -664,7 +661,29 @@ class PositionManager:
                 adopted += 1
                 continue
 
-            self._adopt_position(symbol, live_position, feed=feed)
+            # 2026-08-31: even when the full saved snapshot fails
+            # _try_restore_from_saved_state's sanity check above (most
+            # commonly a stale quantity - DCA fired on the real position
+            # after the last periodic save_state() but before this
+            # restart), its trade_id is still trustworthy - it never
+            # changes when DCA fires, unlike quantity/entry_price. Side
+            # must still match (same guard _try_restore_from_saved_state
+            # itself uses) - a symbol that fully closed and reopened in
+            # the OPPOSITE direction between the last save and this
+            # restart must not inherit the old trade's identity. Real gap
+            # this closes: without it, _adopt_position mints a brand-new
+            # _RECOVERED_ trade_id, severing the link back to the original
+            # signal (trigger, confluence, depth_imbalance) for the rest
+            # of that trade's life - confirmed against real data (36 of
+            # 315 trades, disproportionately the slow-resolving/DCA'd
+            # ones).
+            saved = saved_state.get(symbol)
+            saved_trade_id = None
+
+            if saved and saved.get("side") == live_position.get("side"):
+                saved_trade_id = saved.get("trade_id")
+
+            self._adopt_position(symbol, live_position, feed=feed, saved_trade_id=saved_trade_id)
             adopted += 1
 
         if live_positions:
@@ -897,7 +916,10 @@ class PositionManager:
         return True
 
     @staticmethod
-    def _recover_dca_pending_position(symbol, side, entry_price, quantity, tp1_order, tp2_order, feed):
+    def _recover_dca_pending_position(
+        symbol, side, entry_price, quantity, tp1_order, tp2_order, feed,
+        saved_trade_id=None,
+    ):
         """A real position with BOTH TP1 and TP2 resting but no SL at all,
         under config.DCA_ENABLED, is unambiguous - that's the only entry
         path DCA_ENABLED ever uses (see main._evaluate_symbol), and no
@@ -937,7 +959,7 @@ class PositionManager:
 
         return {
             "symbol": symbol,
-            "trade_id": f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "trade_id": saved_trade_id or f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
             "side": side,
             "entry_price": entry_price,
             # Reference-only, never a real resting order in this stage -
@@ -958,7 +980,6 @@ class PositionManager:
             "stage": DCA_PENDING,
             "shadow": False,
             "opened_at": time.time(),
-            "confluence_ratio": None,
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
             "profit_protection_applied": False,
@@ -981,7 +1002,10 @@ class PositionManager:
         }
 
     @staticmethod
-    def _recover_dca_pending_single_tp_position(symbol, side, entry_price, quantity, tp_order, feed):
+    def _recover_dca_pending_single_tp_position(
+        symbol, side, entry_price, quantity, tp_order, feed,
+        saved_trade_id=None,
+    ):
         """config.TP_STATIC_ROI_ENABLED equivalent of
         _recover_dca_pending_position above - a real position with
         exactly ONE full-position TP resting and no SL at all, under
@@ -1010,7 +1034,7 @@ class PositionManager:
 
         return {
             "symbol": symbol,
-            "trade_id": f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "trade_id": saved_trade_id or f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
             "side": side,
             "entry_price": entry_price,
             # Reference-only, never a real resting order in this stage -
@@ -1031,7 +1055,6 @@ class PositionManager:
             "stage": DCA_PENDING,
             "shadow": False,
             "opened_at": time.time(),
-            "confluence_ratio": None,
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
             "profit_protection_applied": False,
@@ -1051,7 +1074,10 @@ class PositionManager:
         }
 
     @staticmethod
-    def _recover_dca_active_position(symbol, side, entry_price, quantity, sl_order, tp_order):
+    def _recover_dca_active_position(
+        symbol, side, entry_price, quantity, sl_order, tp_order,
+        saved_trade_id=None,
+    ):
         """sl_order's clientAlgoId carries the _DCA_SL_CLIENT_ALGO_ID_
         PREFIX tag _execute_dca stamped on it - unlike the DCA_PENDING
         recovery above, nothing needs to be recomputed here: the real
@@ -1075,7 +1101,7 @@ class PositionManager:
 
         return {
             "symbol": symbol,
-            "trade_id": f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "trade_id": saved_trade_id or f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
             "side": side,
             "entry_price": entry_price,
             "sl_price": sl_price,
@@ -1094,7 +1120,6 @@ class PositionManager:
             "stage": DCA_ACTIVE,
             "shadow": False,
             "opened_at": time.time(),
-            "confluence_ratio": None,
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
             # Conservative on restart, same as the plain adoption path
@@ -1126,7 +1151,7 @@ class PositionManager:
             "atr": None,
         }
 
-    def _adopt_position(self, symbol, live_position, feed=None):
+    def _adopt_position(self, symbol, live_position, feed=None, saved_trade_id=None):
         side = live_position["side"]
         entry_price = live_position["entry_price"]
         quantity = live_position["quantity"]
@@ -1158,7 +1183,8 @@ class PositionManager:
 
         if sl_order and str(sl_order.get("clientAlgoId") or "").startswith(_DCA_SL_CLIENT_ALGO_ID_PREFIX):
             recovered = self._recover_dca_active_position(
-                symbol, side, entry_price, quantity, sl_order, tp2_order
+                symbol, side, entry_price, quantity, sl_order, tp2_order,
+                saved_trade_id=saved_trade_id,
             )
 
             if recovered is not None:
@@ -1179,7 +1205,8 @@ class PositionManager:
 
         if sl_price is None and config.DCA_ENABLED and tp1_order and tp2_order:
             recovered = self._recover_dca_pending_position(
-                symbol, side, entry_price, quantity, tp1_order, tp2_order, feed
+                symbol, side, entry_price, quantity, tp1_order, tp2_order, feed,
+                saved_trade_id=saved_trade_id,
             )
 
             if recovered is not None:
@@ -1200,7 +1227,8 @@ class PositionManager:
         # with `not tp1_order`) so order between them doesn't matter.
         if sl_price is None and config.DCA_ENABLED and not tp1_order and tp2_order:
             recovered = self._recover_dca_pending_single_tp_position(
-                symbol, side, entry_price, quantity, tp2_order, feed
+                symbol, side, entry_price, quantity, tp2_order, feed,
+                saved_trade_id=saved_trade_id,
             )
 
             if recovered is not None:
@@ -1268,7 +1296,7 @@ class PositionManager:
 
         position = {
             "symbol": symbol,
-            "trade_id": f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "trade_id": saved_trade_id or f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
             "side": side,
             "entry_price": entry_price,
             "sl_price": sl_price,
@@ -1284,10 +1312,6 @@ class PositionManager:
             "stage": stage,
             "shadow": False,
             "opened_at": time.time(),
-            # No original signal to read confluence from - kept for
-            # journaling only; early breakeven no longer depends on it
-            # (see _is_early_breakeven_candidate).
-            "confluence_ratio": None,
             "early_breakeven_applied": False,
             "early_breakeven_profit_locked": False,
             # config.PROFIT_PROTECTION_ENABLED - mirrors the two keys
@@ -1326,7 +1350,7 @@ class PositionManager:
             "risk_distance": abs(entry_price - sl_price) if stage == TP1_PENDING else None,
             # No original signal/candle to check this against - stays
             # unresolved forever for a reconciled position, same honesty
-            # policy as confluence_ratio/risk_distance above.
+            # policy as risk_distance above.
             "structure_level": None,
             "trigger_candle_open_time": None,
             "break_confirmed_by_close": None,

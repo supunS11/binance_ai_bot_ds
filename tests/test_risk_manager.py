@@ -915,81 +915,15 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertIsNone(plan)
         self.assertEqual(status, "INVALID_ENTRY_PRICE")
 
-    def test_full_confluence_scales_the_risk_budget_up_to_the_max_multiplier(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True), \
-             patch.object(config, "CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5), \
-             patch.object(config, "CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25), \
-             patch.object(config, "RISK_BASED_POSITION_SIZING_ENABLED", True), \
-             patch.object(risk_manager, "get_position_risk_budget", return_value=10.0), \
-             patch.object(risk_manager, "calculate_position_size", return_value=5.0) as mock_size:
-            plan, status = risk_manager.build_trade_plan(
-                dict(self._signal(), confluence_ratio=1.0), balance=1000
-            )
-
-        self.assertEqual(status, "OK")
-        self.assertEqual(plan["size_multiplier"], 1.25)
-        _, kwargs = mock_size.call_args
-        self.assertAlmostEqual(kwargs["risk_budget_override"], 12.5)
-
-    def test_zero_confluence_scales_the_risk_budget_down_to_the_min_multiplier(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True), \
-             patch.object(config, "CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5), \
-             patch.object(config, "CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25), \
-             patch.object(config, "RISK_BASED_POSITION_SIZING_ENABLED", True), \
-             patch.object(risk_manager, "get_position_risk_budget", return_value=10.0), \
-             patch.object(risk_manager, "calculate_position_size", return_value=5.0) as mock_size:
-            plan, status = risk_manager.build_trade_plan(
-                dict(self._signal(), confluence_ratio=0.0), balance=1000
-            )
-
-        self.assertEqual(status, "OK")
-        self.assertEqual(plan["size_multiplier"], 0.5)
-        _, kwargs = mock_size.call_args
-        self.assertAlmostEqual(kwargs["risk_budget_override"], 5.0)
-
-    def test_missing_confluence_ratio_behaves_as_full_normal_size(self):
-        # Every trade still trades - a signal with no confluence_ratio at
-        # all (e.g. an older/unrelated caller) must size exactly as it did
-        # before this feature existed, not get penalized.
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True), \
-             patch.object(config, "RISK_BASED_POSITION_SIZING_ENABLED", True), \
-             patch.object(risk_manager, "get_position_risk_budget", return_value=10.0), \
+    def test_flat_sizing_mode_scales_margin_instead_of_risk_budget(self):
+        with patch.object(config, "RISK_BASED_POSITION_SIZING_ENABLED", False), \
+             patch.object(config, "MARGIN_PER_TRADE", 20), \
              patch.object(risk_manager, "calculate_position_size", return_value=5.0) as mock_size:
             plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
 
         self.assertEqual(status, "OK")
-        self.assertEqual(plan["size_multiplier"], 1.0)
         _, kwargs = mock_size.call_args
-        self.assertAlmostEqual(kwargs["risk_budget_override"], 10.0)
-
-    def test_confluence_sizing_disabled_always_uses_normal_size(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", False), \
-             patch.object(config, "RISK_BASED_POSITION_SIZING_ENABLED", True), \
-             patch.object(risk_manager, "get_position_risk_budget", return_value=10.0), \
-             patch.object(risk_manager, "calculate_position_size", return_value=5.0) as mock_size:
-            plan, status = risk_manager.build_trade_plan(
-                dict(self._signal(), confluence_ratio=0.0), balance=1000
-            )
-
-        self.assertEqual(status, "OK")
-        self.assertEqual(plan["size_multiplier"], 1.0)
-        _, kwargs = mock_size.call_args
-        self.assertAlmostEqual(kwargs["risk_budget_override"], 10.0)
-
-    def test_flat_sizing_mode_scales_margin_instead_of_risk_budget(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True), \
-             patch.object(config, "CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5), \
-             patch.object(config, "CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25), \
-             patch.object(config, "RISK_BASED_POSITION_SIZING_ENABLED", False), \
-             patch.object(config, "MARGIN_PER_TRADE", 20), \
-             patch.object(risk_manager, "calculate_position_size", return_value=5.0) as mock_size:
-            plan, status = risk_manager.build_trade_plan(
-                dict(self._signal(), confluence_ratio=1.0), balance=1000
-            )
-
-        self.assertEqual(status, "OK")
-        _, kwargs = mock_size.call_args
-        self.assertAlmostEqual(kwargs["margin_override"], 25.0)
+        self.assertAlmostEqual(kwargs["margin_override"], 20.0)
         self.assertNotIn("risk_budget_override", kwargs)
 
 
@@ -1180,44 +1114,6 @@ class MaxSlRoiTests(unittest.TestCase):
             )
 
         self.assertEqual(status, "OK")
-
-
-class ConfluenceSizeMultiplierTests(unittest.TestCase):
-    def test_disabled_config_always_returns_normal_multiplier(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", False):
-            multiplier = risk_manager._confluence_size_multiplier({"confluence_ratio": 0.0})
-
-        self.assertEqual(multiplier, 1.0)
-
-    def test_none_ratio_returns_normal_multiplier(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True):
-            multiplier = risk_manager._confluence_size_multiplier({"confluence_ratio": None})
-
-        self.assertEqual(multiplier, 1.0)
-
-    def test_full_ratio_returns_the_max_multiplier(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True), \
-             patch.object(config, "CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5), \
-             patch.object(config, "CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25):
-            multiplier = risk_manager._confluence_size_multiplier({"confluence_ratio": 1.0})
-
-        self.assertAlmostEqual(multiplier, 1.25)
-
-    def test_zero_ratio_returns_the_min_multiplier(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True), \
-             patch.object(config, "CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5), \
-             patch.object(config, "CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25):
-            multiplier = risk_manager._confluence_size_multiplier({"confluence_ratio": 0.0})
-
-        self.assertAlmostEqual(multiplier, 0.5)
-
-    def test_half_ratio_returns_the_midpoint(self):
-        with patch.object(config, "CONFLUENCE_SIZING_ENABLED", True), \
-             patch.object(config, "CONFLUENCE_SIZING_MIN_MULTIPLIER", 0.5), \
-             patch.object(config, "CONFLUENCE_SIZING_MAX_MULTIPLIER", 1.25):
-            multiplier = risk_manager._confluence_size_multiplier({"confluence_ratio": 0.5})
-
-        self.assertAlmostEqual(multiplier, 0.875)
 
 
 class ComputeDcaPriceTests(unittest.TestCase):

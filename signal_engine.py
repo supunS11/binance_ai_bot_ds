@@ -41,8 +41,10 @@ def long_short_favorable(side, long_short_ratio):
     short-crowded one. Called from main.py once the on-demand
     long_short_ratio fetch resolves (see config.LONG_SHORT_RATIO_ENABLED
     for why that value can't be computed inside evaluate() itself).
-    Informational only, NOT a gate - same treatment as
-    efficiency_favorable/funding_favorable above."""
+    config.LONG_SHORT_FAVORABLE_REJECT_ENABLED (2026-08-31, real evidence
+    - see that flag's own config.py comment) reads this result and
+    rejects on an explicit False - unlike efficiency_favorable/
+    funding_favorable above, this is no longer informational-only."""
     if long_short_ratio is None:
         return None
 
@@ -830,6 +832,20 @@ def evaluate(
             if side == "SELL" and vp_position == "BELOW_VALUE_AREA":
                 return _reject("VP_ALREADY_EXTENDED")
 
+        # config.VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED - see config.py's
+        # own comment for the real evidence. Independent of (stricter
+        # than) VP_EXTENSION_REJECT_ENABLED above - that one only excludes
+        # the specific unfavorable extension; this one requires actually-
+        # inside instead of merely not-unfavorably-outside. None
+        # (VOLUME_PROFILE_TRACKING_ENABLED off, or no snapshot yet) never
+        # blocks - same fail-open convention as every gate here.
+        if (
+            config.VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED
+            and vp_position is not None
+            and vp_position != "INSIDE_VALUE_AREA"
+        ):
+            return _reject("VP_NOT_INSIDE_VALUE_AREA")
+
         # CRASH_MODE - config.CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED. See
         # crash_detector.py for the real incident this was built for: a
         # BUY position DCA'd right into the bottom of a BTC flash-crash
@@ -1116,16 +1132,10 @@ def evaluate(
         funding_rate_ = funding_rate if config.FUNDING_RATE_ENABLED else None
 
         # Boolean "favorable" readings - informational only, journaled
-        # but deliberately NOT added to confluence_fields/confluence_ratio
-        # below (see config.EFFICIENCY_RATIO_CHOP_THRESHOLD: that sizing
-        # mechanism is disabled today on real negative evidence from its
-        # existing 5 fields - mixing new, unvalidated ones into it would
-        # contaminate any future read of either). Kept independently
-        # named/journaled so journal_analysis.py can evaluate each on its
-        # own merits before any decision to fold it into sizing. Note
-        # efficiency_ratio itself is now ALSO a real gate above
-        # (config.EFFICIENCY_RATIO_GATE_ENABLED, checked earlier in this
-        # function) - this boolean is a separate, informational-only
+        # independently so journal_analysis.py can evaluate each on its
+        # own merits. Note efficiency_ratio itself is now ALSO a real gate
+        # above (config.EFFICIENCY_RATIO_GATE_ENABLED, checked earlier in
+        # this function) - this boolean is a separate, informational-only
         # reading of the same underlying value, unaffected by that.
         efficiency_favorable = (
             efficiency_ratio > config.EFFICIENCY_RATIO_CHOP_THRESHOLD
@@ -1138,35 +1148,6 @@ def evaluate(
             funding_favorable = (
                 funding_rate_ <= adverse if side == "BUY" else funding_rate_ >= -adverse
             )
-
-        # Confluence score: how many of the informational fields above
-        # agree with this signal's direction, out of how many were
-        # actually available to check (a field that's None - e.g.
-        # liquidation, still silent for most alts - is excluded from the
-        # denominator rather than counted against the signal). Feeds
-        # risk_manager's confluence-weighted position sizing instead of
-        # gating entry on any of these individually - every signal that
-        # reaches here still trades, only the size adapts. See
-        # config.CONFLUENCE_SIZING_ENABLED.
-        #
-        # sweep_confluence and liquidation_aligned deliberately excluded
-        # (2026-08-25 signal-engine audit): sweep_confluence's split was
-        # flat overall and flat within CHOCH_RETEST specifically (the only
-        # trigger with enough of a split to check) - no measurable value
-        # as a confluence input. liquidation_aligned is essentially never
-        # populated for this bot's actual symbol set (liquidation_snapshot
-        # rarely available - see the separate LIQUIDATION_SWEEP_CONFIRMED
-        # diagnostic-logging investigation), so it was already contributing
-        # almost nothing to confluence_total's denominator. Both remain
-        # computed and journaled below as standalone informational fields -
-        # only their role as a confluence-score input is removed. Zero live
-        # behavior change either way today: CONFLUENCE_SIZING_ENABLED is
-        # False, so confluence_ratio doesn't feed anything live yet.
-        confluence_fields = [ema_aligned, oi_rising, btc_aligned]
-        confluence_available = [value for value in confluence_fields if value is not None]
-        confluence_total = len(confluence_available)
-        confluence_score = sum(1 for value in confluence_available if value)
-        confluence_ratio = confluence_score / confluence_total if confluence_total else None
 
         return {
             "signal": side,
@@ -1235,9 +1216,6 @@ def evaluate(
             # config.LONG_SHORT_RATIO_ENABLED - no bulk endpoint exists for
             # it). main.py calls long_short_favorable() below once it has the
             # real value.
-            "confluence_score": confluence_score,
-            "confluence_total": confluence_total,
-            "confluence_ratio": confluence_ratio,
         }
 
     # Selection: unchanged single-candidate path when
