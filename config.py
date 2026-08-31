@@ -1725,16 +1725,27 @@ DCA_TP_TARGET_ROI_PCT = env_float("DCA_TP_TARGET_ROI_PCT", 50)
 # the (unused, pre-DCA) original stop calculation.
 DCA_STRUCTURE_STOP_ATR_BUFFER = env_float("DCA_STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # 2026-08-31, real evidence (22 resolved real DCA_SL_HIT trades, ground-
-# truth realized PnL): 45% exceeded 2R of the ORIGINAL planned risk
-# before finally stopping out at the structural post-DCA SL, 23%
-# exceeded 5R - two real trades cost -5.54R/$84 and -3.35R/$61, together
-# erasing 35% of total realized account profit in this window. The
-# structural post-DCA SL is deliberately wide (the "give it room to
+# truth realized PnL): 45% lost more than 2R in real DOLLARS relative to
+# what the ORIGINAL (pre-DCA, single-entry) plan would have risked, 23%
+# lost more than 5R - two real trades cost -5.54R/$84 and -3.35R/$61,
+# together erasing 35% of total realized account profit in this window.
+# The structural post-DCA SL is deliberately wide (the "give it room to
 # recover" design) - this is an independent, tighter backstop
 # specifically for when that room isn't enough and the trade just keeps
-# running, not a replacement for the structural stop. 3.0 sits just
-# below BANKUSDT's real -3.35R (would have meaningfully capped it) and
-# well inside ZKPUSDT's -5.54R, while leaving the more moderate
+# running, not a replacement for the structural stop.
+#
+# Deliberately measured in DOLLARS (position_manager._dca_max_adverse_
+# loss_reached: current unrealized loss vs original_risk_distance *
+# original_quantity), NOT price distance from the original entry alone -
+# a real bug found while explaining this feature (2026-08-31, BANKUSDT):
+# a price-only version understates real risk once DCA has grown the
+# position, since the same price move past the DCA fill now applies to
+# MORE quantity than the original 1R was ever sized for. BANKUSDT's real
+# close was only 2.77R away in price terms but 3.35R in real dollars -
+# a price-only check at 3.0 would have missed it entirely.
+#
+# 3.0 sits just below BANKUSDT's real -3.35R (would meaningfully cap it)
+# and well inside ZKPUSDT's -5.54R, while leaving the more moderate
 # (arguably still-recoverable) excursions alone - NOT validated against
 # how many would-be winners also cross 2-3R before recovering (today's
 # MAE/MFE tracking for DCA'd trades was itself broken until this same

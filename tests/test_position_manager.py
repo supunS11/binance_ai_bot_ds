@@ -6156,11 +6156,14 @@ class PollShadowDcaMaxAdverseLossTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _manager_with_dca_active(self, original_entry_price=100, original_risk_distance=1.0):
-        # original_risk_distance=1.0 (not the 2.0 the live-mode tests use)
-        # deliberately keeps the 3.0R threshold (97.0) well clear of
-        # sl_price=94.0 below - the two mechanisms must stay unambiguous
-        # in these tests, not coincide.
+    def _manager_with_dca_active(
+        self, original_entry_price=100, original_risk_distance=1.0, original_quantity=1.0,
+    ):
+        # Dollar-based check: original_dollar_risk = original_risk_distance
+        # * original_quantity = 1.0 * 1.0 = $1.0. Threshold ($3.0) is hit
+        # once (entry_price - close) * quantity >= 3.0, i.e. close at or
+        # below 98 - 3.0/2.0 = 96.5 - kept well above sl_price=94.0 so the
+        # two mechanisms stay unambiguous in these tests, not coincide.
         manager = PositionManager()
         manager.register_dca_pending(_dca_plan(), {"shadow": True})
         position = manager.positions["BTCUSDT"]
@@ -6170,14 +6173,14 @@ class PollShadowDcaMaxAdverseLossTests(unittest.TestCase):
             "dca_breakeven_applied": False,
             "original_entry_price": original_entry_price,
             "original_risk_distance": original_risk_distance,
+            "original_quantity": original_quantity,
         })
         return manager
 
     def test_closes_at_market_once_threshold_reached(self):
-        # original_entry=100, original_risk=1.0, threshold=3.0R -> triggers
-        # once the candle closes at or below 97.0. Kept well above
-        # sl_price=94.0 so this is unambiguously the new check, not the
-        # existing hit_sl path.
+        # close=96.5 is at the 96.5 trigger price (see _manager_with_dca_
+        # active's own comment). Kept well above sl_price=94.0 so this is
+        # unambiguously the new check, not the existing hit_sl path.
         manager = self._manager_with_dca_active()
         candle = _candle(high=97.2, low=96.3, close=96.5)
 
@@ -6187,7 +6190,8 @@ class PollShadowDcaMaxAdverseLossTests(unittest.TestCase):
         self.assertFalse(manager.has_open_position("BTCUSDT"))
 
     def test_stays_open_short_of_threshold(self):
-        # close=98 is only 2.0R below original_entry - under the 3.0R bar.
+        # close=98 is at entry - zero unrealized loss, well under the $3
+        # threshold.
         manager = self._manager_with_dca_active()
         candle = _candle(high=99, low=97.5, close=98)
 
@@ -6212,7 +6216,9 @@ class PollShadowDcaMaxAdverseLossTests(unittest.TestCase):
         # the new check specifically (not just a coincidentally-mild
         # candle), while staying clear of sl_price=94.0 so no OTHER path
         # closes the position either.
-        manager = self._manager_with_dca_active(original_entry_price=None, original_risk_distance=None)
+        manager = self._manager_with_dca_active(
+            original_entry_price=None, original_risk_distance=None, original_quantity=None,
+        )
         candle = _candle(high=97.2, low=96.3, close=96.5)
 
         outcome = manager.poll_shadow("BTCUSDT", candle)
@@ -7463,7 +7469,13 @@ class PollLiveDcaMaxAdverseLossTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _manager_with_dca_active(self, original_entry_price=100, original_risk_distance=2.0):
+    def _manager_with_dca_active(
+        self, original_entry_price=100, original_risk_distance=2.0, original_quantity=1.0,
+    ):
+        # Dollar-based check: original_dollar_risk = original_risk_distance
+        # * original_quantity = 2.0 * 1.0 = $2.0. Threshold ($6.0) is hit
+        # once (entry_price - mark_price) * quantity >= 6.0, i.e. mark
+        # price at or below 98 - 6.0/2.0 = 95.0.
         manager = PositionManager()
         execution_result = {
             "shadow": False,
@@ -7478,12 +7490,13 @@ class PollLiveDcaMaxAdverseLossTests(unittest.TestCase):
             "dca_applied": True, "dca_breakeven_applied": False,
             "original_entry_price": original_entry_price,
             "original_risk_distance": original_risk_distance,
+            "original_quantity": original_quantity,
         })
         return manager
 
     def test_closes_at_market_once_threshold_reached(self):
-        # original_entry=100, original_risk=2.0, threshold=3.0R -> triggers
-        # once mark price is 6.0 or more below 100. 90.0 is well past it.
+        # 90.0 is well past the 95.0 trigger price (see _manager_with_
+        # dca_active's own comment).
         manager = self._manager_with_dca_active()
 
         with patch.object(exchange, "get_mark_price", return_value=90.0), \
@@ -7498,7 +7511,8 @@ class PollLiveDcaMaxAdverseLossTests(unittest.TestCase):
         self.assertFalse(manager.has_open_position("BTCUSDT"))
 
     def test_stays_open_short_of_threshold(self):
-        # 97.0 is only 3.0 below original_entry (1.5R) - under the 3.0R bar.
+        # 97.0 is above the 95.0 trigger price - only $2 unrealized loss
+        # against a $6 threshold.
         manager = self._manager_with_dca_active()
 
         with patch.object(exchange, "get_mark_price", return_value=97.0), \
@@ -7524,9 +7538,11 @@ class PollLiveDcaMaxAdverseLossTests(unittest.TestCase):
 
     def test_missing_original_risk_distance_never_triggers(self):
         # A restart-recovered DCA_ACTIVE position has no way to know its
-        # pre-DCA risk (see _recover_dca_active_position) - fail-open,
+        # pre-DCA risk/size (see _recover_dca_active_position) - fail-open,
         # same convention as every gate in this codebase.
-        manager = self._manager_with_dca_active(original_entry_price=None, original_risk_distance=None)
+        manager = self._manager_with_dca_active(
+            original_entry_price=None, original_risk_distance=None, original_quantity=None,
+        )
 
         with patch.object(exchange, "get_mark_price", return_value=50.0), \
              patch.object(exchange, "close_position_market") as close_market, \
@@ -7552,7 +7568,8 @@ class PollLiveDcaMaxAdverseLossTests(unittest.TestCase):
     def test_sell_side_is_mirrored(self):
         manager = self._manager_with_dca_active()
         manager.positions["BTCUSDT"].update({
-            "side": "SELL", "original_entry_price": 100, "original_risk_distance": 2.0,
+            "side": "SELL", "original_entry_price": 100,
+            "original_risk_distance": 2.0, "original_quantity": 1.0,
         })
 
         with patch.object(exchange, "get_mark_price", return_value=110.0), \

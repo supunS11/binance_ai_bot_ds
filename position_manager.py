@@ -2215,19 +2215,28 @@ class PositionManager:
             position["tp_order_id"] = None
             position["dca_trail_order_id"] = None
 
-        # 2026-08-31: capture the ORIGINAL (pre-DCA) entry/risk before
-        # they're overwritten below - needed both to keep
+        # 2026-08-31: capture the ORIGINAL (pre-DCA) entry/risk/quantity
+        # before they're overwritten below - needed both to keep
         # _mae_mfe_r_multiples accurate for a DCA'd trade (its own
         # docstring already requires "risk captured once at position
         # start", broken by the overwrite below) and for
-        # config.DCA_MAX_ADVERSE_R_ENABLED (needs the ORIGINAL unit, not
-        # the ~3-4x-wider post-DCA one, to mean "how many original-R am I
-        # down"). Guarded so a hypothetical future re-fire can't clobber
-        # the real original - this project's DCA is single-fire by
-        # design, but the guard is free insurance.
+        # config.DCA_MAX_ADVERSE_R_ENABLED. original_quantity specifically
+        # exists for that check: real evidence (2026-08-31, BANKUSDT) - a
+        # PRICE-distance version of this check (adverse price move /
+        # original risk distance) understates real dollar risk once DCA
+        # has grown the position, since the same price move past the DCA
+        # fill now applies to MORE quantity than the original 1R was ever
+        # sized for. The check compares real unrealized DOLLARS lost
+        # (current blended entry/quantity) against original_risk_distance
+        # * original_quantity - the actual dollar amount the ORIGINAL,
+        # single-entry plan would have risked - not a price-only ratio.
+        # Guarded so a hypothetical future re-fire can't clobber the real
+        # original - this project's DCA is single-fire by design, but the
+        # guard is free insurance.
         if position.get("original_risk_distance") is None:
             position["original_entry_price"] = position["entry_price"]
             position["original_risk_distance"] = position["risk_distance"]
+            position["original_quantity"] = position["quantity"]
 
         position["entry_price"] = plan["entry_price"]
         position["sl_price"] = plan["sl_price"]
@@ -3277,22 +3286,38 @@ class PositionManager:
     @staticmethod
     def _dca_max_adverse_loss_reached(position, current_price):
         """config.DCA_MAX_ADVERSE_R_ENABLED - see its own config.py
-        comment for the real evidence. None/missing original_risk_distance
-        (e.g. a restart-recovered DCA_ACTIVE position, which has no way
-        to know its pre-DCA risk - see _recover_dca_active_position)
-        never triggers - fail-open, same convention as every gate in
-        this codebase."""
-        original_entry = position.get("original_entry_price")
-        original_risk = position.get("original_risk_distance")
+        comment for the real evidence. Compares real unrealized DOLLARS
+        lost right now (current blended entry/quantity vs current_price)
+        against original_risk_distance * original_quantity - the actual
+        dollar amount the ORIGINAL, single-entry plan would have risked.
 
-        if original_entry is None or not original_risk or original_risk <= 0:
+        Deliberately NOT a price-distance-only ratio (adverse price move
+        / original_risk_distance) - real evidence (2026-08-31, BANKUSDT)
+        showed that understates real dollar risk once DCA has grown the
+        position: the same price move past the DCA fill now applies to
+        MORE quantity than the original 1R was ever sized for, so price-
+        distance-R and dollar-R diverge, sometimes by a full R or more.
+
+        None/missing original_risk_distance or original_quantity (e.g. a
+        restart-recovered DCA_ACTIVE position, which has no way to know
+        its pre-DCA risk/size - see _recover_dca_active_position) never
+        triggers - fail-open, same convention as every gate in this
+        codebase."""
+        original_risk = position.get("original_risk_distance")
+        original_quantity = position.get("original_quantity")
+
+        if not original_risk or original_risk <= 0 or not original_quantity or original_quantity <= 0:
             return False
 
+        original_dollar_risk = original_risk * original_quantity
         side = position["side"]
-        adverse_distance = (
-            original_entry - current_price if side == "BUY" else current_price - original_entry
+        entry_price = position["entry_price"]
+        quantity = position["quantity"]
+        unrealized_loss = (
+            (entry_price - current_price) * quantity if side == "BUY"
+            else (current_price - entry_price) * quantity
         )
-        return (adverse_distance / original_risk) >= max(float(config.DCA_MAX_ADVERSE_R_MULTIPLE), 0)
+        return (unrealized_loss / original_dollar_risk) >= max(float(config.DCA_MAX_ADVERSE_R_MULTIPLE), 0)
 
     def _close_dca_active_on_max_adverse_loss(self, position):
         """Same market-close-then-_close shape as _market_close_static_tp
