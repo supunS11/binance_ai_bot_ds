@@ -1477,9 +1477,19 @@ class PositionManager:
         by it inflates the R-multiple into the billions. Must always use
         the fixed `risk_distance` captured once at position start
         (register()/_adopt_position()), never re-derive it from the
-        current (possibly-moved) sl_price."""
-        entry_price = position["entry_price"]
-        risk_distance = position.get("risk_distance")
+        current (possibly-moved) sl_price.
+
+        config.DCA_ENABLED - a second bug of the same shape, found
+        2026-08-31: _execute_dca legitimately overwrites entry_price/
+        risk_distance with the new blended values once DCA fires, which
+        silently changes what "1R" means mid-trade despite this
+        function's own stated invariant above. original_entry_price/
+        original_risk_distance (set once, in _execute_dca, before that
+        overwrite) are preferred here when present so a DCA'd trade's
+        MAE/MFE stay measured against the same original risk unit for
+        its whole life, same as a trade that never DCA'd."""
+        entry_price = position.get("original_entry_price") or position["entry_price"]
+        risk_distance = position.get("original_risk_distance") or position.get("risk_distance")
 
         if risk_distance is None or risk_distance <= 0:
             return None, None
@@ -2205,6 +2215,20 @@ class PositionManager:
             position["tp_order_id"] = None
             position["dca_trail_order_id"] = None
 
+        # 2026-08-31: capture the ORIGINAL (pre-DCA) entry/risk before
+        # they're overwritten below - needed both to keep
+        # _mae_mfe_r_multiples accurate for a DCA'd trade (its own
+        # docstring already requires "risk captured once at position
+        # start", broken by the overwrite below) and for
+        # config.DCA_MAX_ADVERSE_R_ENABLED (needs the ORIGINAL unit, not
+        # the ~3-4x-wider post-DCA one, to mean "how many original-R am I
+        # down"). Guarded so a hypothetical future re-fire can't clobber
+        # the real original - this project's DCA is single-fire by
+        # design, but the guard is free insurance.
+        if position.get("original_risk_distance") is None:
+            position["original_entry_price"] = position["entry_price"]
+            position["original_risk_distance"] = position["risk_distance"]
+
         position["entry_price"] = plan["entry_price"]
         position["sl_price"] = plan["sl_price"]
         position["tp_price"] = plan["tp_price"]
@@ -2779,6 +2803,20 @@ class PositionManager:
             if outcome is not None:
                 return outcome
 
+            # config.DCA_MAX_ADVERSE_R_ENABLED - checked before the
+            # favorable-side promotions below, same "adverse event wins
+            # ties" bias this function's own DCA_PENDING branch already
+            # documents for the DCA-fire-vs-early-promotion race.
+            if (
+                config.DCA_MAX_ADVERSE_R_ENABLED
+                and current_price is not None
+                and self._dca_max_adverse_loss_reached(position, current_price)
+            ):
+                outcome = self._close_dca_active_on_max_adverse_loss(position)
+
+                if outcome is not None:
+                    return outcome
+
             # config.PROFIT_PROTECTION_ENABLED - a fresh arm step, unlike
             # BREAKEVEN_ACTIVE below (which only ever TRAILS an already-
             # armed lock carried over from TP1_PENDING) - see
@@ -3236,6 +3274,51 @@ class PositionManager:
         log_info(f"{symbol} static TP quantity closed at market (price already past target)")
         return self._close(symbol, "STATIC_TP_HIT")
 
+    @staticmethod
+    def _dca_max_adverse_loss_reached(position, current_price):
+        """config.DCA_MAX_ADVERSE_R_ENABLED - see its own config.py
+        comment for the real evidence. None/missing original_risk_distance
+        (e.g. a restart-recovered DCA_ACTIVE position, which has no way
+        to know its pre-DCA risk - see _recover_dca_active_position)
+        never triggers - fail-open, same convention as every gate in
+        this codebase."""
+        original_entry = position.get("original_entry_price")
+        original_risk = position.get("original_risk_distance")
+
+        if original_entry is None or not original_risk or original_risk <= 0:
+            return False
+
+        side = position["side"]
+        adverse_distance = (
+            original_entry - current_price if side == "BUY" else current_price - original_entry
+        )
+        return (adverse_distance / original_risk) >= max(float(config.DCA_MAX_ADVERSE_R_MULTIPLE), 0)
+
+    def _close_dca_active_on_max_adverse_loss(self, position):
+        """Same market-close-then-_close shape as _market_close_static_tp
+        - the position's unrealized loss has reached config.
+        DCA_MAX_ADVERSE_R_MULTIPLE times its original planned risk (see
+        _dca_max_adverse_loss_reached), so it's closed now rather than
+        left to run to the structural post-DCA SL, which is deliberately
+        several original-R further away. Returns None (left for the next
+        poll to retry) if the market-close itself failed."""
+        symbol = position["symbol"]
+        side = position["side"]
+
+        try:
+            exchange.close_position_market(symbol, side, position["quantity"])
+        except Exception as exc:
+            log_error(f"{symbol} max-adverse-loss market-close error: {exc}")
+            return None
+
+        exchange.cancel_all_open_orders(symbol)
+        log_info(
+            f"{symbol} closed at market - unrealized loss reached "
+            f"{config.DCA_MAX_ADVERSE_R_MULTIPLE}R of original risk, not "
+            f"waiting for the structural post-DCA SL"
+        )
+        return self._close(symbol, "DCA_MAX_ADVERSE_LOSS")
+
     def _try_early_promotions_shadow(self, position, latest_candle, candles):
         """Shadow-mode counterpart to _try_early_promotions - shared by
         poll_shadow's TP1_PENDING and DCA_PENDING branches (see
@@ -3401,6 +3484,14 @@ class PositionManager:
 
             if migrate_outcome is not None:
                 return migrate_outcome
+
+            # config.DCA_MAX_ADVERSE_R_ENABLED - see poll_live's identical
+            # check for the full reasoning/evidence. Checked before hit_sl
+            # below, same "adverse event wins ties" bias.
+            if config.DCA_MAX_ADVERSE_R_ENABLED and self._dca_max_adverse_loss_reached(
+                position, latest_candle["close"]
+            ):
+                return self._close(symbol, "SHADOW_DCA_MAX_ADVERSE_LOSS")
 
             hit_sl = low <= position["sl_price"] if side == "BUY" else high >= position["sl_price"]
 

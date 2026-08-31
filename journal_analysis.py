@@ -38,6 +38,12 @@ LOSS_OUTCOMES = {
     # as LIMIT_FILL_SL_PLACEMENT_FAILED above, just for the DCA path
     # (position_manager._execute_dca).
     "DCA_SL_HIT", "SHADOW_DCA_SL_HIT", "DCA_SL_PLACEMENT_FAILED",
+    # config.DCA_MAX_ADVERSE_R_ENABLED - a DCA_ACTIVE position closed
+    # early (unrealized loss reached DCA_MAX_ADVERSE_R_MULTIPLE times the
+    # original planned risk) rather than run to the structural post-DCA
+    # SL - still a real loss, just capped smaller than DCA_SL_HIT would
+    # have been (position_manager.py's own comment has the evidence).
+    "DCA_MAX_ADVERSE_LOSS", "SHADOW_DCA_MAX_ADVERSE_LOSS",
     # config.RETRACEMENT_ENTRY_ENABLED - the retracement (or its market
     # fallback) filled, but SL placement then failed and the filled
     # quantity was emergency-closed at market (position_manager.

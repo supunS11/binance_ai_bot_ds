@@ -1724,6 +1724,25 @@ DCA_TP_TARGET_ROI_PCT = env_float("DCA_TP_TARGET_ROI_PCT", 50)
 # placed once DCA fires - mirrors STRUCTURE_STOP_ATR_BUFFER's own role for
 # the (unused, pre-DCA) original stop calculation.
 DCA_STRUCTURE_STOP_ATR_BUFFER = env_float("DCA_STRUCTURE_STOP_ATR_BUFFER", 0.5)
+# 2026-08-31, real evidence (22 resolved real DCA_SL_HIT trades, ground-
+# truth realized PnL): 45% exceeded 2R of the ORIGINAL planned risk
+# before finally stopping out at the structural post-DCA SL, 23%
+# exceeded 5R - two real trades cost -5.54R/$84 and -3.35R/$61, together
+# erasing 35% of total realized account profit in this window. The
+# structural post-DCA SL is deliberately wide (the "give it room to
+# recover" design) - this is an independent, tighter backstop
+# specifically for when that room isn't enough and the trade just keeps
+# running, not a replacement for the structural stop. 3.0 sits just
+# below BANKUSDT's real -3.35R (would have meaningfully capped it) and
+# well inside ZKPUSDT's -5.54R, while leaving the more moderate
+# (arguably still-recoverable) excursions alone - NOT validated against
+# how many would-be winners also cross 2-3R before recovering (today's
+# MAE/MFE tracking for DCA'd trades was itself broken until this same
+# change fixed it - see position_manager._execute_dca - so there was no
+# reliable way to check that yet). Revisit once real before/after data
+# exists specifically for DCA_ACTIVE closes.
+DCA_MAX_ADVERSE_R_ENABLED = env_bool("DCA_MAX_ADVERSE_R_ENABLED", "True")
+DCA_MAX_ADVERSE_R_MULTIPLE = env_float("DCA_MAX_ADVERSE_R_MULTIPLE", 3.0)
 # Operator request (2026-08-20, motivated by a real trade - LITUSDT,
 # 2026-08-19: DCA fired while price was still running hard in the
 # adverse direction with zero sign of turning, then hit its post-DCA SL
