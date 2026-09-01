@@ -114,14 +114,33 @@ def evaluate(
     # confirmed pivot - zero prior trade evidence on this specific
     # method, unlike the swing-age gate.
     htf_trend_live = None
+    # Hoisted unconditionally (not just inside the htf_trend_ema block
+    # below) so it's always available - both the existing htf_trend_live
+    # classification and the new HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED
+    # distance calculation in _evaluate_direction need it, and the latter
+    # can't assume the block below actually ran.
+    latest_htf_close = htf_candles[-1].get("close") if htf_candles else None
 
-    if htf_trend_ema is not None and htf_candles:
-        latest_htf_close = htf_candles[-1]["close"]
-
+    if htf_trend_ema is not None and latest_htf_close is not None:
         if latest_htf_close > htf_trend_ema:
             htf_trend_live = "BULLISH"
         elif latest_htf_close < htf_trend_ema:
             htf_trend_live = "BEARISH"
+
+    # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED - the EMA value from
+    # HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES candles ago, so _evaluate_
+    # direction can measure the EMA's own slope (is it rising/falling,
+    # not just where price sits relative to it right now) - see that
+    # config's own comment for the real evidence. Only computed under
+    # HTF_TREND_EMA_PRIMARY_ENABLED since that's the only time htf_trend_
+    # live is the operative AGAINST_HTF_BIAS source at all.
+    htf_trend_ema_prior = None
+
+    if htf_trend_ema is not None and config.HTF_TREND_EMA_PRIMARY_ENABLED:
+        htf_trend_ema_prior = market_structure.ema_prior_value(
+            htf_candles, period=config.HTF_TREND_EMA_PERIOD,
+            candles_back=config.HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES,
+        )
 
     zone = market_structure.premium_discount_zone(htf_candles)
 
@@ -625,6 +644,29 @@ def evaluate(
         if side is None:
             return _reject("UNKNOWN_BREAK_DIRECTION")
 
+        # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED - signed (toward
+        # THIS candidate's own side) distance of the latest HTF close from
+        # its own EMA, and the EMA's own slope over the prior HTF_TREND_
+        # LIVE_SLOPE_LOOKBACK_CANDLES candles. Computed here (not hoisted
+        # to evaluate() like htf_trend_ema/htf_trend_live themselves)
+        # because the sign depends on `side`, which only exists per-
+        # direction. None whenever the underlying EMA reads aren't
+        # available - never blocks on missing data, same fail-open
+        # convention as every gate in this function. Journaled
+        # unconditionally below (not just when the gate below is enabled)
+        # so real fill-quality data keeps accumulating regardless.
+        htf_trend_live_distance_pct = None
+
+        if htf_trend_ema and htf_trend_ema > 0 and latest_htf_close is not None:
+            raw_distance_pct = (latest_htf_close - htf_trend_ema) / htf_trend_ema * 100
+            htf_trend_live_distance_pct = raw_distance_pct if side == "BUY" else -raw_distance_pct
+
+        htf_trend_live_slope_pct = None
+
+        if htf_trend_ema is not None and htf_trend_ema_prior and htf_trend_ema_prior > 0:
+            raw_slope_pct = (htf_trend_ema - htf_trend_ema_prior) / htf_trend_ema_prior * 100
+            htf_trend_live_slope_pct = raw_slope_pct if side == "BUY" else -raw_slope_pct
+
         # config.TRIGGER_GATE_PROFILES - this project's founding difference
         # from binance_ai_bot_smc: each trigger only runs the gates that
         # actually fit its own detection logic, by default (see config.py's
@@ -642,6 +684,39 @@ def evaluate(
 
             if htf_side and side != htf_side:
                 return _reject(f"AGAINST_HTF_BIAS htf={effective_htf_trend} ltf={direction}")
+
+            # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED - real evidence
+            # (2026-09-01, 57 historical trades, real 4h klines
+            # reconstructed) - see that flag's own config.py comment.
+            # htf_trend_live above is a pure binary (above/below its own
+            # EMA) with no notion of HOW strongly that's true; a close
+            # that just barely crossed the EMA a candle ago behaves very
+            # differently from one clearly separated on a rising EMA, but
+            # both read identically today. Only meaningful under HTF_
+            # TREND_EMA_PRIMARY_ENABLED - htf_trend_live isn't the
+            # operative bias otherwise (effective_htf_trend already reads
+            # the swing-confirmed trend instead in that case, and this
+            # data doesn't apply there). Same reversal-trigger exemption
+            # as AGAINST_HTF_BIAS itself (nested in the same `applicable_
+            # gates` check, not a separate profile entry) - deliberate:
+            # those triggers exist to catch a trend change before it's
+            # confirmed/strong, so requiring a strong already-separated
+            # reading would contradict their own purpose. Reason strings
+            # deliberately carry no continuous value (same convention as
+            # OI_RISING/CVD_NOT_CONFIRMED/DEPTH_OPPOSING) so main.py's
+            # reject-reason tally aggregates by gate, not by exact float.
+            if config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED and config.HTF_TREND_EMA_PRIMARY_ENABLED:
+                if (
+                    htf_trend_live_distance_pct is not None
+                    and htf_trend_live_distance_pct < config.HTF_TREND_LIVE_MIN_DISTANCE_PCT
+                ):
+                    return _reject("HTF_TREND_LIVE_WEAK_DISTANCE")
+
+                if (
+                    htf_trend_live_slope_pct is not None
+                    and htf_trend_live_slope_pct < config.HTF_TREND_LIVE_MIN_SLOPE_PCT
+                ):
+                    return _reject("HTF_TREND_LIVE_WEAK_SLOPE")
 
         # Both checks below exist purely to catch a stale SWING-confirmed
         # bias. Once AGAINST_HTF_BIAS no longer uses that bias at all
@@ -1156,6 +1231,8 @@ def evaluate(
             "entry_price": latest_price,
             "htf_trend": htf_structure.get("trend"),
             "htf_trend_live": htf_trend_live,
+            "htf_trend_live_distance_pct": htf_trend_live_distance_pct,
+            "htf_trend_live_slope_pct": htf_trend_live_slope_pct,
             "htf_trend_swing_age_hours": htf_trend_swing_age_hours,
             # Placeholders - the candidate (not the direction) determines
             # these; the caller overlays the winning candidate's real

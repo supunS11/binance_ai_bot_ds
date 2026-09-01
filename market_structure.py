@@ -680,6 +680,21 @@ def exponential_moving_average(candles, period=None):
     return ema
 
 
+def ema_prior_value(candles, period=None, candles_back=3):
+    """EMA value as of `candles_back` candles ago - same math as
+    exponential_moving_average, anchored earlier, so a caller can measure
+    the EMA's own slope (config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED)
+    instead of only its current level. A separate function (not just a
+    second call to exponential_moving_average with sliced candles) so
+    it's independently mockable in tests, and so a too-short candles list
+    fails closed with its own None rather than a misleadingly-short EMA
+    window."""
+    if candles_back <= 0 or len(candles) <= candles_back:
+        return None
+
+    return exponential_moving_average(candles[:-candles_back], period=period)
+
+
 def efficiency_ratio(candles, period=None):
     """Kaufman's Efficiency Ratio: net directional movement over the
     window divided by total path length (sum of each candle's absolute

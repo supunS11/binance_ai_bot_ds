@@ -581,6 +581,33 @@ HTF_TREND_MAX_SWING_AGE_HOURS = env_float("HTF_TREND_MAX_SWING_AGE_HOURS", 72.0)
 # ENABLED's own reject checks while this is on (see signal_engine.py) -
 # both existed only to catch staleness in the mechanism this replaces.
 HTF_TREND_EMA_PRIMARY_ENABLED = env_bool("HTF_TREND_EMA_PRIMARY_ENABLED", "False")
+# 2026-09-01, real evidence: reconstructed real 4h-EMA distance/slope
+# from actual klines for 57 historical trades where htf_trend_live
+# agreed with the trade (the population HTF_TREND_EMA_PRIMARY_ENABLED
+# currently waves through with no strength check at all) - distance from
+# the EMA: <0% (already reversed by signal time) 40% loss (n=5), 0-0.5%
+# 12% (n=8), 0.5-1.5% 4% (n=23), >=1.5% 0% loss (n=21); EMA slope over 3
+# candles: <0 (rolling the wrong way) 22% loss (n=9), 0-0.3% 13% (n=15),
+# >=0.3% 0% loss (n=33). Both clean and monotonic. Explains 3 of 4 real
+# losses on record (BANKUSDT/ENSOUSDT: negative on both; LDOUSDT: weak-
+# positive on both, the two worst non-negative buckets) - the 4th
+# (JCTUSDT) is an unrelated SL-placement-failure close, not a direction
+# problem. Thresholds set at the stricter tier deliberately (user choice,
+# real quality-over-quantity tradeoff, disclosed): retroactively rejects
+# ~40% of the historical AGAINST_HTF_BIAS-applicable population, but
+# would have caught all 3 real direction-related losses, not just 2.
+# Reject-only, same "safe to ship on real evidence immediately"
+# precedent as OI_RISING_REJECT_ENABLED. Only meaningful under
+# HTF_TREND_EMA_PRIMARY_ENABLED - htf_trend_live isn't the operative
+# bias otherwise. n=57/3-4 real losses is still a real evidence base but
+# a thin one - revisit once more resolved trades exist under this gate,
+# distance/slope are journaled specifically (signal_engine.py's
+# htf_trend_live_distance_pct/htf_trend_live_slope_pct) so that's
+# checkable instead of guessed at again.
+HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED = env_bool("HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED", "True")
+HTF_TREND_LIVE_MIN_DISTANCE_PCT = env_float("HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5)
+HTF_TREND_LIVE_MIN_SLOPE_PCT = env_float("HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3)
+HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES = env_int("HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES", 3)
 
 # =========================
 # SIGNAL ENGINE - order-flow confirmation thresholds

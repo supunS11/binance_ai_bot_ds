@@ -194,6 +194,20 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["absorption_signal"], "BUY")
         self.assertEqual(rows[0]["absorption_aligned"], "True")
 
+    def test_append_signal_writes_htf_trend_live_strength_fields(self):
+        # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED - real
+        # signal_engine.py distance/slope computation covered in
+        # test_signal_engine.py; this only proves the journal writes it
+        # through, same as absorption_signal above.
+        signal_journal.append_signal(
+            _signal(htf_trend_live_distance_pct=1.25, htf_trend_live_slope_pct=-0.4),
+            _plan(),
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["htf_trend_live_distance_pct"], "1.25")
+        self.assertEqual(rows[0]["htf_trend_live_slope_pct"], "-0.4")
+
     def test_append_signal_writes_depth_trend_and_whale_fields(self):
         # config.DEPTH_TREND_TRACKING_ENABLED/WHALE_TRADE_TRACKING_ENABLED -
         # real orderbook.py/order_flow.py/signal_engine.py logic covered in

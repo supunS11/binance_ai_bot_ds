@@ -88,6 +88,7 @@ class SignalEngineTests(unittest.TestCase):
         ema_value=85.0,
         ema_alignment_value=85.0,
         htf_trend_ema=None,
+        htf_trend_ema_prior=None,
         oi_snapshot=None,
         liquidation_snapshot=None,
         quote_volume_usdt=None,
@@ -195,6 +196,14 @@ class SignalEngineTests(unittest.TestCase):
                 return ema_alignment_value
             return htf_trend_ema
 
+        # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED's slope input -
+        # mocked as its own separate function (not a second exponential_
+        # moving_average call) precisely so it's independently
+        # controllable here, unlike a second call with sliced candles
+        # would be under _ema_side_effect above (keyed only on period).
+        # Defaults to None (gate's slope check is a no-op) so no existing
+        # test is affected unless it explicitly opts in.
+
         # OI_RISING_REJECT_ENABLED defaults True in config.py (real gate,
         # see its own comment) but oi_snapshot's own default above
         # (OI_RISING) is rising - defaulting this kwarg to False keeps
@@ -222,6 +231,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest), \
              patch.object(market_structure, "detect_ema_pullback", return_value=ema_pullback), \
              patch.object(market_structure, "exponential_moving_average", side_effect=_ema_side_effect), \
+             patch.object(market_structure, "ema_prior_value", return_value=htf_trend_ema_prior), \
              patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
              patch.object(market_structure, "price_return", return_value=btc_return), \
              patch.object(liquidity_sweep, "detect_sweep", return_value=sweep), \
@@ -513,6 +523,112 @@ class SignalEngineTests(unittest.TestCase):
 
         # Swing age here is still 76h > 72h (same as the dedicated
         # swing-age test), which would normally reject - must not here.
+        self.assertEqual(result["signal"], "BUY")
+
+    # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED - real evidence
+    # (2026-09-01, see config.py's own comment). htf_trend_live above is
+    # a pure binary above/below its own EMA - these tests cover the
+    # strength refinement layered on top of it, only meaningful under
+    # HTF_TREND_EMA_PRIMARY_ENABLED (htf_trend_live isn't the operative
+    # AGAINST_HTF_BIAS source otherwise).
+
+    def test_htf_trend_live_weak_distance_rejects_even_with_strong_slope(self):
+        # distance = (100.3-100.0)/100.0*100 = 0.3% < the 0.5% default
+        # threshold. slope = (100.0-95.0)/95.0*100 ~= 5.26%, comfortably
+        # clearing its own threshold - proves distance is checked (and
+        # can reject) independently of slope.
+        htf_candles = [{"open_time": 0, "close": 100.3}]
+
+        result = self._run(
+            htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
+            htf_trend_ema_primary_enabled=True,
+        )
+
+        self.assertEqual(result["reason"], "HTF_TREND_LIVE_WEAK_DISTANCE")
+
+    def test_htf_trend_live_weak_slope_rejects_even_with_strong_distance(self):
+        # distance = (105.0-100.0)/100.0*100 = 5%, comfortably clearing
+        # its threshold. slope = (100.0-99.9)/99.9*100 ~= 0.1% < the 0.3%
+        # default threshold - proves slope is checked independently of
+        # distance.
+        htf_candles = [{"open_time": 0, "close": 105.0}]
+
+        result = self._run(
+            htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=99.9,
+            htf_trend_ema_primary_enabled=True,
+        )
+
+        self.assertEqual(result["reason"], "HTF_TREND_LIVE_WEAK_SLOPE")
+
+    def test_htf_trend_live_strong_distance_and_slope_passes(self):
+        htf_candles = [{"open_time": 0, "close": 105.0}]
+
+        result = self._run(
+            htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
+            htf_trend_ema_primary_enabled=True,
+        )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertAlmostEqual(result["htf_trend_live_distance_pct"], 5.0, places=4)
+        self.assertAlmostEqual(result["htf_trend_live_slope_pct"], 5.263157, places=4)
+
+    def test_htf_trend_live_strength_reject_disabled_lets_weak_reads_through(self):
+        htf_candles = [{"open_time": 0, "close": 100.3}]
+
+        with patch.object(config, "HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED", False):
+            result = self._run(
+                htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
+                htf_trend_ema_primary_enabled=True,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_htf_trend_live_strength_reject_inert_when_ema_primary_disabled(self):
+        # Same weak-distance shape as the dedicated rejection test above
+        # (0.3% above the EMA), but htf_trend_ema_primary_enabled left at
+        # its default False - swing-confirmed structure (default HTF_
+        # BULLISH, agrees with the default BUY candidate) is the
+        # operative bias instead, and this gate never even evaluates.
+        # htf_trend_ema kept below the default ltf_close=93 - same trick
+        # the first test in this block uses - so the unrelated HTF_TREND_
+        # STALE gate (only live when EMA_PRIMARY is off) doesn't fire
+        # instead and mask what this test is actually proving.
+        htf_candles = [{"open_time": 0, "close": 80.24}]
+
+        result = self._run(htf_candles=htf_candles, htf_trend_ema=80.0, htf_trend_ema_prior=76.0)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_htf_trend_live_strength_reject_fails_open_on_missing_ema_data(self):
+        # Default htf_trend_ema=None (HTF_TREND_FRESHNESS_ENABLED off and
+        # no explicit value here) - both distance and slope stay None,
+        # same fail-open convention as every gate in this file.
+        result = self._run(htf_trend_ema_primary_enabled=True)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["htf_trend_live_distance_pct"])
+        self.assertIsNone(result["htf_trend_live_slope_pct"])
+
+    def test_htf_trend_live_strength_reject_exempt_for_reversal_triggers(self):
+        # Same reversal-trigger exemption AGAINST_HTF_BIAS itself gets
+        # (AGAINST_HTF_BIAS_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED defaults
+        # True) - this new check is nested inside the same "AGAINST_HTF_
+        # BIAS" applicable_gates block, not a separate profile entry, so
+        # CVD_DIVERGENCE never reaches it even with weak distance/slope.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        htf_candles = [{"open_time": 0, "close": 100.3}]
+
+        with patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
+             patch.object(config, "MAX_ENTRY_EXTENSION_R", 0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=100.2,
+                htf_trend_ema_primary_enabled=True,
+            )
+
         self.assertEqual(result["signal"], "BUY")
 
     def test_market_choppy_rejects_below_the_threshold(self):
