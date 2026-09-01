@@ -14,6 +14,7 @@ signal logic of its own.
 """
 from collections import deque
 import json
+import random
 import threading
 import time
 
@@ -292,6 +293,25 @@ class RealtimeMarketData:
         with self.lock:
             return generation == self.generation
 
+    def _reconnect_backoff_wait(self):
+        """Real segfault found live (2026-09-01): a shared network blip
+        made several of this bot's realtime socket threads (market,
+        depth, and both liquidation streams all share this exact reconnect
+        shape) fail and reconnect within the same few seconds - the
+        process crashed with a genuine OS-level segfault
+        (`kernel: python[...]: segfault ... in python3.12`) shortly after,
+        not a catchable Python exception. websockets.sync's C-level
+        socket/SSL teardown isn't proven safe under many threads
+        reconnecting in lockstep, and this bot runs 10+ of these threads
+        concurrently (market + depth chunks, plus 3 liquidation feeds).
+        Jittering the backoff spreads reconnect attempts apart instead of
+        letting a shared failure cluster them into the same instant -
+        reduces how often threads hit that risky window together. This
+        can't guarantee eliminating the underlying race (that's inside a
+        third-party C extension, not something fixable from Python), only
+        make the trigger condition less likely."""
+        self.stop_event.wait(3 + random.uniform(0, 2))
+
     @staticmethod
     def _close_websockets(websockets):
         for websocket in websockets:
@@ -484,7 +504,7 @@ class RealtimeMarketData:
             except Exception as exc:
                 if self._worker_active(generation):
                     log_warning(f"Realtime market websocket reconnecting: {exc}")
-                    self.stop_event.wait(3)
+                    self._reconnect_backoff_wait()
             finally:
                 with self.lock:
                     self.market_websockets.pop(worker_id, None)
@@ -629,7 +649,7 @@ class RealtimeMarketData:
             except Exception as exc:
                 if self._worker_active(generation):
                     log_warning(f"Realtime depth websocket reconnecting: {exc}")
-                    self.stop_event.wait(3)
+                    self._reconnect_backoff_wait()
             finally:
                 with self.lock:
                     self.depth_websockets.pop(worker_id, None)
@@ -910,7 +930,7 @@ class RealtimeMarketData:
             except Exception as exc:
                 if self._worker_active(generation):
                     log_warning(f"Realtime liquidation websocket reconnecting: {exc}")
-                    self.stop_event.wait(3)
+                    self._reconnect_backoff_wait()
             finally:
                 with self.lock:
                     if self.liquidation_websocket is not None:
@@ -1012,7 +1032,7 @@ class RealtimeMarketData:
             except Exception as exc:
                 if self._worker_active(generation):
                     log_warning(f"Realtime Bybit liquidation websocket reconnecting: {exc}")
-                    self.stop_event.wait(3)
+                    self._reconnect_backoff_wait()
             finally:
                 with self.lock:
                     if self.liquidation_websocket_bybit is not None:
@@ -1065,7 +1085,7 @@ class RealtimeMarketData:
             except Exception as exc:
                 if self._worker_active(generation):
                     log_warning(f"Realtime OKX liquidation websocket reconnecting: {exc}")
-                    self.stop_event.wait(3)
+                    self._reconnect_backoff_wait()
             finally:
                 with self.lock:
                     if self.liquidation_websocket_okx is not None:

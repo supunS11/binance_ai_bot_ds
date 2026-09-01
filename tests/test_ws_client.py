@@ -553,6 +553,73 @@ class CrossExchangeLiquidationStreamUrlTests(unittest.TestCase):
         self.assertEqual(connect_mock.call_args.args[0], "wss://ws.okx.com:8443/ws/v5/public")
 
 
+class ReconnectBackoffWaitTests(unittest.TestCase):
+    """Real segfault found live (2026-09-01): several realtime socket
+    threads (market, depth, and both liquidation streams all share this
+    exact reconnect shape) reconnected within the same few seconds after
+    a shared network blip, and the process crashed with a genuine OS-
+    level segfault shortly after - not a catchable Python exception.
+    Jittering the reconnect backoff spreads retries apart instead of
+    letting a shared failure cluster them into the same instant."""
+
+    def test_waits_at_least_the_base_delay(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+
+        with patch.object(feed.stop_event, "wait") as wait_mock, \
+             patch("random.uniform", return_value=0.0):
+            feed._reconnect_backoff_wait()
+
+        wait_mock.assert_called_once_with(3.0)
+
+    def test_adds_jitter_within_the_documented_spread(self):
+        feed = RealtimeMarketData(["BTCUSDT"])
+
+        with patch.object(feed.stop_event, "wait") as wait_mock, \
+             patch("random.uniform", return_value=1.5) as uniform_mock:
+            feed._reconnect_backoff_wait()
+
+        uniform_mock.assert_called_once_with(0, 2)
+        wait_mock.assert_called_once_with(4.5)
+
+    def test_all_reconnect_loops_use_the_shared_jittered_backoff(self):
+        # Locks in that market/depth/liquidation (Binance+Bybit+OKX) all
+        # route through the same helper, not their own independent flat
+        # wait(3) - consistency matters here since any of them clustering
+        # with the others is what triggers the underlying race. The first
+        # connect() failure leaves stop_event unset (backoff must fire and
+        # the loop must retry); the second failure sets stop_event so the
+        # loop exits instead of spinning forever.
+        feed = RealtimeMarketData(["BTCUSDT"])
+        loops = [
+            (feed._market_stream_loop, True),
+            (feed._depth_stream_loop, True),
+            (feed._liquidation_stream_loop, False),
+            (feed._liquidation_stream_loop_bybit, False),
+            (feed._liquidation_stream_loop_okx, False),
+        ]
+
+        for loop, takes_symbols in loops:
+            feed.stop_event.clear()
+            calls = {"n": 0}
+
+            def _raise_then_stop(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] >= 2:
+                    feed.stop_event.set()
+                raise RuntimeError("boom")
+
+            with patch("websockets.sync.client.connect", side_effect=_raise_then_stop), \
+                 patch.object(feed, "_reconnect_backoff_wait") as backoff_mock:
+                if takes_symbols:
+                    loop(["BTCUSDT"], feed.generation)
+                else:
+                    loop(feed.generation)
+
+            backoff_mock.assert_called_once()
+
+        feed.stop_event.clear()
+
+
 class BybitLiquidationSubscribeTests(unittest.TestCase):
     """Real live finding (2026-08-29): Bybit rejects the ENTIRE subscribe
     batch if even one symbol has no liquidation handler (~5% of a real
