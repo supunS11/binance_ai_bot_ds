@@ -517,6 +517,57 @@ class PrivateRestWeightTests(unittest.TestCase):
 
         self.rate_limit_mock.assert_called_once_with(40)
 
+    def test_get_all_open_algo_orders_is_weighted(self):
+        with patch.object(exchange.client, "futures_get_open_algo_orders", return_value=[]):
+            exchange.get_all_open_algo_orders()
+
+        self.rate_limit_mock.assert_called_once_with(40)
+
+
+class GetAllOpenAlgoOrdersResponseShapeTests(unittest.TestCase):
+    """PositionManager.reconcile_stray_algo_orders_on_startup relies on
+    this always returning a plain list, regardless of which shape
+    Binance's algo endpoint responds with - mirrors get_open_algo_orders'
+    own wrapper-key ambiguity handling."""
+
+    def setUp(self):
+        self.rate_limit_patcher = patch.object(exchange, "_rate_limit_public_request")
+        self.rate_limit_patcher.start()
+
+    def tearDown(self):
+        self.rate_limit_patcher.stop()
+
+    def test_bare_list_response_passes_through(self):
+        orders = [{"symbol": "RUNEUSDT", "algoId": "algo1"}]
+
+        with patch.object(exchange.client, "futures_get_open_algo_orders", return_value=orders):
+            self.assertEqual(exchange.get_all_open_algo_orders(), orders)
+
+    def test_orders_wrapped_dict_response_unwraps(self):
+        orders = [{"symbol": "RUNEUSDT", "algoId": "algo1"}]
+
+        with patch.object(
+            exchange.client, "futures_get_open_algo_orders",
+            return_value={"orders": orders},
+        ):
+            self.assertEqual(exchange.get_all_open_algo_orders(), orders)
+
+    def test_data_wrapped_dict_response_unwraps(self):
+        orders = [{"symbol": "RUNEUSDT", "algoId": "algo1"}]
+
+        with patch.object(
+            exchange.client, "futures_get_open_algo_orders",
+            return_value={"data": orders},
+        ):
+            self.assertEqual(exchange.get_all_open_algo_orders(), orders)
+
+    def test_fetch_error_swallowed_to_empty_list(self):
+        with patch.object(
+            exchange.client, "futures_get_open_algo_orders",
+            side_effect=Exception("timeout"),
+        ):
+            self.assertEqual(exchange.get_all_open_algo_orders(), [])
+
 
 class GetFundingRatesTests(unittest.TestCase):
     """Bulk (one call, every symbol) funding rate snapshot - reuses the

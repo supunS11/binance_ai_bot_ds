@@ -1592,6 +1592,40 @@ def get_all_open_orders():
         return []
 
 
+def get_all_open_algo_orders():
+    """Every open algo/conditional order (SL/TP1/TP2/trailing-stop),
+    account-wide, one call - the algo-namespace analog of
+    get_all_open_orders(). Startup-only use (see PositionManager.
+    reconcile_stray_algo_orders_on_startup) - confirmed live (2026-09-01)
+    that the underlying endpoint accepts an account-wide query with no
+    symbol filter, same shape as get_open_algo_orders(symbol) without
+    the filter."""
+    method = getattr(client, "futures_get_open_algo_orders", None)
+
+    try:
+        if method:
+            response = _private_rest_call(
+                "futures_get_open_algo_orders", method, weight=40,
+            )
+        else:
+            response = _private_rest_call(
+                "futures_get_open_algo_orders", client._request_futures_api,
+                "get", "openAlgoOrders", True, data={}, weight=40,
+            )
+
+        if isinstance(response, dict):
+            # Same wrapper-key ambiguity get_open_algo_orders already
+            # handles per-symbol - not consistently "data".
+            wrapped = response.get("orders") or response.get("data")
+            return wrapped if isinstance(wrapped, list) else []
+
+        return response if isinstance(response, list) else []
+
+    except Exception as exc:
+        log_error(f"open algo orders fetch error: {exc}")
+        return []
+
+
 def get_income_history(symbol=None, income_type=None, start_time=None, end_time=None, limit=1000):
     """Ground-truth realized PNL/commission/funding from Binance's own
     account income ledger (/fapi/v1/income) - unlike the journal's

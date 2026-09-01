@@ -4137,6 +4137,76 @@ class ReconcilePendingEntriesOnStartupTests(unittest.TestCase):
         self.assertFalse(manager.positions["BTCUSDT"]["dca_order_id"])
 
 
+class ReconcileStrayAlgoOrdersOnStartupTests(unittest.TestCase):
+    """TP1 (place_take_profit_partial) and the DCA-breakeven trailing
+    stop (place_trailing_stop_loss) are reduceOnly, fixed-quantity algo
+    orders - unlike SL/TP2 (closePosition=true), Binance does not auto-
+    cancel these when the position closes some other way. A symbol whose
+    position closed entirely while the bot was offline never re-enters
+    self.positions (reconcile_on_startup only adopts symbols with a real
+    open position), so reconcile_closed_positions can never see it
+    either. This is the account-wide sweep that catches exactly that gap
+    - confirmed real, twice (RUNEUSDT, TWTUSDT)."""
+
+    def test_stray_algo_order_for_untracked_symbol_is_cancelled(self):
+        manager = PositionManager()
+        open_orders = [{"symbol": "RUNEUSDT", "algoId": "algo1", "orderType": "TAKE_PROFIT_MARKET"}]
+
+        with patch.object(exchange, "get_all_open_algo_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_algo_order") as cancel_algo:
+            manager.reconcile_stray_algo_orders_on_startup()
+
+        cancel_algo.assert_called_once_with("RUNEUSDT", "algo1")
+
+    def test_algo_order_for_a_tracked_symbol_is_left_alone(self):
+        manager = PositionManager()
+        manager.positions["XRPUSDT"] = {"side": "SELL", "shadow": False}
+        open_orders = [{"symbol": "XRPUSDT", "algoId": "algo1", "orderType": "STOP_MARKET"}]
+
+        with patch.object(exchange, "get_all_open_algo_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_algo_order") as cancel_algo:
+            manager.reconcile_stray_algo_orders_on_startup()
+
+        cancel_algo.assert_not_called()
+
+    def test_order_missing_symbol_or_algo_id_is_skipped(self):
+        manager = PositionManager()
+        open_orders = [{"symbol": "RUNEUSDT"}, {"algoId": "algo1"}]
+
+        with patch.object(exchange, "get_all_open_algo_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_algo_order") as cancel_algo:
+            manager.reconcile_stray_algo_orders_on_startup()
+
+        cancel_algo.assert_not_called()
+
+    def test_empty_response_is_a_no_op(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel_algo:
+            manager.reconcile_stray_algo_orders_on_startup()
+
+        cancel_algo.assert_not_called()
+
+    def test_multiple_stray_orders_across_symbols_all_cancelled(self):
+        manager = PositionManager()
+        manager.positions["XRPUSDT"] = {"side": "SELL", "shadow": False}
+        open_orders = [
+            {"symbol": "RUNEUSDT", "algoId": "algo1", "orderType": "TAKE_PROFIT_MARKET"},
+            {"symbol": "TWTUSDT", "algoId": "algo2", "orderType": "TAKE_PROFIT_MARKET"},
+            {"symbol": "XRPUSDT", "algoId": "algo3", "orderType": "STOP_MARKET"},
+        ]
+
+        with patch.object(exchange, "get_all_open_algo_orders", return_value=open_orders), \
+             patch.object(exchange, "cancel_algo_order") as cancel_algo:
+            manager.reconcile_stray_algo_orders_on_startup()
+
+        self.assertEqual(
+            sorted(call.args for call in cancel_algo.call_args_list),
+            [("RUNEUSDT", "algo1"), ("TWTUSDT", "algo2")],
+        )
+
+
 def _retracement_plan(side="BUY", dca=True, single_tp=False):
     plan = dict(_plan(side))
 

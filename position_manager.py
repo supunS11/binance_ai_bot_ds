@@ -812,6 +812,51 @@ class PositionManager:
                 f"order(s) preserved"
             )
 
+    def reconcile_stray_algo_orders_on_startup(self):
+        """A TP1 partial (place_take_profit_partial) or DCA-breakeven
+        trailing stop (place_trailing_stop_loss) is a reduceOnly, FIXED-
+        quantity algo order - unlike SL/TP2 (place_stop_loss/place_take_
+        profit_full, both closePosition=true), Binance does not auto-
+        cancel these when the position they were sized for closes some
+        other way. reconcile_closed_positions already cancels leftover
+        orders for a symbol found closed while still tracked in self.
+        positions - but a symbol whose position closed ENTIRELY while the
+        bot was offline never re-enters self.positions at all (reconcile_
+        on_startup only adopts symbols with a real currently-open
+        exchange position), so nothing has ever cancelled its stray
+        reduceOnly leg. Left alone it stays live indefinitely and, being
+        a fixed quantity rather than closePosition=true, could fire
+        unexpectedly against an unrelated future position opened on the
+        same symbol later.
+
+        Confirmed real, twice (RUNEUSDT, TWTUSDT - both closed entirely
+        while untracked, both needed a manual cancel afterward because
+        nothing in the bot's own reconciliation would ever have found
+        them).
+
+        Must run after reconcile_on_startup - self.positions must already
+        reflect every symbol with a real open position by the time this
+        runs."""
+        cancelled = 0
+
+        for order in exchange.get_all_open_algo_orders():
+            symbol = order.get("symbol")
+            algo_id = order.get("algoId")
+
+            if not symbol or not algo_id or symbol in self.positions:
+                continue
+
+            exchange.cancel_algo_order(symbol, algo_id)
+            cancelled += 1
+            log_warning(
+                f"{symbol} cancelled a stray algo order found on restart "
+                f"(algoId={algo_id}, type={order.get('orderType')}) - no "
+                f"tracked position exists for this symbol"
+            )
+
+        if cancelled:
+            log_info(f"Startup reconciliation | {cancelled} stray algo order(s) cancelled")
+
     def reconcile_closed_positions(self):
         """Catches what poll_live structurally cannot: a tracked real
         (non-shadow) position closed OUTSIDE the bot entirely (manual

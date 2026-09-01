@@ -624,6 +624,7 @@ def main():
     if config.EXECUTION_MODE == "LIVE":
         positions.reconcile_on_startup(feed)
         positions.reconcile_pending_entries_on_startup()
+        positions.reconcile_stray_algo_orders_on_startup()
 
     eval_interval = max(config.SIGNAL_EVAL_INTERVAL_SECONDS, 1)
     heartbeat_every = max(int(30 / eval_interval), 1)
