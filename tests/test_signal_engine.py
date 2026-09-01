@@ -533,49 +533,66 @@ class SignalEngineTests(unittest.TestCase):
     # AGAINST_HTF_BIAS source otherwise).
 
     def test_htf_trend_live_weak_distance_rejects_even_with_strong_slope(self):
-        # distance = (100.3-100.0)/100.0*100 = 0.3% < the 0.5% default
-        # threshold. slope = (100.0-95.0)/95.0*100 ~= 5.26%, comfortably
-        # clearing its own threshold - proves distance is checked (and
-        # can reject) independently of slope.
+        # Thresholds pinned explicitly (0.5%/0.3%) rather than relying on
+        # config.py's own defaults (0.0%/0.0% as of 2026-09-01 - see that
+        # flag's own comment for why the stricter tier didn't hold up
+        # under corrected evidence) - this test is about the mechanism
+        # correctly rejecting once BELOW a threshold, independent of
+        # whatever value the mechanism ships with. distance = (100.3-
+        # 100.0)/100.0*100 = 0.3% < 0.5%. slope = (100.0-95.0)/95.0*100
+        # ~= 5.26%, comfortably clearing its own threshold - proves
+        # distance is checked (and can reject) independently of slope.
         htf_candles = [{"open_time": 0, "close": 100.3}]
 
-        result = self._run(
-            htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
-            htf_trend_ema_primary_enabled=True,
-        )
+        with patch.object(config, "HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3):
+            result = self._run(
+                htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
+                htf_trend_ema_primary_enabled=True,
+            )
 
         self.assertEqual(result["reason"], "HTF_TREND_LIVE_WEAK_DISTANCE")
 
     def test_htf_trend_live_weak_slope_rejects_even_with_strong_distance(self):
-        # distance = (105.0-100.0)/100.0*100 = 5%, comfortably clearing
-        # its threshold. slope = (100.0-99.9)/99.9*100 ~= 0.1% < the 0.3%
-        # default threshold - proves slope is checked independently of
-        # distance.
+        # Thresholds pinned explicitly - see comment on the sibling test
+        # above. distance = (105.0-100.0)/100.0*100 = 5%, comfortably
+        # clearing its threshold. slope = (100.0-99.9)/99.9*100 ~= 0.1% <
+        # 0.3% - proves slope is checked independently of distance.
         htf_candles = [{"open_time": 0, "close": 105.0}]
 
-        result = self._run(
-            htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=99.9,
-            htf_trend_ema_primary_enabled=True,
-        )
+        with patch.object(config, "HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3):
+            result = self._run(
+                htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=99.9,
+                htf_trend_ema_primary_enabled=True,
+            )
 
         self.assertEqual(result["reason"], "HTF_TREND_LIVE_WEAK_SLOPE")
 
     def test_htf_trend_live_strong_distance_and_slope_passes(self):
+        # Thresholds pinned explicitly - see comment on the first test in
+        # this block.
         htf_candles = [{"open_time": 0, "close": 105.0}]
 
-        result = self._run(
-            htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
-            htf_trend_ema_primary_enabled=True,
-        )
+        with patch.object(config, "HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3):
+            result = self._run(
+                htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
+                htf_trend_ema_primary_enabled=True,
+            )
 
         self.assertEqual(result["signal"], "BUY")
         self.assertAlmostEqual(result["htf_trend_live_distance_pct"], 5.0, places=4)
         self.assertAlmostEqual(result["htf_trend_live_slope_pct"], 5.263157, places=4)
 
     def test_htf_trend_live_strength_reject_disabled_lets_weak_reads_through(self):
+        # Thresholds pinned explicitly - see comment on the first test in
+        # this block.
         htf_candles = [{"open_time": 0, "close": 100.3}]
 
-        with patch.object(config, "HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED", False):
+        with patch.object(config, "HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED", False), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3):
             result = self._run(
                 htf_candles=htf_candles, htf_trend_ema=100.0, htf_trend_ema_prior=95.0,
                 htf_trend_ema_primary_enabled=True,

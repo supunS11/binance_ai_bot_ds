@@ -584,29 +584,48 @@ HTF_TREND_EMA_PRIMARY_ENABLED = env_bool("HTF_TREND_EMA_PRIMARY_ENABLED", "False
 # 2026-09-01, real evidence: reconstructed real 4h-EMA distance/slope
 # from actual klines for 57 historical trades where htf_trend_live
 # agreed with the trade (the population HTF_TREND_EMA_PRIMARY_ENABLED
-# currently waves through with no strength check at all) - distance from
-# the EMA: <0% (already reversed by signal time) 40% loss (n=5), 0-0.5%
-# 12% (n=8), 0.5-1.5% 4% (n=23), >=1.5% 0% loss (n=21); EMA slope over 3
-# candles: <0 (rolling the wrong way) 22% loss (n=9), 0-0.3% 13% (n=15),
-# >=0.3% 0% loss (n=33). Both clean and monotonic. Explains 3 of 4 real
-# losses on record (BANKUSDT/ENSOUSDT: negative on both; LDOUSDT: weak-
-# positive on both, the two worst non-negative buckets) - the 4th
-# (JCTUSDT) is an unrelated SL-placement-failure close, not a direction
-# problem. Thresholds set at the stricter tier deliberately (user choice,
-# real quality-over-quantity tradeoff, disclosed): retroactively rejects
-# ~40% of the historical AGAINST_HTF_BIAS-applicable population, but
-# would have caught all 3 real direction-related losses, not just 2.
-# Reject-only, same "safe to ship on real evidence immediately"
-# precedent as OI_RISING_REJECT_ENABLED. Only meaningful under
-# HTF_TREND_EMA_PRIMARY_ENABLED - htf_trend_live isn't the operative
-# bias otherwise. n=57/3-4 real losses is still a real evidence base but
-# a thin one - revisit once more resolved trades exist under this gate,
-# distance/slope are journaled specifically (signal_engine.py's
-# htf_trend_live_distance_pct/htf_trend_live_slope_pct) so that's
-# checkable instead of guessed at again.
+# currently waves through with no strength check at all).
+#
+# CORRECTED 2026-09-01 (same day, real bug found while answering a follow
+# -up question): the first pass of this evidence used journal_analysis.
+# load_trades(), which merges a retracement-routed trade's settle row
+# into the signal row via plain dict.update() - both rows carry a non-
+# blank "timestamp", so the settle row's (much later) timestamp silently
+# overwrote the true signal-time one for every retracement-routed trade
+# in the sample. That pulled the wrong HTF kline window for those trades
+# and produced a falsely clean, falsely monotonic result (reported as
+# distance: <0% 40% loss n=5, 0-0.5% 12% n=8, 0.5-1.5% 4% n=23, >=1.5% 0%
+# n=21; slope: <0 22% n=9, 0-0.3% 13% n=15, >=0.3% 0% n=33 - "explains 3
+# of 4 real losses"). Recomputed keeping the true signal-time row
+# separate (same fix already applied to the retracement-timeout
+# analysis) - same n=57, real numbers: distance <0% 40% loss (n=5,
+# unchanged), 0-0.5% 0% (n=7), 0.5-1.5% 5% (n=19), >=1.5% 4% (n=26);
+# slope <0 15% (n=13), 0-0.3% 0% (n=12), >=0.3% 6% (n=32) - NOT
+# monotonic once corrected (the "weak" 0-0.5%/0-0.3% buckets show the
+# *best* loss rates, not worse). Of the 4 real losses, only JCTUSDT
+# (distance -3.93%) and ENSOUSDT (distance -0.83%, slope -0.92%) show a
+# genuinely bad read - BANKUSDT (+1.25%/+0.71%) and LDOUSDT (+1.56%/
+# +0.47%) both read as strong-and-positive, contradicting the original
+# "explains 3 of 4" claim.
+#
+# What actually holds up: distance/slope BELOW ZERO (the EMA read has
+# already reversed, or is actively rolling the wrong way) is bad (15-40%
+# loss); anywhere at or above zero performs similarly (0-6%, no real
+# gradient). That's the ORIGINAL "conservative tier" this flag's own
+# design discussion offered as the alternative to the stricter one - the
+# stricter tier (>=0.5%/>=0.3%) was chosen on the since-retracted
+# evidence and is not supported by the corrected numbers, so both
+# thresholds are reverted to 0.0 (reject only on an actual negative
+# reading) pending more resolved trades. Reject-only, same "safe to ship
+# on real evidence immediately" precedent as OI_RISING_REJECT_ENABLED.
+# Only meaningful under HTF_TREND_EMA_PRIMARY_ENABLED - htf_trend_live
+# isn't the operative bias otherwise. distance/slope are journaled
+# specifically (signal_engine.py's htf_trend_live_distance_pct/
+# htf_trend_live_slope_pct) so this can keep being checked against real
+# data instead of guessed at again.
 HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED = env_bool("HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED", "True")
-HTF_TREND_LIVE_MIN_DISTANCE_PCT = env_float("HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5)
-HTF_TREND_LIVE_MIN_SLOPE_PCT = env_float("HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3)
+HTF_TREND_LIVE_MIN_DISTANCE_PCT = env_float("HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.0)
+HTF_TREND_LIVE_MIN_SLOPE_PCT = env_float("HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.0)
 HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES = env_int("HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES", 3)
 
 # =========================
