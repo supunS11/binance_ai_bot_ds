@@ -14,6 +14,7 @@ import time
 import config
 import exchange
 import execution
+import market_structure
 import risk_manager
 import signal_engine
 import signal_journal
@@ -245,6 +246,78 @@ def _evaluate_symbol(
             _tally_reject(
                 reject_trigger_counts, reject_trigger_symbols, symbol,
                 f"LONG_SHORT_UNFAVORABLE | triggers={result.get('signal_trigger')}",
+            )
+            return
+
+    # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
+    # evidence (see that flag's own config.py comment). Scoped to
+    # OB_FVG_RETEST only - checked identically against CHOCH_RETEST and
+    # came back flat, so NOT applied there. On-demand (real 1m klines
+    # fetched fresh here, not streamed - the bot's own LTF stream is
+    # WS_KLINE_INTERVAL=1h, no 1m candles flow through it otherwise) -
+    # only for a candidate that's already OB_FVG_RETEST and has already
+    # passed every other check, same on-demand-after-signal shape as
+    # LONG_SHORT_RATIO_ENABLED above.
+    if (
+        config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED
+        and result.get("signal_trigger") == "OB_FVG_RETEST"
+    ):
+        # +5, not +1: get_klines has no explicit endTime here (a live,
+        # "right now" call), so its last row is almost always the still-
+        # forming current-minute candle - dropped unconditionally below,
+        # same exclusion the historical replay applied via its own
+        # endTime-based check.
+        price_df = exchange.get_klines(
+            symbol, "1m", limit=config.OB_FVG_RETEST_PRICE_HOLD_LOOKBACK_MINUTES + 5
+        )
+        price_candles = (
+            [
+                {"open": float(row["open"]), "close": float(row["close"])}
+                for _, row in price_df.iloc[:-1].iterrows()
+            ]
+            if price_df is not None and not price_df.empty else []
+        )
+        price_hold_consistency = market_structure.price_hold_consistency(
+            price_candles, result["signal"]
+        )
+
+        if (
+            price_hold_consistency is not None
+            and price_hold_consistency < config.OB_FVG_RETEST_MIN_PRICE_HOLD_PCT
+        ):
+            _tally_reject(reject_counts, reject_symbols, symbol, "OB_FVG_RETEST_PRICE_WEAK")
+            _tally_reject(
+                reject_trigger_counts, reject_trigger_symbols, symbol,
+                f"OB_FVG_RETEST_PRICE_WEAK | triggers={result.get('signal_trigger')}",
+            )
+            return
+
+    # config.MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED - 2026-09-02, real
+    # evidence (see that flag's own config.py comment). Same population as
+    # MARKET_CHOPPY itself (config.trigger_gate_profiles() - MARKET_CHOPPY
+    # already rejected any candidate outside this scope inside
+    # signal_engine.evaluate, well before reaching here). On-demand (a
+    # fresh, longer 5-day OI history call the existing short-window
+    # OpenInterestEngine doesn't carry) - only for a candidate that's
+    # already passed every other check, same on-demand-after-signal shape
+    # as LONG_SHORT_RATIO_ENABLED/OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED
+    # above.
+    if config.MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED and "MARKET_CHOPPY" in config.trigger_gate_profiles().get(
+        result.get("signal_trigger"), frozenset()
+    ):
+        oi_history = exchange.get_open_interest_history(
+            symbol, period="1h", limit=config.MARKET_CHOPPY_OI_REGIME_LOOKBACK_SAMPLES
+        )
+        oi_percentile = market_structure.oi_percentile(oi_history)
+
+        if (
+            oi_percentile is not None
+            and oi_percentile >= config.MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE
+        ):
+            _tally_reject(reject_counts, reject_symbols, symbol, "MARKET_CHOPPY_OI_CROWDED")
+            _tally_reject(
+                reject_trigger_counts, reject_trigger_symbols, symbol,
+                f"MARKET_CHOPPY_OI_CROWDED | triggers={result.get('signal_trigger')}",
             )
             return
 

@@ -722,6 +722,57 @@ def efficiency_ratio(candles, period=None):
     return net_move / path_length
 
 
+def price_hold_consistency(candles, side, lookback=None):
+    """Fraction (0-1) of the most recent `lookback` real closed candles
+    that closed in `side`'s own favorable direction (close > open for
+    BUY, close < open for SELL) - config.OB_FVG_RETEST_PRICE_WEAK_REJECT_
+    ENABLED. A real, replayable proxy for "was recent price action
+    actually sustained in this direction, or just a fleeting flip":
+    historical order-book depth isn't archived anywhere, so a book-based
+    version of this same question can't be checked against real past
+    trades the way DEPTH_TREND_UNSTABLE's own depth_consistency_pct is -
+    this uses real closed-candle price action instead, which is archived
+    indefinitely (see that flag's own config.py comment for the real
+    evidence). Returns None with too little history rather than a
+    misleadingly short window."""
+    lookback = int(config.OB_FVG_RETEST_PRICE_HOLD_LOOKBACK_MINUTES if lookback is None else lookback)
+
+    if lookback <= 0 or len(candles) < lookback:
+        return None
+
+    window = candles[-lookback:]
+    favorable = sum(
+        1 for candle in window
+        if ((candle["close"] > candle["open"]) if side == "BUY" else (candle["close"] < candle["open"]))
+    )
+
+    return favorable / len(window)
+
+
+def oi_percentile(history):
+    """Percentile rank (0-1) of the most recent OI reading within its own
+    trailing history - config.MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED (see
+    that flag's own config.py comment for the real evidence). A different
+    question from OI_RISING (direction/momentum over OI_RISING's own
+    much shorter in-memory window): this is absolute level/regime -
+    "is OI currently crowded relative to where it's recently sat" -
+    over a much longer real trailing window that OpenInterestEngine's
+    short-lived in-memory history doesn't carry, hence the separate
+    on-demand exchange.get_open_interest_history call in main.py.
+    history is that function's own ascending (timestamp, oi_value) tuple
+    list, or None/too-short on failure. Requires at least 30 real samples
+    (same floor used throughout this gate's own evidence check) - fewer
+    than that makes a percentile rank too noisy to mean anything."""
+    if not history or len(history) < 30:
+        return None
+
+    values = [value for _, value in history]
+    current = values[-1]
+    below_or_equal = sum(1 for value in values if value <= current)
+
+    return below_or_equal / len(values)
+
+
 def price_correlation(candles_a, candles_b, period=None):
     """Pearson correlation between two symbols' closes over the same
     trailing window - how much of this symbol's move is just riding a

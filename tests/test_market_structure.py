@@ -950,6 +950,90 @@ class EfficiencyRatioTests(unittest.TestCase):
         self.assertIsNone(ms.efficiency_ratio(candles, period=14))
 
 
+class PriceHoldConsistencyTests(unittest.TestCase):
+    """config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - real evidence
+    (2026-09-02, 43 resolved OB_FVG_RETEST trades). Real closed-candle
+    price-action proxy for "was recent pressure sustained", since
+    historical order-book depth isn't archived anywhere to check the
+    same question the way depth_consistency_pct does."""
+
+    def _candle(self, open_, close):
+        return {"open": open_, "close": close}
+
+    def test_none_with_too_few_candles(self):
+        candles = [self._candle(100, 101) for _ in range(5)]
+        self.assertIsNone(ms.price_hold_consistency(candles, "BUY", lookback=10))
+
+    def test_all_favorable_buy_closes_is_1(self):
+        candles = [self._candle(100, 101) for _ in range(10)]  # every close > open
+        self.assertAlmostEqual(ms.price_hold_consistency(candles, "BUY", lookback=10), 1.0)
+
+    def test_all_unfavorable_buy_closes_is_0(self):
+        candles = [self._candle(101, 100) for _ in range(10)]  # every close < open
+        self.assertAlmostEqual(ms.price_hold_consistency(candles, "BUY", lookback=10), 0.0)
+
+    def test_sell_favors_closes_below_open(self):
+        candles = [self._candle(101, 100) for _ in range(10)]
+        self.assertAlmostEqual(ms.price_hold_consistency(candles, "SELL", lookback=10), 1.0)
+
+    def test_mixed_candles_computes_the_real_fraction(self):
+        candles = (
+            [self._candle(100, 101) for _ in range(6)]  # favorable for BUY
+            + [self._candle(101, 100) for _ in range(4)]  # unfavorable for BUY
+        )
+        self.assertAlmostEqual(ms.price_hold_consistency(candles, "BUY", lookback=10), 0.6)
+
+    def test_only_the_most_recent_lookback_candles_are_used(self):
+        # 10 unfavorable, then 5 favorable - lookback=5 should only see
+        # the favorable tail.
+        candles = (
+            [self._candle(101, 100) for _ in range(10)]
+            + [self._candle(100, 101) for _ in range(5)]
+        )
+        self.assertAlmostEqual(ms.price_hold_consistency(candles, "BUY", lookback=5), 1.0)
+
+    def test_lookback_defaults_from_config(self):
+        with patch.object(config, "OB_FVG_RETEST_PRICE_HOLD_LOOKBACK_MINUTES", 3):
+            candles = [self._candle(100, 101) for _ in range(3)]
+            self.assertAlmostEqual(ms.price_hold_consistency(candles, "BUY"), 1.0)
+
+
+class OiPercentileTests(unittest.TestCase):
+    """config.MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED - real evidence
+    (2026-09-02, 185 resolved trades that already pass MARKET_CHOPPY,
+    real futures_open_interest_hist data)."""
+
+    def _history(self, values):
+        return [(float(i), v) for i, v in enumerate(values)]
+
+    def test_none_with_no_history(self):
+        self.assertIsNone(ms.oi_percentile(None))
+        self.assertIsNone(ms.oi_percentile([]))
+
+    def test_none_below_30_samples(self):
+        history = self._history([100.0] * 29)
+        self.assertIsNone(ms.oi_percentile(history))
+
+    def test_latest_value_at_the_low_end_is_near_0(self):
+        # 30 samples, latest is the smallest -> only itself is <=.
+        values = list(range(1, 30)) + [0]
+        history = self._history(values)
+        self.assertAlmostEqual(ms.oi_percentile(history), 1 / 30)
+
+    def test_latest_value_at_the_high_end_is_1(self):
+        # 30 samples, latest is the largest -> every value is <=.
+        values = list(range(0, 29)) + [1000]
+        history = self._history(values)
+        self.assertAlmostEqual(ms.oi_percentile(history), 1.0)
+
+    def test_latest_value_at_the_median_is_half(self):
+        # 30 samples 0..29 with the median value (14) moved to the end:
+        # 15 of the 30 values (0..14) are <= it.
+        values = [v for v in range(30) if v != 14] + [14]
+        history = self._history(values)
+        self.assertAlmostEqual(ms.oi_percentile(history), 0.5)
+
+
 class PriceCorrelationTests(unittest.TestCase):
     """Backs the BTC-correlation confluence field (config.BTC_CORRELATION_ENABLED)."""
 

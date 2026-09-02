@@ -2,10 +2,13 @@ import unittest
 from collections import Counter
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 import config
 import exchange
 import execution
 import main
+import market_structure
 import risk_manager
 import signal_engine
 import signal_journal
@@ -534,7 +537,17 @@ class SignalStabilityTrackerTests(unittest.TestCase):
 class EvaluateSymbolStabilityTests(unittest.TestCase):
     def setUp(self):
         # See EvaluateSymbolRejectCountsTests.setUp - same reason, both flags.
-        for name, value in (("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False)):
+        # MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED pinned off too: several
+        # tests below set a real (non-reversal) signal_trigger and fall
+        # through past build_trade_plan, which would otherwise reach the
+        # new on-demand exchange.get_open_interest_history call with
+        # nothing mocking it - not what those tests are about. The
+        # dedicated tests near the bottom of this class re-enable it
+        # explicitly per test, same convention as OB_FVG_RETEST_PRICE_WEAK.
+        for name, value in (
+            ("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False),
+            ("MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", False),
+        ):
             patcher = patch.object(config, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -716,6 +729,209 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
             main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
 
         plan_mock.assert_called_once()
+
+    # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
+    # evidence (see config.py's own comment). Scoped to OB_FVG_RETEST
+    # only - same on-demand-after-signal shape as LONG_SHORT_RATIO_ENABLED
+    # above.
+
+    def _fake_klines_df(self):
+        return pd.DataFrame({
+            "time": range(15), "open": [100.0] * 15, "high": [101.0] * 15,
+            "low": [99.0] * 15, "close": [101.0] * 15, "volume": [10.0] * 15,
+        })
+
+    def test_price_hold_weak_rejects_before_building_a_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "OB_FVG_RETEST"}
+        reject_counts = Counter()
+        reject_symbols = {}
+        reject_trigger_counts = Counter()
+        reject_trigger_symbols = {}
+
+        with patch.object(config, "OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_MIN_PRICE_HOLD_PCT", 0.5), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines", return_value=self._fake_klines_df()), \
+             patch.object(market_structure, "price_hold_consistency", return_value=0.3), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(len(positions.registered), 0)
+        self.assertEqual(reject_counts["OB_FVG_RETEST_PRICE_WEAK"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["OB_FVG_RETEST_PRICE_WEAK"])
+        self.assertEqual(reject_trigger_counts["OB_FVG_RETEST_PRICE_WEAK | triggers=OB_FVG_RETEST"], 1)
+
+    def test_price_hold_strong_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "OB_FVG_RETEST"}
+
+        with patch.object(config, "OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_MIN_PRICE_HOLD_PCT", 0.5), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines", return_value=self._fake_klines_df()), \
+             patch.object(market_structure, "price_hold_consistency", return_value=0.8), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_price_hold_consistency_none_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "OB_FVG_RETEST"}
+
+        with patch.object(config, "OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines", return_value=None), \
+             patch.object(market_structure, "price_hold_consistency", return_value=None), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_price_hold_weak_reject_disabled_by_flag(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "OB_FVG_RETEST"}
+
+        with patch.object(config, "OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines") as klines_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        klines_mock.assert_not_called()
+        plan_mock.assert_called_once()
+
+    def test_price_hold_not_checked_for_other_triggers(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        # CHOCH_RETEST - tested identically in the real replay and came
+        # back flat, deliberately not applied there.
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CHOCH_RETEST"}
+
+        with patch.object(config, "OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines") as klines_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        klines_mock.assert_not_called()
+        plan_mock.assert_called_once()
+
+    # config.MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED - 2026-09-02, real
+    # evidence (see config.py's own comment). Same on-demand-after-signal
+    # shape as OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED above, but scoped
+    # to MARKET_CHOPPY's own full trigger population (config.
+    # trigger_gate_profiles()), not just one trigger.
+
+    def test_oi_crowded_rejects_before_building_a_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+        reject_counts = Counter()
+        reject_symbols = {}
+        reject_trigger_counts = Counter()
+        reject_trigger_symbols = {}
+
+        with patch.object(config, "MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", True), \
+             patch.object(config, "MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE", 0.75), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_open_interest_history", return_value=[(0.0, 1.0)] * 30), \
+             patch.object(market_structure, "oi_percentile", return_value=0.9), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(len(positions.registered), 0)
+        self.assertEqual(reject_counts["MARKET_CHOPPY_OI_CROWDED"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["MARKET_CHOPPY_OI_CROWDED"])
+        self.assertEqual(reject_trigger_counts["MARKET_CHOPPY_OI_CROWDED | triggers=EMA_PULLBACK"], 1)
+
+    def test_oi_below_cutoff_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+
+        with patch.object(config, "MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", True), \
+             patch.object(config, "MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE", 0.75), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_open_interest_history", return_value=[(0.0, 1.0)] * 30), \
+             patch.object(market_structure, "oi_percentile", return_value=0.5), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_oi_percentile_none_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+
+        with patch.object(config, "MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_open_interest_history", return_value=None), \
+             patch.object(market_structure, "oi_percentile", return_value=None), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_oi_crowded_reject_disabled_by_flag(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+
+        with patch.object(config, "MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_open_interest_history") as history_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        history_mock.assert_not_called()
+        plan_mock.assert_called_once()
+
+    def test_oi_regime_not_checked_for_reversal_triggers(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        # CVD_DIVERGENCE - one of the 3 reversal triggers MARKET_CHOPPY
+        # itself is exempt for (config.
+        # MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED) - this gate
+        # reuses that same exemption via config.trigger_gate_profiles().
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+
+        with patch.object(config, "MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", True), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_open_interest_history") as history_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        history_mock.assert_not_called()
+        plan_mock.assert_called_once()
+
+    def test_oi_regime_uses_the_configured_lookback(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+
+        with patch.object(config, "MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", True), \
+             patch.object(config, "MARKET_CHOPPY_OI_REGIME_LOOKBACK_SAMPLES", 60), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_open_interest_history", return_value=None) as history_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        history_mock.assert_called_once_with("BTCUSDT", period="1h", limit=60)
 
     def test_stability_none_behaves_like_the_original_ungated_behavior(self):
         feed = _FakeFeed()

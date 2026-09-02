@@ -725,7 +725,20 @@ OI_RISING_REJECT_ENABLED = env_bool("OI_RISING_REJECT_ENABLED", "True")
 # this bot's single evaluate-on-tick usage needs.
 LIQUIDATION_CONFIRMATION_ENABLED = env_bool("LIQUIDATION_CONFIRMATION_ENABLED", "True")
 LIQUIDATION_WINDOW_SECONDS = env_int("LIQUIDATION_WINDOW_SECONDS", 120)
-LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT = env_float("LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 50000)
+# 2026-09-02, real evidence re-confirmed: the original 50,000 default was
+# "invented from nothing, turned out ~200x too high for this bot's real
+# symbol set" (see WHALE_TRADE_MIN_NOTIONAL_USDT's own comment above,
+# which already documented the real measured distribution - median $227,
+# p95 $6,039, 0/997 real events ever cleared 50,000). liquidation_cluster/
+# liquidation_aligned have been silently empty for essentially this
+# entire bot's live history as a direct result - confirmed live
+# (2026-09-02): only 1 real trade across the whole journal has ever had a
+# non-null liquidation_aligned value. Recalibrated to the real measured
+# p95 (rounded) so real clusters actually clear it going forward, instead
+# of a threshold realistic only for BTCUSDT/ETHUSDT-sized notional. Purely
+# a threshold correction on an already-real, already-cited distribution -
+# no new mechanism, no new evidence being invented here.
+LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT = env_float("LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 6000)
 LIQUIDATION_MAX_EVENTS_PER_SYMBOL = env_int("LIQUIDATION_MAX_EVENTS_PER_SYMBOL", 200)
 # Funding rate - reflects how crowded long vs short positioning is
 # market-wide for a symbol (strongly positive = longs paying heavily to
@@ -903,6 +916,59 @@ CHOCH_RETEST_MIN_DEPTH_IMBALANCE = env_float("CHOCH_RETEST_MIN_DEPTH_IMBALANCE",
 # version. 0 (or negative) disables, same convention as
 # CHOCH_RETEST_MIN_DEPTH_IMBALANCE.
 OB_FVG_RETEST_MIN_DEPTH_IMBALANCE = env_float("OB_FVG_RETEST_MIN_DEPTH_IMBALANCE", 0.10)
+# 2026-09-02, real evidence (43 resolved OB_FVG_RETEST trades, real 1m
+# klines reconstructed): fraction of the last OB_FVG_RETEST_PRICE_HOLD_
+# LOOKBACK_MINUTES real closed 1m candles that closed in the trade's own
+# favorable direction - <0.5 (against/mixed) lost 21% (n=24) vs 0.5-0.8
+# (mostly favorable) lost only 5% (n=19), a comparable sample size to
+# this same gate's own OB_FVG_RETEST_MIN_DEPTH_IMBALANCE evidence above
+# (n=33). Tested identically against CHOCH_RETEST first (same real
+# methodology, same real klines) and came back flat (29% vs 31%) - NOT
+# applied there, evidence doesn't support it for that trigger. This is a
+# deliberately different KIND of confirmation than depth_imbalance above,
+# not a fancier version of it: real order-book depth history isn't
+# archived anywhere (unlike klines, which backfill indefinitely), so a
+# cross-exchange or multi-level version of the depth gate can't be
+# checked against real past trades the way this can - price_hold_
+# consistency answers a similar "was the pressure behind this retest
+# actually sustained" question using closed-candle price action instead,
+# which is. Fetched on-demand in main.py (real 1m klines, not streamed -
+# the bot's own LTF stream is WS_KLINE_INTERVAL=1h) only for a candidate
+# that's already OB_FVG_RETEST and has already passed every other check,
+# same on-demand-after-signal shape as LONG_SHORT_RATIO_ENABLED. Reject-
+# only, same "ship on real evidence immediately" precedent as
+# OI_RISING_REJECT_ENABLED.
+OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED = env_bool("OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", "True")
+OB_FVG_RETEST_MIN_PRICE_HOLD_PCT = env_float("OB_FVG_RETEST_MIN_PRICE_HOLD_PCT", 0.5)
+OB_FVG_RETEST_PRICE_HOLD_LOOKBACK_MINUTES = env_int("OB_FVG_RETEST_PRICE_HOLD_LOOKBACK_MINUTES", 10)
+# config.MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED - 2026-09-02, real evidence
+# (185 resolved trades that already pass MARKET_CHOPPY today, real
+# futures_open_interest_hist data, period=1h/120 samples = ~5 real trailing
+# days). Percentile rank of the latest OI reading within that trailing
+# distribution - a monotonic real split: 0-25th=11%, 25-50th=17%,
+# 50-75th=19%, 75-100th=21% loss rate (n=70/35/37/42). Cutoff swept 60th-
+# 85th on the resulting "kept population" aggregate loss rate: 60th=15.8%,
+# 65th=15.1%, 70th=14.1%, 75th=14.7%, 80th=16.2%, 85th=16.3% - 70th and
+# 75th sit in the same shallow trough (within noise given the underlying
+# 5-10-trade bins), both ends clearly worse. Chose 75th over 70th: the
+# 75-80th band is the single worst-performing band anywhere in the whole
+# distribution (60% loss rate, n=5) - 75th cuts immediately before it,
+# while 70th would also rezero-catch the much cleaner 60-75th trough
+# (0-25% loss across those bands) for no real benefit. A different
+# question from OI_RISING (direction/momentum over OI_RISING's own much
+# shorter in-memory window, config.OI_RISING_REJECT_ENABLED) - this is
+# absolute level/regime over a much longer real trailing window that
+# OpenInterestEngine's short-lived in-memory history doesn't carry, hence
+# fetched on-demand in main.py (a fresh REST call) rather than reusing the
+# existing OI snapshot - same on-demand-after-signal shape as
+# OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED above. Same population/trigger
+# scope as MARKET_CHOPPY itself (config.trigger_gate_profiles(), i.e.
+# MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED's own exemption) -
+# reject-only, same "ship on real evidence immediately" precedent as
+# OI_RISING_REJECT_ENABLED.
+MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED = env_bool("MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", "True")
+MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE = env_float("MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE", 0.75)
+MARKET_CHOPPY_OI_REGIME_LOOKBACK_SAMPLES = env_int("MARKET_CHOPPY_OI_REGIME_LOOKBACK_SAMPLES", 120)
 # Fourth entry trigger: a fresh rejection wick into an UNMITIGATED fair
 # value gap (market_structure.find_fvg_retest) - independent of any live
 # break right now, the classic OB/FVG "retest" entry. Scoped to FVGs only
@@ -1259,16 +1325,17 @@ LIQUIDATION_SWEEP_CONFIRMED_TRIGGER_ENABLED = env_bool(
 )
 # Temporary, read-only diagnostic (2026-08-25 signal-engine audit finding:
 # LIQUIDATION_SWEEP_CONFIRMED has never produced a single trade).
-# LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT=50000 within a 120s window
-# (LIQUIDATION_WINDOW_SECONDS) is realistic for BTCUSDT/ETHUSDT but may be
-# unrealistic for this bot's actual (mostly small/mid-cap) symbol set -
-# but there's no historical liquidation-notional data to check that
-# against without guessing a new number. Logs the REAL notional magnitude
-# seen at every genuine LIQUIDITY_SWEEP event (whether or not it clears
-# the threshold), so a future recalibration is evidence-based. Never
-# gates anything, never changes any returned field - default True purely
-# because it's observability-only; turn off once enough evidence has
-# accumulated to decide.
+# UPDATE (2026-09-02): the "no historical liquidation-notional data to
+# check against" premise below is now stale - see LIQUIDATION_CLUSTER_
+# MIN_NOTIONAL_USDT's own comment above for the real measured
+# distribution (median $227, p95 $6,039) that motivated recalibrating it
+# from 50,000 to 6,000. This diagnostic stays on regardless - still the
+# right way to keep validating the threshold as more real
+# LIQUIDITY_SWEEP events resolve under the corrected value. Logs the REAL
+# notional magnitude seen at every genuine LIQUIDITY_SWEEP event (whether
+# or not it clears the threshold). Never gates anything, never changes
+# any returned field - default True purely because it's observability-
+# only.
 LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED = env_bool(
     "LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED", "True"
 )
