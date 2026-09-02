@@ -52,6 +52,23 @@ def long_short_favorable(side, long_short_ratio):
     return long_short_ratio < threshold if side == "BUY" else long_short_ratio > 1 / threshold
 
 
+def taker_flow_agrees(side, taker_ratio):
+    """Sign agreement between Binance's own aggregated taker buy/sell
+    VOLUME ratio and the trade's own side - a CONFIRMATION reading
+    (unlike long_short_favorable above, which is deliberately
+    contrarian): >1 means more taker BUY volume than SELL volume in the
+    window, so a BUY trade agrees when taker_ratio > 1, a SELL trade
+    when < 1. config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED (real
+    evidence, see that flag's own config.py comment). Called from
+    main.py once the on-demand exchange.get_taker_longshort_ratio fetch
+    resolves, same on-demand shape as long_short_favorable. None with no
+    real ratio (never blocks)."""
+    if taker_ratio is None:
+        return None
+
+    return taker_ratio > 1 if side == "BUY" else taker_ratio < 1
+
+
 def evaluate(
     symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
     oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,

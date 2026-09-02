@@ -876,5 +876,82 @@ class PlaceDcaRestingOrderTests(unittest.TestCase):
         self.assertIsNone(dca_order)
 
 
+class PlaceDcaProtectiveStopTests(unittest.TestCase):
+    """config.DCA_PROTECTIVE_FIRST_ENABLED - supersedes config.
+    DCA_RESTING_ORDER_ENABLED when both are on: instead of a resting
+    quantity-ADDING LIMIT order, place_dca_protection_orders rests a
+    quantity-NEUTRAL protective STOP_MARKET (exchange.place_stop_loss)
+    at dca_price. See config.py's own comment for the full evidence."""
+
+    def test_enabled_places_a_protective_stop_at_dca_price(self):
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": 9}) as place_sl, \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            _, _, _, dca_order = execution.place_dca_protection_orders(
+                "BTCUSDT", "BUY", _dca_plan()
+            )
+
+        limit_order.assert_not_called()  # the old add-in mechanism is never touched
+        place_sl.assert_called_once()
+        args, kwargs = place_sl.call_args
+        self.assertEqual(args, ("BTCUSDT", "BUY", 96))  # dca_price, not a computed level
+        self.assertTrue(
+            kwargs["client_algo_id"].startswith(execution.DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_PREFIX)
+        )
+        self.assertEqual(dca_order, {"algoId": 9})
+
+    def test_enabled_works_for_single_tp_plan_too(self):
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": 9}) as place_sl:
+            _, _, _, dca_order = execution.place_dca_protection_orders(
+                "BTCUSDT", "BUY", _dca_single_tp_plan()
+            )
+
+        place_sl.assert_called_once()
+        self.assertEqual(dca_order, {"algoId": 9})
+
+    def test_supersedes_dca_resting_order_enabled_when_both_are_on(self):
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True), \
+             patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": 9}), \
+             patch.object(exchange, "place_limit_order") as limit_order:
+            execution.place_dca_protection_orders("BTCUSDT", "BUY", _dca_plan())
+
+        limit_order.assert_not_called()
+
+    def test_disabled_leaves_the_legacy_resting_order_path_untouched(self):
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False), \
+             patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}), \
+             patch.object(exchange, "place_limit_order", return_value={"orderId": 9}) as limit_order, \
+             patch.object(exchange, "place_stop_loss") as place_sl:
+            _, _, _, dca_order = execution.place_dca_protection_orders(
+                "BTCUSDT", "BUY", _dca_plan()
+            )
+
+        limit_order.assert_called_once()
+        place_sl.assert_not_called()
+        self.assertEqual(dca_order, {"orderId": 9})
+
+    def test_placement_failure_is_best_effort_not_raised(self):
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}), \
+             patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")):
+            tp1_order, tp2_order, tp_order, dca_order = execution.place_dca_protection_orders(
+                "BTCUSDT", "BUY", _dca_plan()
+            )
+
+        self.assertEqual(tp1_order, {"algoId": 3})
+        self.assertEqual(tp2_order, {"algoId": 4})
+        self.assertIsNone(dca_order)
+
+
 if __name__ == "__main__":
     unittest.main()

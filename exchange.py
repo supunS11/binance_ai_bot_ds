@@ -1733,6 +1733,38 @@ def get_long_short_ratio(symbol):
         return None
 
 
+def get_taker_longshort_ratio(symbol):
+    """Binance's own aggregated taker buy/sell VOLUME ratio for one
+    symbol - real executed order flow, distinct from get_long_short_
+    ratio above (account/position count, not volume) and from this
+    bot's own local CVD calculation (aggTrade-derived, a different real
+    data source). config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED (see
+    that flag's own config.py comment for the real evidence). No bulk
+    "every symbol" version of this endpoint exists either, so this is
+    on-demand only, same constraint as get_long_short_ratio. Returns
+    None (not 0.0) when unavailable - a real ratio of exactly 0 doesn't
+    happen."""
+    try:
+        data = _public_rest_call(
+            f"futures_taker_longshort_ratio:{symbol}",
+            client.futures_taker_longshort_ratio,
+            symbol=symbol,
+            period="1h",
+            limit=1,
+            weight=1,
+        )
+
+        if not data:
+            return None
+
+        value = data[-1].get("buySellRatio")
+        return float(value) if value is not None else None
+
+    except Exception as exc:
+        log_warning(f"{symbol} taker long/short ratio fetch error: {exc}")
+        return None
+
+
 # =========================
 # HISTORICAL DATA (BACKTESTING ONLY) - not called anywhere in the live
 # trading loop. Unlike get_klines/get_24h_quote_volumes/get_funding_rates

@@ -434,7 +434,16 @@ class PositionManager:
         placement failed - see execution.place_dca_protection_orders).
         poll_live's DCA_PENDING branch uses its presence to decide
         whether to poll real order status (exchange.get_order_status)
-        instead of the candle-range check for this specific position."""
+        instead of the candle-range check for this specific position.
+
+        config.DCA_PROTECTIVE_FIRST_ENABLED - dca_protective_sl_order_id
+        is the resting protective STOP_MARKET's id instead (None under
+        the same conditions as dca_order_id above, plus whenever this
+        flag is off) - a deliberately SEPARATE field from dca_order_id
+        rather than reusing it, so the two mutually-exclusive mechanisms
+        (see execution._place_dca_resting_or_protective_order) can never
+        be confused with each other during rollout. Only one of the two
+        fields is ever non-None for a given position."""
         symbol = plan["symbol"]
         shadow = execution_result.get("shadow", True)
         entry_price, breakeven_price, risk_distance = _resolve_real_entry(
@@ -475,8 +484,13 @@ class PositionManager:
             ),
             "dca_order_id": (
                 exchange._accepted_order_id(execution_result.get("dca_order"))
-                if not shadow else None
+                if not shadow and not config.DCA_PROTECTIVE_FIRST_ENABLED else None
             ),
+            "dca_protective_sl_order_id": (
+                exchange._accepted_order_id(execution_result.get("dca_order"))
+                if not shadow and config.DCA_PROTECTIVE_FIRST_ENABLED else None
+            ),
+            "dca_protective_stop_hit": None,
             "stage": DCA_PENDING,
             "shadow": shadow,
             "opened_at": time.time(),
@@ -1119,6 +1133,139 @@ class PositionManager:
         }
 
     @staticmethod
+    def _recover_dca_protective_pending_position(
+        symbol, side, entry_price, quantity, sl_order, tp1_order, tp2_order,
+        saved_trade_id=None,
+    ):
+        """config.DCA_PROTECTIVE_FIRST_ENABLED equivalent of
+        _recover_dca_pending_position above - a real position with a
+        clientAlgoId-tagged (execution.DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_
+        PREFIX) protective STOP_MARKET plus TP1+TP2 resting is unambiguous:
+        no other stage in this codebase produces that exact shape. Unlike
+        the legacy no-SL recovery above, dca_price doesn't need to be
+        recomputed from current structure/ATR - it's read directly off
+        the real, already-resting SL order's own trigger price, the same
+        ground-truth-over-recomputation preference _recover_dca_active_
+        position already uses for sl_price/tp_price. dca_quantity still
+        needs a fresh value (nothing rests for it pre-escalation) - same
+        DCA_SIZE_MULTIPLIER computation the legacy path uses, since
+        escalation always fires at full size regardless of how a
+        position was recovered."""
+        dca_price = _safe_float(sl_order.get("triggerPrice") or sl_order.get("stopPrice"))
+
+        if dca_price is None or dca_price <= 0:
+            return None
+
+        def _trigger_price(order):
+            return _safe_float(order.get("triggerPrice") or order.get("stopPrice"))
+
+        tp1_quantity = _safe_float(tp1_order.get("quantity") or tp1_order.get("origQty"))
+        if tp1_quantity is None:
+            tp1_quantity = round(quantity * min(max(float(config.TP1_CLOSE_PCT), 0), 100) / 100, 8)
+        tp2_quantity = max(round(quantity - tp1_quantity, 8), 0)
+
+        return {
+            "symbol": symbol,
+            "trade_id": saved_trade_id or f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "side": side,
+            "entry_price": entry_price,
+            "sl_price": risk_manager._apply_min_stop_distance(entry_price, entry_price, side),
+            "tp1_price": _trigger_price(tp1_order),
+            "tp2_price": _trigger_price(tp2_order),
+            "tp_price": None,
+            "single_tp": False,
+            "breakeven_price": risk_manager.compute_breakeven_price(entry_price, side),
+            "quantity": quantity,
+            "tp1_quantity": tp1_quantity,
+            "tp2_quantity": tp2_quantity,
+            "sl_order_id": None,
+            "tp1_order_id": exchange._accepted_order_id(tp1_order),
+            "tp2_order_id": exchange._accepted_order_id(tp2_order),
+            "tp_order_id": None,
+            "dca_order_id": None,
+            "dca_protective_sl_order_id": exchange._accepted_order_id(sl_order),
+            "dca_protective_stop_hit": None,
+            "stage": DCA_PENDING,
+            "shadow": False,
+            "opened_at": time.time(),
+            "early_breakeven_applied": False,
+            "early_breakeven_profit_locked": False,
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
+            "profit_protection_peak_price": None,
+            "trailing_stop_locked_profit": False,
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
+            "risk_distance": None,
+            "structure_level": None,
+            "trigger_candle_open_time": None,
+            "break_confirmed_by_close": None,
+            "dca_price": dca_price,
+            "dca_quantity": round(quantity * max(float(config.DCA_SIZE_MULTIPLIER), 0), 8),
+            "dca_applied": False,
+            "atr": None,
+        }
+
+    @staticmethod
+    def _recover_dca_protective_pending_single_tp_position(
+        symbol, side, entry_price, quantity, sl_order, tp_order,
+        saved_trade_id=None,
+    ):
+        """Single-TP (config.TP_STATIC_ROI_ENABLED) sibling of
+        _recover_dca_protective_pending_position above - same real-SL-
+        trigger-price-over-recomputation approach, single-TP position
+        shape instead of TP1+TP2."""
+        dca_price = _safe_float(sl_order.get("triggerPrice") or sl_order.get("stopPrice"))
+
+        if dca_price is None or dca_price <= 0:
+            return None
+
+        def _trigger_price(order):
+            return _safe_float(order.get("triggerPrice") or order.get("stopPrice"))
+
+        return {
+            "symbol": symbol,
+            "trade_id": saved_trade_id or f"{symbol}_RECOVERED_{int(time.time() * 1000)}",
+            "side": side,
+            "entry_price": entry_price,
+            "sl_price": risk_manager._apply_min_stop_distance(entry_price, entry_price, side),
+            "tp1_price": None,
+            "tp2_price": None,
+            "tp_price": _trigger_price(tp_order),
+            "single_tp": True,
+            "breakeven_price": risk_manager.compute_breakeven_price(entry_price, side),
+            "quantity": quantity,
+            "tp1_quantity": None,
+            "tp2_quantity": None,
+            "sl_order_id": None,
+            "tp1_order_id": None,
+            "tp2_order_id": None,
+            "tp_order_id": exchange._accepted_order_id(tp_order),
+            "dca_order_id": None,
+            "dca_protective_sl_order_id": exchange._accepted_order_id(sl_order),
+            "dca_protective_stop_hit": None,
+            "stage": DCA_PENDING,
+            "shadow": False,
+            "opened_at": time.time(),
+            "early_breakeven_applied": False,
+            "early_breakeven_profit_locked": False,
+            "profit_protection_applied": False,
+            "profit_protection_profit_locked": False,
+            "profit_protection_peak_price": None,
+            "trailing_stop_locked_profit": False,
+            "mae_price": entry_price,
+            "mfe_price": entry_price,
+            "risk_distance": None,
+            "structure_level": None,
+            "trigger_candle_open_time": None,
+            "break_confirmed_by_close": None,
+            "dca_price": dca_price,
+            "dca_quantity": round(quantity * max(float(config.DCA_SIZE_MULTIPLIER), 0), 8),
+            "dca_applied": False,
+            "atr": None,
+        }
+
+    @staticmethod
     def _recover_dca_active_position(
         symbol, side, entry_price, quantity, sl_order, tp_order,
         saved_trade_id=None,
@@ -1245,6 +1392,44 @@ class PositionManager:
                     f"{symbol} adopted existing open position | side={side} "
                     f"entry={entry_price} sl={recovered['sl_price']} "
                     f"tp={recovered['tp_price']} stage=DCA_ACTIVE"
+                )
+                return
+
+        # config.DCA_PROTECTIVE_FIRST_ENABLED - checked before the
+        # sl_price-is-None branches below, since a protective-first
+        # DCA_PENDING position now HAS a real SL-shaped order resting
+        # (the whole point of this mechanism) - without this check first,
+        # sl_price would read non-None and the position would silently
+        # fall through into the ordinary post-TP1 recovery path further
+        # down, losing its dca_price/pending semantics entirely. Same
+        # clientAlgoId-tag disambiguation as the DCA_ACTIVE check above,
+        # different prefix (execution.DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_
+        # PREFIX, not _DCA_SL_CLIENT_ALGO_ID_PREFIX - a protective-first
+        # SL was never through _execute_dca, so it's never tagged with
+        # that one).
+        if sl_order and str(sl_order.get("clientAlgoId") or "").startswith(
+            execution.DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_PREFIX
+        ):
+            if tp1_order and tp2_order:
+                recovered = self._recover_dca_protective_pending_position(
+                    symbol, side, entry_price, quantity, sl_order, tp1_order, tp2_order,
+                    saved_trade_id=saved_trade_id,
+                )
+            elif not tp1_order and tp2_order:
+                recovered = self._recover_dca_protective_pending_single_tp_position(
+                    symbol, side, entry_price, quantity, sl_order, tp2_order,
+                    saved_trade_id=saved_trade_id,
+                )
+            else:
+                recovered = None
+
+            if recovered is not None:
+                self.positions[symbol] = recovered
+                log_info(
+                    f"{symbol} adopted existing open position | side={side} "
+                    f"entry={entry_price} stage=DCA_PENDING (protective stop "
+                    f"@{recovered['dca_price']}) tp1={recovered['tp1_price']} "
+                    f"tp2={recovered['tp2_price']} tp={recovered['tp_price']}"
                 )
                 return
 
@@ -1434,6 +1619,7 @@ class PositionManager:
                 dca_applied=position.get("dca_applied", False),
                 dca_breakeven_direction_confirmed=position.get("dca_breakeven_direction_confirmed"),
                 dca_pressure_confirmed=position.get("dca_pressure_confirmed"),
+                dca_protective_stop_hit=position.get("dca_protective_stop_hit"),
             )
 
         return outcome
@@ -2039,9 +2225,160 @@ class PositionManager:
 
         return True, outcome
 
+    def _poll_dca_protective_stop(self, position):
+        """config.DCA_PROTECTIVE_FIRST_ENABLED - polls the resting
+        protective STOP_MARKET's real status. An algo order (unlike
+        _poll_dca_resting_order's plain LIMIT order), so exchange.
+        get_algo_order_status is the right primitive.
+
+        Returns (fired, outcome): `fired` is False when nothing has
+        changed yet (still resting, or a transient lookup failure -
+        get_algo_order_status's own docstring covers status meanings).
+        `fired` is True once the stop has genuinely triggered - the
+        position is closed via self._close(symbol, "DCA_PROTECTIVE_
+        SL_HIT") exactly like every other SL-hit close in this file,
+        after sweeping whatever TP1/TP2 (or single TP) is still resting
+        (now irrelevant - the position is gone)."""
+        symbol = position["symbol"]
+        order_id = position["dca_protective_sl_order_id"]
+        status = exchange.get_algo_order_status(symbol, order_id)
+
+        if status == "FINISHED":
+            exchange.cancel_all_open_orders(symbol)
+            position["dca_protective_stop_hit"] = True
+            return True, self._close(symbol, "DCA_PROTECTIVE_SL_HIT")
+
+        if status in ("CANCELED", "EXPIRED", "REJECTED", "NOT_FOUND"):
+            # Gone without ever firing - either _try_dca_protective_
+            # escalation's own cancel (in which case dca_applied is
+            # already True and this branch is moot - see poll_live's own
+            # ordering), or an external cancel/expiry. Clear the id so
+            # _ensure_protection_orders' self-heal re-places it on the
+            # very next poll rather than leaving the position silently
+            # unprotected forever - same ground-truth self-heal
+            # discipline _poll_dca_resting_order already established for
+            # the legacy mechanism.
+            log_warning(
+                f"{symbol} DCA protective stop {order_id} is gone "
+                f"(status={status}) but was still tracked - clearing "
+                f"dca_protective_sl_order_id so it gets re-placed next poll"
+            )
+            position["dca_protective_sl_order_id"] = None
+
+        return False, None
+
+    def _try_dca_protective_escalation(
+        self, position, candles=None, htf_candles=None, cvd_snapshot=None,
+        current_price=None, crash_snapshot=None,
+    ):
+        """config.DCA_PROTECTIVE_ESCALATION_ENABLED - the real-time "last
+        look", only ever called once price has actually reached
+        position["dca_price"] (caller's responsibility, via
+        _dca_price_reached_in_range). Runs the same pressure check
+        _execute_dca's own config.DCA_PRESSURE_CHECK_ENABLED branch
+        would, but BEFORE any quantity is added rather than after - not
+        confirmed means the resting protective stop simply stays armed
+        and nothing else happens (the trade resolves via that stop,
+        exactly as if escalation didn't exist). Confirmed means order
+        flow genuinely still favors the original thesis, so this cancels
+        the protective stop and fires a real, full-size DCA add via
+        _execute_dca(pressure_confirmed_override=True) - inheriting that
+        function's entire existing tail (build_dca_plan at full size,
+        TP1/TP2 cancel, new TP+SL placement, and critically the atomic
+        "SL placement failed -> market-close" safety net) completely
+        unmodified.
+
+        Ground-truth position check first (exchange._fetch_open_position_
+        detail, same primitive _replace_sl_order already trusts for this
+        exact class of race) - the resting protective stop may have
+        already fired between this poll tick starting and now. Returns
+        None when nothing closed this call (protective stop stays
+        resting, or a transient check failure - retry next poll either
+        way); a close-outcome string otherwise."""
+        symbol = position["symbol"]
+        confirmed, detail = self._dca_pressure_check(
+            position, htf_candles, candles, cvd_snapshot, current_price, crash_snapshot,
+        )
+        position["dca_pressure_confirmed"] = confirmed
+
+        if not confirmed:
+            log_info(
+                f"{symbol} DCA protective stop remains armed - escalation "
+                f"declined | {detail}"
+            )
+            return None
+
+        try:
+            live_position = exchange._fetch_open_position_detail(symbol)
+        except Exception as exc:
+            log_warning(f"{symbol} DCA escalation position check failed, retrying next poll: {exc}")
+            return None
+
+        if live_position is None:
+            exchange.cancel_all_open_orders(symbol)
+            position["dca_protective_stop_hit"] = True
+            return self._close(symbol, "DCA_PROTECTIVE_SL_HIT")
+
+        try:
+            existing = self._find_open_order(symbol, "STOP_MARKET", close_position=True)
+
+            if existing:
+                exchange.cancel_algo_order(symbol, exchange._accepted_order_id(existing))
+            elif position.get("dca_protective_sl_order_id"):
+                exchange.cancel_algo_order(symbol, position["dca_protective_sl_order_id"])
+        except Exception as exc:
+            log_warning(f"{symbol} DCA protective stop cancel failed (continuing): {exc}")
+
+        position["dca_protective_sl_order_id"] = None
+
+        return self._execute_dca(
+            position, candles=candles, htf_candles=htf_candles,
+            cvd_snapshot=cvd_snapshot, current_price=current_price,
+            crash_snapshot=crash_snapshot, pressure_confirmed_override=True,
+        )
+
+    def _dca_pressure_check(
+        self, position, htf_candles, candles, cvd_snapshot, current_price, crash_snapshot,
+    ):
+        """Shared by _execute_dca's own config.DCA_PRESSURE_CHECK_ENABLED
+        branch and _try_dca_protective_escalation's real-time "last
+        look" - same signal_engine.direction_still_confirmed call plus
+        config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED forcing,
+        factored out so both paths can never drift apart. Side-effect-
+        free (does not touch `position`). Returns (confirmed, detail) -
+        confirmed is direction_still_confirmed's own bool/None (None
+        when the underlying data isn't available), detail is the
+        diagnostic dict for logging."""
+        side = position["side"]
+        confirmed, detail = signal_engine.direction_still_confirmed(
+            side, htf_candles, candles, cvd_snapshot, current_price
+        )
+
+        crash_snapshot_ = crash_snapshot or {}
+        crash_forced = (
+            config.CRASH_DETECTOR_ENABLED
+            and config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED
+            and crash_snapshot_.get("active")
+            and (
+                (side == "BUY" and crash_snapshot_.get("direction") == "BEARISH")
+                or (side == "SELL" and crash_snapshot_.get("direction") == "BULLISH")
+            )
+        )
+
+        if crash_forced and confirmed:
+            confirmed = False
+            detail = {
+                **(detail or {}),
+                "crash_detector_forced": True,
+                "crash_direction": crash_snapshot_.get("direction"),
+                "crash_move_pct": crash_snapshot_.get("pct_move"),
+            }
+
+        return confirmed, detail
+
     def _execute_dca(
         self, position, candles=None, htf_candles=None, cvd_snapshot=None, current_price=None,
-        crash_snapshot=None, resting_fill=None,
+        crash_snapshot=None, resting_fill=None, pressure_confirmed_override=None,
     ):
         """config.DCA_ENABLED - price reached position["dca_price"]
         before TP1 ever filled. Adds position["dca_quantity"] at that
@@ -2096,7 +2433,20 @@ class PositionManager:
         DCA_ACTIVE transition) is unchanged - this is exactly why the
         fill is threaded through as a parameter rather than duplicating
         the function: the "SL must be atomic" safety discipline below is
-        inherited for free either way."""
+        inherited for free either way.
+
+        config.DCA_PROTECTIVE_FIRST_ENABLED - `pressure_confirmed_
+        override` (optional bool) is given by _try_dca_protective_
+        escalation once its own real-time pressure check already read
+        True - skips the internal direction_still_confirmed recompute
+        entirely and uses this value directly instead (escalation only
+        ever calls with True, so this always takes the full DCA_SIZE_
+        MULTIPLIER/DCA_STRUCTURE_STOP_ATR_BUFFER branch below, same as an
+        ordinary confirmed DCA_PRESSURE_CHECK_ENABLED fire). Every
+        existing call site passes nothing, preserving current behavior
+        exactly - same "thread the decision through as a parameter,
+        inherit the safety discipline for free" reasoning as
+        `resting_fill` above."""
         symbol = position["symbol"]
         side = position["side"]
         shadow = position["shadow"]
@@ -2110,30 +2460,18 @@ class PositionManager:
             dca_quantity = resting_fill["quantity"]
             dca_fill_price = resting_fill["price"]
             buffer_atr_multiple = max(float(config.DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER), 0)
+        elif pressure_confirmed_override is not None:
+            # Already checked in real time by _try_dca_protective_
+            # escalation immediately before calling here - always True in
+            # practice (escalation declines and never calls this function
+            # at all when its own check reads False), so this always
+            # takes the full-size/normal-buffer path below, same as an
+            # ordinary confirmed DCA_PRESSURE_CHECK_ENABLED fire.
+            pressure_confirmed = pressure_confirmed_override
         elif config.DCA_PRESSURE_CHECK_ENABLED:
-            pressure_confirmed, pressure_detail = signal_engine.direction_still_confirmed(
-                side, htf_candles, candles, cvd_snapshot, current_price
+            pressure_confirmed, pressure_detail = self._dca_pressure_check(
+                position, htf_candles, candles, cvd_snapshot, current_price, crash_snapshot,
             )
-
-            crash_snapshot_ = crash_snapshot or {}
-            crash_forced = (
-                config.CRASH_DETECTOR_ENABLED
-                and config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED
-                and crash_snapshot_.get("active")
-                and (
-                    (side == "BUY" and crash_snapshot_.get("direction") == "BEARISH")
-                    or (side == "SELL" and crash_snapshot_.get("direction") == "BULLISH")
-                )
-            )
-
-            if crash_forced and pressure_confirmed:
-                pressure_confirmed = False
-                pressure_detail = {
-                    **(pressure_detail or {}),
-                    "crash_detector_forced": True,
-                    "crash_direction": crash_snapshot_.get("direction"),
-                    "crash_move_pct": crash_snapshot_.get("pct_move"),
-                }
 
             if not pressure_confirmed:
                 dca_quantity = round(
@@ -2797,7 +3135,31 @@ class PositionManager:
             # time sample) - see _dca_price_reached_in_range's own
             # docstring for the real gap that closes.
             if dca_candidate:
-                if config.DCA_RESTING_ORDER_ENABLED and position.get("dca_order_id"):
+                # config.DCA_PROTECTIVE_FIRST_ENABLED - a protective-first
+                # position has a real resting stop, not a resting add-in
+                # order, so it's checked first and separately: poll the
+                # stop's own status, and only if config.
+                # DCA_PROTECTIVE_ESCALATION_ENABLED is also on AND price
+                # has actually reached dca_price, run the real-time
+                # pressure check to decide whether to escalate. See
+                # config.DCA_PROTECTIVE_FIRST_ENABLED's own comment for
+                # the full rationale.
+                if config.DCA_PROTECTIVE_FIRST_ENABLED and position.get("dca_protective_sl_order_id"):
+                    fired, outcome = self._poll_dca_protective_stop(position)
+                    if fired:
+                        return outcome
+                    if (
+                        config.DCA_PROTECTIVE_ESCALATION_ENABLED
+                        and self._dca_price_reached_in_range(position, candles)
+                    ):
+                        outcome = self._try_dca_protective_escalation(
+                            position, candles=candles, htf_candles=htf_candles,
+                            cvd_snapshot=cvd_snapshot, current_price=current_price,
+                            crash_snapshot=crash_snapshot,
+                        )
+                        if outcome is not None or position.get("dca_applied"):
+                            return outcome
+                elif config.DCA_RESTING_ORDER_ENABLED and position.get("dca_order_id"):
                     fired, outcome = self._poll_dca_resting_order(
                         position, candles=candles, htf_candles=htf_candles,
                         cvd_snapshot=cvd_snapshot, current_price=current_price,
@@ -3179,6 +3541,51 @@ class PositionManager:
 
             return None
 
+        if (
+            position["stage"] == DCA_PENDING
+            and config.DCA_PROTECTIVE_FIRST_ENABLED
+            and not position.get("dca_applied")
+        ):
+            # config.DCA_PROTECTIVE_FIRST_ENABLED - genuine self-heal
+            # (unlike execution._place_dca_resting_order, which has no
+            # retry at all if its one placement attempt fails) plus the
+            # migration path for a position that entered DCA_PENDING
+            # before this flag was turned on: an old-style dca_order_id
+            # add-in LIMIT order, if still resting, gets actively
+            # cancelled here rather than left to fill unexpectedly once
+            # protective-first is supposed to be in charge. Does not
+            # return early - falls through into the ordinary TP self-heal
+            # below exactly as today, single_tp or not.
+            if position.get("dca_order_id"):
+                try:
+                    exchange.cancel_order(symbol, position["dca_order_id"])
+                    log_info(f"{symbol} stale pre-migration DCA add-in order cancelled")
+                except Exception as exc:
+                    log_warning(f"{symbol} stale DCA add-in order cancel failed: {exc}")
+                position["dca_order_id"] = None
+
+            if not position.get("dca_protective_sl_order_id"):
+                existing = self._find_open_order(symbol, "STOP_MARKET", close_position=True)
+
+                if existing:
+                    position["dca_protective_sl_order_id"] = exchange._accepted_order_id(existing)
+                    log_info(f"{symbol} DCA protective stop tracking re-synced from exchange")
+                else:
+                    try:
+                        order = exchange.place_stop_loss(
+                            symbol, side, position["dca_price"],
+                            client_algo_id=(
+                                f"{execution.DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_PREFIX}"
+                                f"{int(time.time() * 1000)}"
+                            ),
+                        )
+                        position["dca_protective_sl_order_id"] = exchange._accepted_order_id(order)
+
+                        if position["dca_protective_sl_order_id"]:
+                            log_info(f"{symbol} DCA protective stop recovered")
+                    except Exception as exc:
+                        log_warning(f"{symbol} DCA protective stop recovery attempt failed: {exc}")
+
         if position["stage"] == DCA_PENDING and position.get("single_tp"):
             # config.TP_STATIC_ROI_ENABLED - same single-TP self-heal
             # shape as DCA_ACTIVE above, just for the pre-DCA stage. No
@@ -3502,6 +3909,31 @@ class PositionManager:
                 touched_dca = low <= dca_price if side == "BUY" else high >= dca_price
 
                 if touched_dca:
+                    # config.DCA_PROTECTIVE_FIRST_ENABLED - shadow has no
+                    # real resting orders, so there's nothing to poll; the
+                    # touch itself IS the protective-stop-fires moment,
+                    # unless escalation is on and the real-time pressure
+                    # check reads confirmed. Same "adverse-touch wins the
+                    # within-candle ambiguity" bias this function's own
+                    # docstring already states, applied consistently here.
+                    if config.DCA_PROTECTIVE_FIRST_ENABLED:
+                        if config.DCA_PROTECTIVE_ESCALATION_ENABLED:
+                            confirmed, detail = self._dca_pressure_check(
+                                position, htf_candles, candles, cvd_snapshot,
+                                latest_candle["close"], crash_snapshot,
+                            )
+                            position["dca_pressure_confirmed"] = confirmed
+
+                            if confirmed:
+                                return self._execute_dca(
+                                    position, candles=candles, htf_candles=htf_candles,
+                                    cvd_snapshot=cvd_snapshot, current_price=latest_candle["close"],
+                                    crash_snapshot=crash_snapshot, pressure_confirmed_override=True,
+                                )
+
+                        position["dca_protective_stop_hit"] = True
+                        return self._close(symbol, "SHADOW_DCA_PROTECTIVE_SL_HIT")
+
                     return self._execute_dca(
                         position, candles=candles, htf_candles=htf_candles,
                         cvd_snapshot=cvd_snapshot, current_price=latest_candle["close"],

@@ -675,6 +675,87 @@ class ReconcileOnStartupTests(unittest.TestCase):
         place_sl.assert_called_once()
         self.assertEqual(position["sl_order_id"], "emergency_sl")
 
+    # config.DCA_PROTECTIVE_FIRST_ENABLED - a real, tagged protective SL
+    # plus TP1+TP2 (or a single TP) is unambiguous, same tag-based
+    # disambiguation as the DCA_ACTIVE dcaSL/dcaTP check above (no
+    # config.DCA_ENABLED gate needed here either - the tag alone proves
+    # what this is, nothing else in this codebase produces it). Unlike
+    # the legacy no-SL recovery tests above, no feed/candles are needed:
+    # dca_price comes straight from the real resting order's own trigger
+    # price, never recomputed.
+
+    def _protective_dca_pending_open_orders(self, sl_tag="dcaProtSL1787000000000"):
+        return [
+            {
+                "type": "STOP_MARKET", "closePosition": "true",
+                "triggerPrice": "96", "algoId": "prot_sl_real", "clientAlgoId": sl_tag,
+            },
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "false", "triggerPrice": "102", "origQty": "0.8", "algoId": "tp1_1"},
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "104", "algoId": "tp2_1"},
+        ]
+
+    def test_protective_dca_pending_shape_with_the_tag_is_recovered_as_dca_pending(self):
+        manager = PositionManager()
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=self._protective_dca_pending_open_orders()):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        self.assertEqual(position["dca_price"], 96.0)  # read from the real SL, not recomputed
+        self.assertEqual(position["dca_protective_sl_order_id"], "prot_sl_real")
+        self.assertIsNone(position["dca_order_id"])
+        self.assertIsNone(position["sl_order_id"])  # reference-only, no real SL order tracked here
+        self.assertEqual(position["tp1_price"], 102.0)
+        self.assertEqual(position["tp2_price"], 104.0)
+        self.assertEqual(position["tp1_order_id"], "tp1_1")
+        self.assertEqual(position["tp2_order_id"], "tp2_1")
+        self.assertFalse(position["single_tp"])
+        self.assertFalse(position["dca_applied"])
+        self.assertIsNone(position["dca_protective_stop_hit"])
+
+    def test_protective_dca_pending_single_tp_shape_is_recovered_as_dca_pending(self):
+        manager = PositionManager()
+        orders = [
+            {
+                "type": "STOP_MARKET", "closePosition": "true",
+                "triggerPrice": "96", "algoId": "prot_sl_real", "clientAlgoId": "dcaProtSL1787000000000",
+            },
+            {"type": "TAKE_PROFIT_MARKET", "closePosition": "true", "triggerPrice": "106", "algoId": "tp_solo"},
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)
+        self.assertTrue(position["single_tp"])
+        self.assertEqual(position["dca_price"], 96.0)
+        self.assertEqual(position["dca_protective_sl_order_id"], "prot_sl_real")
+        self.assertEqual(position["tp_price"], 106.0)
+        self.assertEqual(position["tp_order_id"], "tp_solo")
+
+    def test_protective_tag_without_matching_tp_shape_falls_through(self):
+        # A protective-tagged SL with only ONE side of TP1/TP2 (neither
+        # dual nor single-TP shape) shouldn't happen in practice, but
+        # must not crash - falls through to the generic emergency-stop
+        # adoption path rather than being force-fit into either recovery.
+        manager = PositionManager()
+        orders = [
+            {
+                "type": "STOP_MARKET", "closePosition": "true",
+                "triggerPrice": "96", "algoId": "prot_sl_real", "clientAlgoId": "dcaProtSL1787000000000",
+            },
+        ]
+
+        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=100.0)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()  # must not raise
+
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+
     def _dca_active_open_orders(self, sl_tag="dcaSL1787000000000", tp_tag="dcaTP1787000000000"):
         # Same shape a genuine post-DCA position always has: one real
         # full-position SL, one real full-position TP, no partial TP -
@@ -5215,6 +5296,41 @@ class RegisterDcaPendingTests(unittest.TestCase):
 
         self.assertFalse(position["dca_order_id"])
 
+    # config.DCA_PROTECTIVE_FIRST_ENABLED - dca_protective_sl_order_id is
+    # a SEPARATE field from dca_order_id above, populated from the same
+    # execution_result["dca_order"] key but only when this flag is on -
+    # the two mechanisms are mutually exclusive per position.
+
+    def test_protective_first_stores_dca_protective_sl_order_id(self):
+        manager = PositionManager()
+        execution_result = {"shadow": False, "dca_order": {"algoId": 777}}
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True):
+            position = manager.register_dca_pending(_dca_plan(), execution_result)
+
+        self.assertEqual(position["dca_protective_sl_order_id"], 777)
+        self.assertFalse(position["dca_order_id"])
+        self.assertIsNone(position["dca_protective_stop_hit"])
+
+    def test_protective_first_off_leaves_protective_field_empty(self):
+        manager = PositionManager()
+        execution_result = {"shadow": False, "dca_order": {"orderId": 555}}
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False):
+            position = manager.register_dca_pending(_dca_plan(), execution_result)
+
+        self.assertEqual(position["dca_order_id"], 555)
+        self.assertFalse(position["dca_protective_sl_order_id"])
+
+    def test_protective_first_shadow_registration_order_id_is_none(self):
+        manager = PositionManager()
+        execution_result = {"shadow": True, "dca_order": {"algoId": 777}}
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True):
+            position = manager.register_dca_pending(_dca_plan(), execution_result)
+
+        self.assertIsNone(position["dca_protective_sl_order_id"])
+
     def test_atr_is_carried_from_the_plan(self):
         manager = PositionManager()
         position = manager.register_dca_pending(dict(_dca_plan(), atr=2.5), {"shadow": True})
@@ -5716,6 +5832,27 @@ class ExecuteDcaPressureCheckTests(unittest.TestCase):
             100, 1.0, 96, 1.0, "BUY", None, atr=1.0, buffer_atr_multiple=None,
         )
 
+    # config.DCA_PROTECTIVE_FIRST_ENABLED - pressure_confirmed_override,
+    # given by _try_dca_protective_escalation once its own real-time
+    # check already ran, skips the internal recompute entirely (even
+    # when DCA_PRESSURE_CHECK_ENABLED is also True) and always takes the
+    # full-size/normal-buffer branch, same as an ordinary confirmed fire.
+
+    def test_override_skips_the_internal_confirmation_recompute(self):
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "DCA_PRESSURE_CHECK_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed") as confirmed_check, \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            manager._execute_dca(position, pressure_confirmed_override=True)
+
+        confirmed_check.assert_not_called()
+        self.assertTrue(position["dca_pressure_confirmed"])
+        build_plan.assert_called_once_with(
+            100, 1.0, 96, 1.0, "BUY", None, atr=1.0, buffer_atr_multiple=None,
+        )
+
     def test_confirmed_keeps_the_full_size_and_normal_buffer(self):
         manager = self._manager_with_dca_pending()
         position = manager.positions["BTCUSDT"]
@@ -5942,6 +6079,57 @@ class PollShadowDcaPendingTests(unittest.TestCase):
 
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+
+    # config.DCA_PROTECTIVE_FIRST_ENABLED - shadow has no real resting
+    # orders, so the touch itself IS the protective-stop-fires moment,
+    # unless escalation is on and the real-time pressure check confirms.
+
+    def test_protective_first_touch_closes_as_shadow_protective_sl_hit(self):
+        manager = self._manager_with_dca_pending()
+        candle = _candle(high=100, low=95)  # touches dca_price=96
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertEqual(outcome, "SHADOW_DCA_PROTECTIVE_SL_HIT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_protective_first_escalation_off_never_calls_the_confirmation_check(self):
+        manager = self._manager_with_dca_pending()
+        candle = _candle(high=100, low=95)
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True), \
+             patch.object(config, "DCA_PROTECTIVE_ESCALATION_ENABLED", False), \
+             patch.object(signal_engine, "direction_still_confirmed") as confirmed_check:
+            manager.poll_shadow("BTCUSDT", candle)
+
+        confirmed_check.assert_not_called()
+
+    def test_protective_first_escalation_confirmed_fires_a_full_size_dca(self):
+        manager = self._manager_with_dca_pending()
+        candle = _candle(high=100, low=95, close=95)
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True), \
+             patch.object(config, "DCA_PROTECTIVE_ESCALATION_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_ACTIVE)
+        self.assertTrue(position["dca_pressure_confirmed"])
+
+    def test_protective_first_escalation_not_confirmed_closes_as_protective_sl_hit(self):
+        manager = self._manager_with_dca_pending()
+        candle = _candle(high=100, low=95, close=95)
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True), \
+             patch.object(config, "DCA_PROTECTIVE_ESCALATION_ENABLED", True), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(False, {})):
+            outcome = manager.poll_shadow("BTCUSDT", candle)
+
+        self.assertEqual(outcome, "SHADOW_DCA_PROTECTIVE_SL_HIT")
 
     def _manager_with_single_tp_dca_pending(self):
         manager = PositionManager()
@@ -6997,6 +7185,316 @@ class PollLiveDcaRestingOrderTests(unittest.TestCase):
         cancel_order.assert_not_called()
         self.assertIsNone(outcome)
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], BREAKEVEN_ACTIVE)
+
+
+class PollLiveDcaProtectiveStopTests(unittest.TestCase):
+    """config.DCA_PROTECTIVE_FIRST_ENABLED - a position with a real
+    resting protective STOP_MARKET polls exchange.get_algo_order_status
+    (an algo order, unlike DCA_RESTING_ORDER_ENABLED's plain LIMIT order)
+    instead of watching candle ranges."""
+
+    def setUp(self):
+        for name, value in (
+            ("MAE_TRACKING_ENABLED", False),
+            ("PROFIT_PROTECTION_ENABLED", False),
+            ("EARLY_BREAKEVEN_ENABLED", False),
+            ("DCA_PRESSURE_CHECK_ENABLED", False),
+            ("DCA_PROTECTIVE_FIRST_ENABLED", True),
+            ("DCA_PROTECTIVE_ESCALATION_ENABLED", False),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _manager_with_protective_stop(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+            "dca_order": {"algoId": "dca_prot_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        return manager
+
+    def test_not_yet_finished_falls_through_to_no_op(self):
+        manager = self._manager_with_protective_stop()
+
+        with patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW") as status:
+            outcome = manager.poll_live("BTCUSDT")
+
+        # get_algo_order_status is also used for TP1/TP2 status further
+        # down this same poll (unlike DCA_RESTING_ORDER_ENABLED's plain-
+        # order get_order_status, no collision there) - any_call, not the
+        # most recent call, is the right assertion here.
+        status.assert_any_call("BTCUSDT", "dca_prot_1")
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+
+    def test_finished_closes_the_position_and_sweeps_tp_orders(self):
+        manager = self._manager_with_protective_stop()
+
+        with patch.object(exchange, "get_mark_price", return_value=93.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="FINISHED"), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "DCA_PROTECTIVE_SL_HIT")
+        cancel_all.assert_called_once_with("BTCUSDT")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_terminal_gone_status_clears_the_id_for_self_heal(self):
+        manager = self._manager_with_protective_stop()
+
+        with patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="CANCELED"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertIsNone(manager.positions["BTCUSDT"]["dca_protective_sl_order_id"])
+
+    def test_unknown_status_stays_tracked(self):
+        # Transient lookup failure - not a real "gone" signal.
+        manager = self._manager_with_protective_stop()
+
+        with patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="UNKNOWN"):
+            manager.poll_live("BTCUSDT")
+
+        self.assertEqual(manager.positions["BTCUSDT"]["dca_protective_sl_order_id"], "dca_prot_1")
+
+
+class DcaProtectiveEscalationTests(unittest.TestCase):
+    """config.DCA_PROTECTIVE_ESCALATION_ENABLED - the real-time "last
+    look" once price has actually reached dca_price: not confirmed
+    leaves the resting protective stop armed and does nothing else;
+    confirmed cancels it and fires a real, full-size DCA add via
+    _execute_dca(pressure_confirmed_override=True)."""
+
+    def setUp(self):
+        for name, value in (
+            ("MAE_TRACKING_ENABLED", False),
+            ("PROFIT_PROTECTION_ENABLED", False),
+            ("EARLY_BREAKEVEN_ENABLED", False),
+            ("DCA_PROTECTIVE_FIRST_ENABLED", True),
+            ("DCA_PROTECTIVE_ESCALATION_ENABLED", True),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _manager_with_protective_stop(self):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"},
+            "tp2_order": {"algoId": "tp2_1"},
+            "dca_order": {"algoId": "dca_prot_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        return manager
+
+    def test_not_confirmed_leaves_the_protective_stop_armed(self):
+        manager = self._manager_with_protective_stop()
+        candles = [{"high": 100.0, "low": 95.0}]  # reaches dca_price=96
+
+        with patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(False, {})), \
+             patch.object(exchange, "_fetch_open_position_detail") as fetch_detail, \
+             patch.object(exchange, "place_market_order") as market_order:
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertIsNone(outcome)
+        fetch_detail.assert_not_called()
+        market_order.assert_not_called()
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+        self.assertEqual(manager.positions["BTCUSDT"]["dca_protective_sl_order_id"], "dca_prot_1")
+        self.assertFalse(manager.positions["BTCUSDT"]["dca_pressure_confirmed"])
+
+    def test_confirmed_and_still_open_escalates_to_a_full_size_dca(self):
+        manager = self._manager_with_protective_stop()
+        candles = [{"high": 100.0, "low": 95.0}]
+
+        with patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value={"quantity": 1.0}), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order") as cancel_algo, \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 1, "avgPrice": "96"}) as market_order, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertIsNone(outcome)
+        cancel_algo.assert_any_call("BTCUSDT", "dca_prot_1")
+        market_order.assert_called_once_with("BTCUSDT", "BUY", 1.0)  # full size, not pressure-reduced
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+        self.assertTrue(manager.positions["BTCUSDT"]["dca_pressure_confirmed"])
+        self.assertIsNone(manager.positions["BTCUSDT"]["dca_protective_sl_order_id"])
+
+    def test_confirmed_but_already_closed_resolves_as_protective_sl_hit(self):
+        # The race _replace_sl_order already defends against, reused here:
+        # the resting protective stop may have already fired between this
+        # poll tick starting and the ground-truth check running.
+        manager = self._manager_with_protective_stop()
+        candles = [{"high": 100.0, "low": 95.0}]
+
+        with patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(exchange, "_fetch_open_position_detail", return_value=None), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
+             patch.object(exchange, "place_market_order") as market_order:
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertEqual(outcome, "DCA_PROTECTIVE_SL_HIT")
+        cancel_all.assert_called_once_with("BTCUSDT")
+        market_order.assert_not_called()
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+
+    def test_ground_truth_check_failure_retries_without_acting(self):
+        manager = self._manager_with_protective_stop()
+        candles = [{"high": 100.0, "low": 95.0}]
+
+        with patch.object(exchange, "get_mark_price", return_value=95.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(signal_engine, "direction_still_confirmed", return_value=(True, {})), \
+             patch.object(exchange, "_fetch_open_position_detail", side_effect=RuntimeError("timeout")), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel_all, \
+             patch.object(exchange, "place_market_order") as market_order:
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertIsNone(outcome)
+        cancel_all.assert_not_called()
+        market_order.assert_not_called()
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_PENDING)
+        self.assertEqual(manager.positions["BTCUSDT"]["dca_protective_sl_order_id"], "dca_prot_1")
+
+    def test_escalation_not_attempted_before_price_reaches_dca_price(self):
+        manager = self._manager_with_protective_stop()
+        candles = [{"high": 100.0, "low": 97.0}]  # dca_price=96, not reached
+
+        with patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "get_algo_order_status", return_value="NEW"), \
+             patch.object(signal_engine, "direction_still_confirmed") as confirmed_check:
+            outcome = manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertIsNone(outcome)
+        confirmed_check.assert_not_called()
+
+
+class EnsureProtectionOrdersDcaProtectiveFirstTests(unittest.TestCase):
+    """config.DCA_PROTECTIVE_FIRST_ENABLED - self-heal for a missing
+    resting protective stop, plus active cleanup of a stale pre-migration
+    dca_order_id add-in order. Runs before (and does not replace) the
+    existing TP1/TP2/single-TP self-heal that follows it."""
+
+    def setUp(self):
+        patcher = patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _manager_with_dca_pending(self, protective_sl_order_id=None, dca_order_id=None):
+        manager = PositionManager()
+        execution_result = {
+            "shadow": False,
+            "tp1_order": {"algoId": "tp1_1"}, "tp2_order": {"algoId": "tp2_1"},
+        }
+        manager.register_dca_pending(_dca_plan(), execution_result)
+        position = manager.positions["BTCUSDT"]
+        position["dca_protective_sl_order_id"] = protective_sl_order_id
+        position["dca_order_id"] = dca_order_id
+        return manager
+
+    def test_missing_protective_stop_is_resynced_from_a_real_exchange_order(self):
+        manager = self._manager_with_dca_pending(protective_sl_order_id=None)
+        real_sl = {"type": "STOP_MARKET", "closePosition": "true", "algoId": "real_prot_sl"}
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[real_sl]), \
+             patch.object(exchange, "place_stop_loss") as place:
+            manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        self.assertEqual(manager.positions["BTCUSDT"]["dca_protective_sl_order_id"], "real_prot_sl")
+        place.assert_not_called()
+
+    def test_missing_protective_stop_with_none_on_exchange_places_a_new_one(self):
+        manager = self._manager_with_dca_pending(protective_sl_order_id=None)
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "prot_sl_recovered"}) as place:
+            manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        self.assertEqual(
+            manager.positions["BTCUSDT"]["dca_protective_sl_order_id"], "prot_sl_recovered",
+        )
+        place.assert_called_once()
+        args, kwargs = place.call_args
+        self.assertEqual(args[:3], ("BTCUSDT", "BUY", 96))  # dca_price from _dca_plan()
+        self.assertTrue(
+            kwargs["client_algo_id"].startswith(execution.DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_PREFIX)
+        )
+
+    def test_present_protective_stop_id_is_a_noop(self):
+        manager = self._manager_with_dca_pending(protective_sl_order_id="already_resting")
+
+        with patch.object(exchange, "get_open_algo_orders") as get_open, \
+             patch.object(exchange, "place_stop_loss") as place:
+            manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        get_open.assert_not_called()
+        place.assert_not_called()
+        self.assertEqual(manager.positions["BTCUSDT"]["dca_protective_sl_order_id"], "already_resting")
+
+    def test_stale_legacy_add_in_order_is_actively_cancelled(self):
+        # Migration case: a position registered before DCA_PROTECTIVE_
+        # FIRST_ENABLED was turned on still has an old-style resting
+        # add-in LIMIT order tracked - must be cancelled, not left to
+        # fill unexpectedly.
+        manager = self._manager_with_dca_pending(
+            protective_sl_order_id="already_resting", dca_order_id="stale_legacy_add_in",
+        )
+
+        with patch.object(exchange, "cancel_order") as cancel_order, \
+             patch.object(exchange, "get_open_algo_orders") as get_open, \
+             patch.object(exchange, "place_stop_loss") as place:
+            manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        cancel_order.assert_called_once_with("BTCUSDT", "stale_legacy_add_in")
+        self.assertIsNone(manager.positions["BTCUSDT"]["dca_order_id"])
+        # A protective stop is already resting - no re-sync/placement needed.
+        get_open.assert_not_called()
+        place.assert_not_called()
+
+    def test_dca_applied_positions_are_left_alone(self):
+        # Once a real add has happened, this is DCA_ACTIVE territory
+        # (handled by a completely separate branch of this same
+        # function) - not reached here regardless of stage bookkeeping.
+        manager = self._manager_with_dca_pending(protective_sl_order_id=None)
+        manager.positions["BTCUSDT"]["dca_applied"] = True
+
+        with patch.object(exchange, "get_open_algo_orders") as get_open, \
+             patch.object(exchange, "place_stop_loss") as place, \
+             patch.object(exchange, "place_take_profit_full"), \
+             patch.object(exchange, "place_take_profit_partial"):
+            manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        place.assert_not_called()
+
+    def test_flag_off_never_touches_the_protective_field(self):
+        manager = self._manager_with_dca_pending(protective_sl_order_id=None)
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False), \
+             patch.object(exchange, "get_open_algo_orders") as get_open, \
+             patch.object(exchange, "place_stop_loss") as place, \
+             patch.object(exchange, "place_take_profit_full"), \
+             patch.object(exchange, "place_take_profit_partial"):
+            manager._ensure_protection_orders(manager.positions["BTCUSDT"])
+
+        place.assert_not_called()
 
 
 class EnsureProtectionOrdersSingleTpDcaPendingTests(unittest.TestCase):

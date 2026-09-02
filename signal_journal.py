@@ -43,7 +43,7 @@ FIELDNAMES = [
     "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
     "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed",
     "dca_pressure_confirmed", "retracement_fill_type", "retracement_fill_lag_seconds",
-    "used_deep_retracement",
+    "used_deep_retracement", "dca_protective_stop_hit",
     "outcome",
 ]
 
@@ -272,6 +272,7 @@ def append_outcome(
     symbol, outcome, trade_id=None, mae_r_multiple=None, mfe_r_multiple=None,
     early_breakeven_applied=None, break_confirmed_by_close=None, dca_applied=None,
     dca_breakeven_direction_confirmed=None, dca_pressure_confirmed=None,
+    dca_protective_stop_hit=None,
 ):
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
@@ -316,5 +317,14 @@ def append_outcome(
     # against confirmed (unchanged) ones once enough of each exist.
     if dca_pressure_confirmed is not None:
         row["dca_pressure_confirmed"] = dca_pressure_confirmed
+
+    # config.DCA_PROTECTIVE_FIRST_ENABLED - did this trade close via the
+    # quantity-neutral protective stop resting at dca_price, without ever
+    # averaging in? None (blank) means the flag was off, or the position
+    # never reached DCA_PENDING's decision point at all. Lets journal_
+    # analysis.py compare this new outcome's realized loss size against
+    # the old dca_applied=True population directly, once enough resolve.
+    if dca_protective_stop_hit is not None:
+        row["dca_protective_stop_hit"] = dca_protective_stop_hit
 
     _append_row(row)

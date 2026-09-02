@@ -969,6 +969,46 @@ OB_FVG_RETEST_PRICE_HOLD_LOOKBACK_MINUTES = env_int("OB_FVG_RETEST_PRICE_HOLD_LO
 MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED = env_bool("MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", "True")
 MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE = env_float("MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE", 0.75)
 MARKET_CHOPPY_OI_REGIME_LOOKBACK_SAMPLES = env_int("MARKET_CHOPPY_OI_REGIME_LOOKBACK_SAMPLES", 120)
+# config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED - 2026-09-02, real
+# evidence (97 resolved CVD_DIVERGENCE SHADOW trades - this trigger is
+# SHADOW_ONLY today, see .env - real Binance futures_taker_longshort_
+# ratio data, period=1h). Sign agreement between the trade's own side and
+# Binance's own aggregated taker BUY/SELL VOLUME ratio: agrees lost 7%
+# (n=43) vs disagrees lost 13% (n=54) - real executed order flow,
+# distinct from both this bot's own local CVD calculation (CVD_DIVERGENCE
+# is itself a CVD-based trigger - this is a second, independent real data
+# source, not a repeat of the same signal) and from the global long/short
+# ACCOUNT ratio LONG_SHORT_FAVORABLE_REJECT_ENABLED already checks (that
+# one's position count, this is volume). The SAME real-population check
+# also tried basis regime and OI percentile (both real signals for OTHER
+# triggers this session - AGAINST_HTF_BIAS/CVD_NOT_CONFIRMED and
+# MARKET_CHOPPY_OI_REGIME respectively) and found NO usable gradient for
+# either against this specific trigger's population - deliberately NOT
+# applied here; a reversal trigger doesn't automatically inherit a
+# trend-following trigger's real findings. Fetched on-demand in main.py
+# (no bulk endpoint exists), same shape as LONG_SHORT_RATIO_ENABLED.
+# Scoped to CVD_DIVERGENCE only - never tested against any other trigger.
+# Reject-only, same "ship on real evidence immediately" precedent as
+# OI_RISING_REJECT_ENABLED.
+CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED = env_bool("CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", "True")
+# config.CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED - 2026-09-02, real
+# evidence (same 97-trade population above, real 1m klines, 78/97
+# resolved with sufficient history - the rest lacked enough real 1m
+# candle history at signal time). Same market_structure.price_hold_
+# consistency measure already shipped for OB_FVG_RETEST_PRICE_WEAK_
+# REJECT_ENABLED, applied to this different trigger with its own
+# threshold/lookback knobs (not assumed to share OB_FVG_RETEST's 0.5
+# cutoff) - real split: <0.4 lost 17% (n=35) vs >=0.4 lost only 7%
+# (n=43). Also tested identically against real volume ROC (recent-vs-
+# prior window) on this same population - came back with no usable
+# gradient (11%/16%/5%/7% across buckets, not monotonic) - NOT applied.
+# On-demand real 1m klines, same shape as OB_FVG_RETEST_PRICE_WEAK_
+# REJECT_ENABLED above. Scoped to CVD_DIVERGENCE only. Reject-only, same
+# "ship on real evidence immediately" precedent as OI_RISING_REJECT_
+# ENABLED.
+CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED = env_bool("CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", "True")
+CVD_DIVERGENCE_MIN_PRICE_HOLD_PCT = env_float("CVD_DIVERGENCE_MIN_PRICE_HOLD_PCT", 0.4)
+CVD_DIVERGENCE_PRICE_HOLD_LOOKBACK_MINUTES = env_int("CVD_DIVERGENCE_PRICE_HOLD_LOOKBACK_MINUTES", 10)
 # Fourth entry trigger: a fresh rejection wick into an UNMITIGATED fair
 # value gap (market_structure.find_fvg_retest) - independent of any live
 # break right now, the classic OB/FVG "retest" entry. Scoped to FVGs only
@@ -1959,6 +1999,60 @@ DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER = env_float("DCA_PRESSURE_TIGHT_STOP_ATR_BUFF
 # DCA_PRESSURE_CHECK_ENABLED itself and every other unvalidated
 # mechanism here.
 DCA_RESTING_ORDER_ENABLED = env_bool("DCA_RESTING_ORDER_ENABLED", "False")
+# config.DCA_PROTECTIVE_FIRST_ENABLED - 2026-09-02, real evidence (38
+# resolved LIVE dca_applied=True trades): 14.3% win rate (5/35) vs 99.3%
+# (147/148) for trades that never needed DCA - DCA is a severe value-
+# destroyer, not a rescue mechanism. Deeper look: dca_pressure_confirmed/
+# dca_breakeven_direction_confirmed (the two "does order flow still
+# confirm the original thesis" checks this bot already computes) have
+# NEVER once been observed reading True in real trading - every real
+# case read "not confirmed", and 93-100% of those went on to lose.
+# Detection already works; today's response (DCA_PRESSURE_CHECK_ENABLED's
+# reduced size, still added) doesn't change the outcome, only its size.
+#
+# DCA_RESTING_ORDER_ENABLED above rests a real quantity-ADDING LIMIT
+# order at dca_price the instant a position enters DCA_PENDING - by the
+# time the bot's code learns about the fill, the quantity has already
+# been added on the real exchange, so no real-time "last look" is
+# possible on that path (see that flag's own comment: it skips the
+# pressure check entirely for exactly this reason).
+#
+# This flag inverts the default: instead of resting an order that ADDS
+# quantity at dca_price, rest a quantity-NEUTRAL protective stop there
+# (exchange.place_stop_loss, closePosition=true, same order type used
+# everywhere else in this file) the moment a position enters DCA_PENDING
+# - this alone closes DCA_RESTING_ORDER_ENABLED's own original gap (no
+# SL until DCA fires) without ever needing to average in. TP1/TP2 keep
+# running against the ORIGINAL entry/quantity untouched. Only escalates
+# to a real quantity-adding DCA (position_manager._try_dca_protective_
+# escalation, full DCA_SIZE_MULTIPLIER size) if signal_engine.
+# direction_still_confirmed reads True at the moment price actually
+# reaches dca_price - see config.DCA_PROTECTIVE_ESCALATION_ENABLED,
+# a separate phase-2 switch. Given "confirmed" has never once been
+# observed in real data, this should make quantity-adding DCA rare and
+# "stop near the original risk, no averaging in" the normal outcome.
+#
+# Supersedes DCA_RESTING_ORDER_ENABLED when both are on (checked first in
+# execution.place_dca_protection_orders and position_manager.poll_live's
+# DCA_PENDING branch) - DCA_RESTING_ORDER_ENABLED itself is left
+# untouched, so turning this back off and that back on is an instant
+# rollback path. Brand new, unvalidated mechanism touching real order
+# placement - default False, same "earns a live default only after real
+# data" rule as DCA_RESTING_ORDER_ENABLED itself.
+DCA_PROTECTIVE_FIRST_ENABLED = env_bool("DCA_PROTECTIVE_FIRST_ENABLED", "False")
+# Phase-2 switch, same two-phase rollout convention as DCA_BREAKEVEN_
+# CONFIRMATION_ENABLED/_WITHHOLD_ENABLED - implicitly a no-op unless
+# DCA_PROTECTIVE_FIRST_ENABLED is also True. Off (default): pure
+# "protect only, never add quantity" - the safest possible rollout, and
+# given real evidence "confirmed" has never once been observed True,
+# likely close to this system's real long-run behavior regardless. On:
+# allows position_manager._try_dca_protective_escalation to actually
+# cancel the resting protective stop and fire a real, full-size DCA add
+# when direction_still_confirmed reads True. Recommended sequence:
+# run DCA_PROTECTIVE_FIRST_ENABLED alone first, watch real
+# DCA_PROTECTIVE_SL_HIT outcomes accumulate, decide on this one later
+# with the same real-data methodology as everything else in this file.
+DCA_PROTECTIVE_ESCALATION_ENABLED = env_bool("DCA_PROTECTIVE_ESCALATION_ENABLED", "False")
 # Real gap found live (2026-08-17, operator observation): a DCA_ACTIVE
 # position's only two protection mechanisms are PROFIT_PROTECTION_ENABLED
 # (needs PROFIT_PROTECTION_ACTIVATION_PCT_OF_TP1 of the way to the single,

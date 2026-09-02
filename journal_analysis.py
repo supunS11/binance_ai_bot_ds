@@ -44,6 +44,13 @@ LOSS_OUTCOMES = {
     # SL - still a real loss, just capped smaller than DCA_SL_HIT would
     # have been (position_manager.py's own comment has the evidence).
     "DCA_MAX_ADVERSE_LOSS", "SHADOW_DCA_MAX_ADVERSE_LOSS",
+    # config.DCA_PROTECTIVE_FIRST_ENABLED - the quantity-neutral
+    # protective stop resting at dca_price fired without ever escalating
+    # to a real DCA add (position_manager._poll_dca_protective_stop/its
+    # shadow equivalent) - still fundamentally a stop-loss hit, just
+    # capped near the original single-entry risk instead of the wider
+    # post-DCA one DCA_SL_HIT represents.
+    "DCA_PROTECTIVE_SL_HIT", "SHADOW_DCA_PROTECTIVE_SL_HIT",
     # config.RETRACEMENT_ENTRY_ENABLED - the retracement (or its market
     # fallback) filled, but SL placement then failed and the filled
     # quantity was emergency-closed at market (position_manager.

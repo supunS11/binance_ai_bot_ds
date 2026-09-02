@@ -43,6 +43,16 @@ def _is_shadow_mode(plan):
 # is actually placed, and position_manager already imports this module -
 # importing the other way around would be circular.
 DCA_ADD_CLIENT_ORDER_ID_PREFIX = "dcaAdd"
+# config.DCA_PROTECTIVE_FIRST_ENABLED - tags the resting protective SL
+# (an algo order, unlike DCA_ADD_CLIENT_ORDER_ID_PREFIX above - see
+# exchange.place_stop_loss's own client_algo_id docstring) placed at
+# dca_price instead of a quantity-adding order, so position_manager.
+# _adopt_position can tell a protective-first DCA_PENDING position apart
+# from an ordinary post-TP1 position on restart (both would otherwise
+# look identical: one real SL + resting TP order(s)) - same
+# clientAlgoId-tag disambiguation _DCA_SL_CLIENT_ALGO_ID_PREFIX already
+# gives DCA_ACTIVE recovery.
+DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_PREFIX = "dcaProtSL"
 
 
 def place_protection_orders(symbol, side, plan):
@@ -137,19 +147,59 @@ def _place_dca_resting_order(symbol, side, plan):
         return None
 
 
+def _place_dca_protective_stop(symbol, side, plan):
+    """config.DCA_PROTECTIVE_FIRST_ENABLED - see its own config.py
+    comment for the full evidence/rationale. Quantity-neutral (closes
+    whatever is currently open on this side, same exchange.place_stop_
+    loss shape used everywhere else in this file) - unlike
+    _place_dca_resting_order above, this never adds to the position by
+    itself; escalating to a real add is position_manager._try_dca_
+    protective_escalation's job, not this function's. Best-effort, same
+    treatment as _place_dca_resting_order - a failed placement here
+    doesn't block the entry (TP1/TP2 are already correct), it just means
+    position_manager._ensure_protection_orders' self-heal retries next
+    poll rather than leaving the position silently unprotected forever."""
+    if not config.DCA_PROTECTIVE_FIRST_ENABLED or plan.get("dca_price") is None:
+        return None
+
+    try:
+        return exchange.place_stop_loss(
+            symbol, side, plan["dca_price"],
+            client_algo_id=f"{DCA_PROTECTIVE_SL_CLIENT_ALGO_ID_PREFIX}{int(time.time() * 1000)}",
+        )
+    except Exception as exc:
+        log_warning(f"{symbol} DCA protective stop placement failed: {exc}")
+        return None
+
+
+def _place_dca_resting_or_protective_order(symbol, side, plan):
+    """config.DCA_PROTECTIVE_FIRST_ENABLED supersedes config.
+    DCA_RESTING_ORDER_ENABLED when both are on - a position gets exactly
+    one resting DCA-price order, never both. See each flag's own
+    config.py comment."""
+    if config.DCA_PROTECTIVE_FIRST_ENABLED:
+        return _place_dca_protective_stop(symbol, side, plan)
+
+    return _place_dca_resting_order(symbol, side, plan)
+
+
 def place_dca_protection_orders(symbol, side, plan):
-    """No SL (matches enter_trade_dca_pending's own no-SL-before-DCA
-    design) - a single full-position TP (plan["single_tp"]) or TP1
-    (partial) + TP2 (full), both best-effort, plus (config.
-    DCA_RESTING_ORDER_ENABLED) a resting LIMIT order for the DCA add
-    itself - see _place_dca_resting_order. Extracted out of
-    enter_trade_dca_pending's tail for the same reason place_protection_
+    """No SL by default (matches enter_trade_dca_pending's own no-SL-
+    before-DCA design, UNLESS config.DCA_PROTECTIVE_FIRST_ENABLED is on -
+    see that flag's own comment) - a single full-position TP
+    (plan["single_tp"]) or TP1 (partial) + TP2 (full), both best-effort,
+    plus a resting order at dca_price: either a quantity-ADDING LIMIT
+    order (config.DCA_RESTING_ORDER_ENABLED, see _place_dca_resting_
+    order) or a quantity-NEUTRAL protective stop (config.
+    DCA_PROTECTIVE_FIRST_ENABLED, see _place_dca_protective_stop) -
+    never both, see _place_dca_resting_or_protective_order. Extracted out
+    of enter_trade_dca_pending's tail for the same reason place_protection_
     orders was: config.RETRACEMENT_ENTRY_ENABLED's settle path needs to
     place DCA-shaped protection for a fill that already happened, without
     placing a second entry order. Returns (tp1_order, tp2_order, tp_order,
     dca_order) - exactly one of (tp_order) or (tp1_order, tp2_order) is
     ever non-None depending on plan["single_tp"], the other pair stays
-    None; dca_order is None whenever the flag is off, shadow, or
+    None; dca_order is None whenever both flags are off, shadow, or
     placement failed."""
     if plan.get("single_tp"):
         tp_order = None
@@ -159,7 +209,7 @@ def place_dca_protection_orders(symbol, side, plan):
         except Exception as exc:
             log_warning(f"{symbol} TP placement failed: {exc}")
 
-        return None, None, tp_order, _place_dca_resting_order(symbol, side, plan)
+        return None, None, tp_order, _place_dca_resting_or_protective_order(symbol, side, plan)
 
     tp1_order = None
     tp2_order = None
@@ -176,7 +226,7 @@ def place_dca_protection_orders(symbol, side, plan):
     except Exception as exc:
         log_warning(f"{symbol} TP2 placement failed: {exc}")
 
-    return tp1_order, tp2_order, None, _place_dca_resting_order(symbol, side, plan)
+    return tp1_order, tp2_order, None, _place_dca_resting_or_protective_order(symbol, side, plan)
 
 
 def enter_trade(plan):
@@ -247,20 +297,25 @@ def enter_trade(plan):
 
 def enter_trade_dca_pending(plan):
     """config.DCA_ENABLED - places the entry + TP1 + TP2 exactly like
-    enter_trade, but deliberately places NO SL. The position stays
-    unprotected by any resting exchange order until either TP1 fills (the
-    existing breakeven-promotion path finally places one, same as today)
-    or price reaches plan["dca_price"] and position_manager._execute_dca
-    places the first real SL alongside a new single post-DCA TP. Callers
-    register the result via positions.register_dca_pending(...), not
-    positions.register(...). See config.py's DCA section for the full
-    rationale and the real risk being accepted during this window - not
-    something this function tries to mitigate on its own.
+    enter_trade, but deliberately places NO SL (UNLESS config.
+    DCA_PROTECTIVE_FIRST_ENABLED is on - see that flag's own config.py
+    comment - in which case place_dca_protection_orders rests a real,
+    quantity-neutral protective stop at dca_price immediately, and this
+    "no SL" framing no longer applies). Without that flag: the position
+    stays unprotected by any resting exchange order until either TP1
+    fills (the existing breakeven-promotion path finally places one, same
+    as today) or price reaches plan["dca_price"] and position_manager.
+    _execute_dca places the first real SL alongside a new single post-DCA
+    TP. Callers register the result via positions.register_dca_pending(
+    ...), not positions.register(...). See config.py's DCA section for
+    the full rationale and the real risk being accepted during this
+    window - not something this function tries to mitigate on its own.
 
     config.TP_STATIC_ROI_ENABLED - plan["single_tp"] routes to ONE
     full-position take-profit (plan["tp_price"]) instead of TP1(partial)+
     TP2(remainder) - see risk_manager.build_trade_plan's own comment.
-    Still no SL either way; the DCA-or-TP race is otherwise unchanged."""
+    Still no SL either way (absent DCA_PROTECTIVE_FIRST_ENABLED); the
+    DCA-or-TP race is otherwise unchanged."""
     symbol = plan["symbol"]
     side = plan["side"]
     single_tp = plan.get("single_tp")

@@ -622,6 +622,36 @@ class GetLongShortRatioTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class GetTakerLongShortRatioTests(unittest.TestCase):
+    """On-demand (no bulk endpoint exists) real taker BUY/SELL volume
+    ratio - config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED."""
+
+    def test_returns_the_latest_ratio(self):
+        data = [
+            {"symbol": "BTCUSDT", "buySellRatio": "0.9", "timestamp": 1000},
+            {"symbol": "BTCUSDT", "buySellRatio": "1.3", "timestamp": 2000},
+        ]
+
+        with patch.object(exchange.client, "futures_taker_longshort_ratio", return_value=data):
+            result = exchange.get_taker_longshort_ratio("BTCUSDT")
+
+        self.assertEqual(result, 1.3)  # the last (most recent) entry, not the first
+
+    def test_empty_response_returns_none(self):
+        with patch.object(exchange.client, "futures_taker_longshort_ratio", return_value=[]):
+            result = exchange.get_taker_longshort_ratio("BTCUSDT")
+
+        self.assertIsNone(result)
+
+    def test_error_returns_none_instead_of_raising(self):
+        with patch.object(
+            exchange.client, "futures_taker_longshort_ratio", side_effect=RuntimeError("boom")
+        ):
+            result = exchange.get_taker_longshort_ratio("BTCUSDT")
+
+        self.assertIsNone(result)
+
+
 class GetIncomeHistoryTests(unittest.TestCase):
     def test_returns_the_records_list(self):
         records = [{"symbol": "BTCUSDT", "incomeType": "REALIZED_PNL", "income": "1.5", "time": 1000}]

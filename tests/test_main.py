@@ -115,7 +115,17 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
         # these same minimal fixtures into enter_trade_retracement instead,
         # which needs plan["side"] these fixtures don't carry. Pinned off
         # for the same isolation reason as DCA_ENABLED above.
-        for name, value in (("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False)):
+        # CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED/CVD_DIVERGENCE_PRICE_
+        # HOLD_WEAK_REJECT_ENABLED pinned off too: test_signal_trigger_is_
+        # copied_onto_plan_before_execution_and_journaling below uses a
+        # real CVD_DIVERGENCE signal_trigger and falls through past
+        # build_trade_plan - not what that test is about, and these
+        # gates' on-demand exchange calls aren't mocked there.
+        for name, value in (
+            ("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False),
+            ("CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False),
+            ("CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False),
+        ):
             patcher = patch.object(config, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -544,9 +554,20 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
         # nothing mocking it - not what those tests are about. The
         # dedicated tests near the bottom of this class re-enable it
         # explicitly per test, same convention as OB_FVG_RETEST_PRICE_WEAK.
+        # CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED/CVD_DIVERGENCE_PRICE_
+        # HOLD_WEAK_REJECT_ENABLED pinned off for the identical reason -
+        # test_oi_regime_not_checked_for_reversal_triggers uses a real
+        # CVD_DIVERGENCE signal_trigger and falls through past
+        # build_trade_plan, which would otherwise reach these two
+        # on-demand exchange calls with nothing mocking them (real bug
+        # found while implementing an unrelated later feature - both
+        # default True and were added after this class's setUp already
+        # existed, so this class was never updated for them).
         for name, value in (
             ("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False),
             ("MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", False),
+            ("CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False),
+            ("CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -932,6 +953,177 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
             main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
 
         history_mock.assert_called_once_with("BTCUSDT", period="1h", limit=60)
+
+    # config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED /
+    # config.CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED - 2026-09-02,
+    # real evidence (see each flag's own config.py comment). Both scoped
+    # to CVD_DIVERGENCE only, same on-demand-after-signal shape as every
+    # other gate above.
+
+    def test_taker_flow_disagree_rejects_before_building_a_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+        reject_counts = Counter()
+        reject_symbols = {}
+        reject_trigger_counts = Counter()
+        reject_trigger_symbols = {}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_taker_longshort_ratio", return_value=0.8), \
+             patch.object(signal_engine, "taker_flow_agrees", return_value=False), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(len(positions.registered), 0)
+        self.assertEqual(reject_counts["CVD_DIVERGENCE_TAKER_FLOW_DISAGREE"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["CVD_DIVERGENCE_TAKER_FLOW_DISAGREE"])
+        self.assertEqual(
+            reject_trigger_counts["CVD_DIVERGENCE_TAKER_FLOW_DISAGREE | triggers=CVD_DIVERGENCE"], 1
+        )
+
+    def test_taker_flow_agrees_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_taker_longshort_ratio", return_value=1.5), \
+             patch.object(signal_engine, "taker_flow_agrees", return_value=True), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_taker_flow_none_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_taker_longshort_ratio", return_value=None), \
+             patch.object(signal_engine, "taker_flow_agrees", return_value=None), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_taker_flow_reject_disabled_by_flag(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_taker_longshort_ratio") as ratio_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        ratio_mock.assert_not_called()
+        plan_mock.assert_called_once()
+
+    def test_taker_flow_not_checked_for_other_triggers(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_taker_longshort_ratio") as ratio_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        ratio_mock.assert_not_called()
+        plan_mock.assert_called_once()
+
+    def test_cvd_price_hold_weak_rejects_before_building_a_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+        reject_counts = Counter()
+        reject_symbols = {}
+        reject_trigger_counts = Counter()
+        reject_trigger_symbols = {}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_MIN_PRICE_HOLD_PCT", 0.4), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_LOOKBACK_MINUTES", 10), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines", return_value=self._fake_klines_df()), \
+             patch.object(market_structure, "price_hold_consistency", return_value=0.3), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(len(positions.registered), 0)
+        self.assertEqual(reject_counts["CVD_DIVERGENCE_PRICE_HOLD_WEAK"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["CVD_DIVERGENCE_PRICE_HOLD_WEAK"])
+        self.assertEqual(
+            reject_trigger_counts["CVD_DIVERGENCE_PRICE_HOLD_WEAK | triggers=CVD_DIVERGENCE"], 1
+        )
+
+    def test_cvd_price_hold_strong_does_not_reject(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_MIN_PRICE_HOLD_PCT", 0.4), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines", return_value=self._fake_klines_df()), \
+             patch.object(market_structure, "price_hold_consistency", return_value=0.8), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_cvd_price_hold_weak_reject_disabled_by_flag(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "CVD_DIVERGENCE"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines") as klines_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        klines_mock.assert_not_called()
+        plan_mock.assert_called_once()
+
+    def test_cvd_price_hold_not_checked_for_other_triggers(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "OB_FVG_RETEST"}
+
+        with patch.object(config, "CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False), \
+             patch.object(config, "CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", True), \
+             patch.object(config, "OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines") as klines_mock, \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        klines_mock.assert_not_called()
+        plan_mock.assert_called_once()
 
     def test_stability_none_behaves_like_the_original_ungated_behavior(self):
         feed = _FakeFeed()

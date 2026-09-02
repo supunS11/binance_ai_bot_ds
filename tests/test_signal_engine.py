@@ -3755,6 +3755,28 @@ class LongShortFavorableTests(unittest.TestCase):
             self.assertFalse(signal_engine.long_short_favorable("SELL", 0.4))
 
 
+class TakerFlowAgreesTests(unittest.TestCase):
+    """signal_engine.taker_flow_agrees - config.CVD_DIVERGENCE_TAKER_FLOW_
+    REJECT_ENABLED. Unlike long_short_favorable above (contrarian), this
+    is a plain confirmation reading: >1 = more taker BUY volume than
+    SELL volume."""
+
+    def test_none_ratio_is_none(self):
+        self.assertIsNone(signal_engine.taker_flow_agrees("BUY", None))
+
+    def test_buy_agrees_when_ratio_above_1(self):
+        self.assertTrue(signal_engine.taker_flow_agrees("BUY", 1.3))
+
+    def test_buy_disagrees_when_ratio_below_1(self):
+        self.assertFalse(signal_engine.taker_flow_agrees("BUY", 0.8))
+
+    def test_sell_agrees_when_ratio_below_1(self):
+        self.assertTrue(signal_engine.taker_flow_agrees("SELL", 0.8))
+
+    def test_sell_disagrees_when_ratio_above_1(self):
+        self.assertFalse(signal_engine.taker_flow_agrees("SELL", 1.3))
+
+
 class DirectionStillConfirmedTests(unittest.TestCase):
     """config.DCA_BREAKEVEN_CONFIRMATION_ENABLED - the trend/order-flow-
     health subset of evaluate()'s own gates, reused against an ALREADY

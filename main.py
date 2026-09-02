@@ -321,6 +321,62 @@ def _evaluate_symbol(
             )
             return
 
+    # config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED - 2026-09-02, real
+    # evidence (see that flag's own config.py comment). On-demand (no
+    # bulk endpoint exists) - only for a candidate that's already
+    # CVD_DIVERGENCE and has already passed every other check, same
+    # on-demand-after-signal shape as LONG_SHORT_RATIO_ENABLED above.
+    if (
+        config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED
+        and result.get("signal_trigger") == "CVD_DIVERGENCE"
+    ):
+        taker_ratio = exchange.get_taker_longshort_ratio(symbol)
+        taker_agrees = signal_engine.taker_flow_agrees(result["signal"], taker_ratio)
+
+        if taker_agrees is False:
+            _tally_reject(reject_counts, reject_symbols, symbol, "CVD_DIVERGENCE_TAKER_FLOW_DISAGREE")
+            _tally_reject(
+                reject_trigger_counts, reject_trigger_symbols, symbol,
+                f"CVD_DIVERGENCE_TAKER_FLOW_DISAGREE | triggers={result.get('signal_trigger')}",
+            )
+            return
+
+    # config.CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED - 2026-09-02,
+    # real evidence (see that flag's own config.py comment). Same
+    # market_structure.price_hold_consistency helper already shipped for
+    # OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED, different trigger and its
+    # own threshold/lookback knobs. On-demand real 1m klines, same shape
+    # as that gate above.
+    if (
+        config.CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED
+        and result.get("signal_trigger") == "CVD_DIVERGENCE"
+    ):
+        price_df = exchange.get_klines(
+            symbol, "1m", limit=config.CVD_DIVERGENCE_PRICE_HOLD_LOOKBACK_MINUTES + 5
+        )
+        price_candles = (
+            [
+                {"open": float(row["open"]), "close": float(row["close"])}
+                for _, row in price_df.iloc[:-1].iterrows()
+            ]
+            if price_df is not None and not price_df.empty else []
+        )
+        price_hold_consistency = market_structure.price_hold_consistency(
+            price_candles, result["signal"],
+            lookback=config.CVD_DIVERGENCE_PRICE_HOLD_LOOKBACK_MINUTES,
+        )
+
+        if (
+            price_hold_consistency is not None
+            and price_hold_consistency < config.CVD_DIVERGENCE_MIN_PRICE_HOLD_PCT
+        ):
+            _tally_reject(reject_counts, reject_symbols, symbol, "CVD_DIVERGENCE_PRICE_HOLD_WEAK")
+            _tally_reject(
+                reject_trigger_counts, reject_trigger_symbols, symbol,
+                f"CVD_DIVERGENCE_PRICE_HOLD_WEAK | triggers={result.get('signal_trigger')}",
+            )
+            return
+
     plan, status = risk_manager.build_trade_plan(result, balance)
 
     if status != "OK":
