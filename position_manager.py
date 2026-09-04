@@ -408,6 +408,13 @@ class PositionManager:
             # from position["sl_price"] later (that field legitimately
             # moves to the breakeven price once a trade is promoted).
             "risk_distance": risk_distance,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real BTC price at
+            # this position's real entry (from plan["btc_entry_price"],
+            # captured in main.py, None for BTCUSDT itself) and the
+            # running worst-since-entry extreme, seeded to the same value.
+            # See _update_btc_adverse_move/_btc_max_adverse_move_pct.
+            "btc_entry_price": plan.get("btc_entry_price"),
+            "btc_max_adverse_price": plan.get("btc_entry_price"),
             # For resolve_break_confirmations() - was the structure break
             # that triggered this entry still holding once its candle
             # actually finished, or was it just a wick that snapped back
@@ -503,6 +510,10 @@ class PositionManager:
             "mae_price": entry_price,
             "mfe_price": entry_price,
             "risk_distance": risk_distance,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - see register()'s
+            # own comment for the full rationale.
+            "btc_entry_price": plan.get("btc_entry_price"),
+            "btc_max_adverse_price": plan.get("btc_entry_price"),
             "structure_level": plan.get("structure_level"),
             "trigger_candle_open_time": plan.get("trigger_candle_open_time"),
             "break_confirmed_by_close": None,
@@ -574,6 +585,12 @@ class PositionManager:
             "mae_price": None,
             "mfe_price": None,
             "risk_distance": plan.get("risk_distance") or abs(plan["entry_price"] - plan["sl_price"]),
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same "not-yet-real
+            # fill" reasoning as mae_price/mfe_price above: None until
+            # _apply_pending_fill/poll_shadow_pending_entry backfill a real
+            # BTC price at the actual fill moment.
+            "btc_entry_price": None,
+            "btc_max_adverse_price": None,
             "structure_level": plan.get("structure_level"),
             "trigger_candle_open_time": plan.get("trigger_candle_open_time"),
             "break_confirmed_by_close": None,
@@ -1051,6 +1068,10 @@ class PositionManager:
             # None (unknown) is honest, same policy the plain-adopt path
             # below already follows for a reconciled BREAKEVEN_ACTIVE.
             "risk_distance": None,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same restart-loses
+            # -the-true-window honesty policy as risk_distance above.
+            "btc_entry_price": None,
+            "btc_max_adverse_price": None,
             "structure_level": None,
             "trigger_candle_open_time": None,
             "break_confirmed_by_close": None,
@@ -1123,6 +1144,10 @@ class PositionManager:
             "mae_price": entry_price,
             "mfe_price": entry_price,
             "risk_distance": None,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - see
+            # _recover_dca_pending_position's own comment.
+            "btc_entry_price": None,
+            "btc_max_adverse_price": None,
             "structure_level": None,
             "trigger_candle_open_time": None,
             "break_confirmed_by_close": None,
@@ -1197,6 +1222,10 @@ class PositionManager:
             "mae_price": entry_price,
             "mfe_price": entry_price,
             "risk_distance": None,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - see
+            # _recover_dca_pending_position's own comment.
+            "btc_entry_price": None,
+            "btc_max_adverse_price": None,
             "structure_level": None,
             "trigger_candle_open_time": None,
             "break_confirmed_by_close": None,
@@ -1256,6 +1285,10 @@ class PositionManager:
             "mae_price": entry_price,
             "mfe_price": entry_price,
             "risk_distance": None,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - see
+            # _recover_dca_pending_position's own comment.
+            "btc_entry_price": None,
+            "btc_max_adverse_price": None,
             "structure_level": None,
             "trigger_candle_open_time": None,
             "break_confirmed_by_close": None,
@@ -1330,6 +1363,10 @@ class PositionManager:
             # same honesty policy _recover_dca_pending_position/the plain
             # BREAKEVEN_ACTIVE adoption path already follow.
             "risk_distance": None,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same restart-loses
+            # -the-true-window honesty policy as risk_distance above.
+            "btc_entry_price": None,
+            "btc_max_adverse_price": None,
             "structure_level": None,
             "trigger_candle_open_time": None,
             "break_confirmed_by_close": None,
@@ -1578,6 +1615,10 @@ class PositionManager:
             # isn't. Only a TP1_PENDING adoption still has its real,
             # untouched original stop to compute this from.
             "risk_distance": abs(entry_price - sl_price) if stage == TP1_PENDING else None,
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same restart-loses
+            # -the-true-window honesty policy as risk_distance above.
+            "btc_entry_price": None,
+            "btc_max_adverse_price": None,
             # No original signal/candle to check this against - stays
             # unresolved forever for a reconciled position, same honesty
             # policy as risk_distance above.
@@ -1611,9 +1652,11 @@ class PositionManager:
             self._closed_at[symbol] = time.time()
             log_info(f"{symbol} position closed | OUTCOME={outcome}")
             mae_r, mfe_r = self._mae_mfe_r_multiples(position)
+            btc_adverse_pct = self._btc_max_adverse_move_pct(position)
             signal_journal.append_outcome(
                 symbol, outcome, position.get("trade_id"),
                 mae_r_multiple=mae_r, mfe_r_multiple=mfe_r,
+                btc_max_adverse_move_pct=btc_adverse_pct,
                 early_breakeven_applied=position.get("early_breakeven_applied", False),
                 break_confirmed_by_close=position.get("break_confirmed_by_close"),
                 dca_applied=position.get("dca_applied", False),
@@ -1662,10 +1705,13 @@ class PositionManager:
     @staticmethod
     def _update_mae_mfe(position, low_or_price, high_or_price=None):
         """Tracks the worst (MAE) and best (MFE) price seen over the life
-        of a trade so far. Live mode passes a single mark-price sample
-        (high_or_price defaults to the same value); shadow mode passes
-        the current candle's actual low/high so a single candle's full
-        range is captured, not just its close. See
+        of a trade so far. Accepts either a single price sample
+        (high_or_price defaults to the same value) or an explicit
+        low/high pair so a candle's full range is captured, not just one
+        point on it. Live mode feeds it BOTH - the mark-price sample it
+        already fetches, plus the forming candle's range via
+        _update_mae_mfe_from_candles - because min/max only ever move the
+        worse/better way, so the two calls compose safely. See
         config.MAE_TRACKING_ENABLED for why this exists."""
         if not config.MAE_TRACKING_ENABLED:
             return
@@ -1686,6 +1732,56 @@ class PositionManager:
         else:
             position["mae_price"] = max(mae_price, high_or_price)
             position["mfe_price"] = min(mfe_price, low_or_price)
+
+    @staticmethod
+    def _update_mae_mfe_from_candles(position, candles):
+        """Feeds _update_mae_mfe the forming candle's FULL high/low range
+        in live mode, alongside the point-in-time mark-price sample
+        poll_live already takes.
+
+        Real gap this closes (2026-09-04 journal audit): MAE in live mode
+        was only ever sampled once per POSITION_POLL_INTERVAL_SECONDS via
+        exchange.get_mark_price, so any adverse wick that reversed between
+        two poll ticks was never recorded. Real proof it was already
+        corrupting the metric - 1000LUNCUSDT resolved with a journaled
+        mae_r_multiple of 0.46R while its DCA (which only fires when price
+        actually reaches dca_price) had triggered at 0.65R: an impossible
+        reading, since price demonstrably went at least 0.65R adverse. The
+        recorded MAE was simply blind to the wick that filled the resting
+        DCA order.
+
+        This is the exact same point-sampling gap _dca_price_reached_in_
+        range already closed for the DCA TRIGGER itself (see its docstring
+        - that 2026-08-24 audit found ~29% of resolved trades had a large
+        adverse excursion the point check missed), now applied to the MAE
+        MEASUREMENT so the two can no longer disagree.
+
+        candles[-1] is continuously updated by the kline websocket stream,
+        so its high/low covers the whole range since that candle opened.
+        Purely a metrics correction - mae_price/mfe_price feed only
+        _mae_mfe_r_multiples' journaled R-multiples (no trading decision
+        reads either field), so nothing about live behavior changes.
+        None/empty candles or a candle missing high/low is a no-op, same
+        never-act-on-incomplete-data rule _dca_price_reached_in_range
+        uses. The isinstance guard is deliberate rather than incidental:
+        this is purely observational code running inside poll_live's
+        real-money path, so a malformed candle has to degrade to "no MAE
+        update" instead of raising and taking the entire position poll
+        (SL/TP management included) down with it."""
+        if not candles:
+            return
+
+        latest_candle = candles[-1]
+
+        if not isinstance(latest_candle, dict):
+            return
+
+        high, low = latest_candle.get("high"), latest_candle.get("low")
+
+        if high is None or low is None:
+            return
+
+        PositionManager._update_mae_mfe(position, low, high)
 
     @staticmethod
     def _mae_mfe_r_multiples(position):
@@ -1730,6 +1826,50 @@ class PositionManager:
         mae_r = round(abs(entry_price - mae_price) / risk_distance, 4)
         mfe_r = round(abs(entry_price - mfe_price) / risk_distance, 4)
         return mae_r, mfe_r
+
+    @staticmethod
+    def _update_btc_adverse_move(position, btc_low, btc_high):
+        """Tracks the worst BTC price seen, in the direction that hurts
+        THIS position's side, over the trade's life so far - see
+        config.BTC_ADVERSE_MOVE_TRACKING_ENABLED for the real evidence
+        this exists to keep gathering prospectively. Mirrors
+        _update_mae_mfe's own shape exactly, one step removed: side-based
+        min/max, but against BTC's own low/high, not this symbol's. No-op
+        when btc_entry_price was never captured (a BTCUSDT position
+        itself, a still-pending resting order, or a restart-adopted
+        position - see the register()/_adopt_position call sites for
+        why)."""
+        if not config.BTC_ADVERSE_MOVE_TRACKING_ENABLED:
+            return
+
+        entry = position.get("btc_entry_price")
+
+        if entry is None or btc_low is None or btc_high is None:
+            return
+
+        worst = position.get("btc_max_adverse_price", entry)
+        side = position["side"]
+
+        if side == "BUY":
+            position["btc_max_adverse_price"] = min(worst, btc_low)
+        else:
+            position["btc_max_adverse_price"] = max(worst, btc_high)
+
+    @staticmethod
+    def _btc_max_adverse_move_pct(position):
+        """% move, always positive, of the worst real-time BTC price seen
+        away from btc_entry_price - directly comparable to the
+        retrospective evidence's bucket boundaries in config.BTC_ADVERSE_
+        MOVE_TRACKING_ENABLED's own comment. None when no anchor/no update
+        ever ran (same "no reading, no fabricated number" convention as
+        _mae_mfe_r_multiples' own None-risk_distance branch)."""
+        entry = position.get("btc_entry_price")
+        worst = position.get("btc_max_adverse_price")
+
+        if entry is None or worst is None or entry <= 0:
+            return None
+
+        return round(abs(entry - worst) / entry * 100, 4)
 
     def _replace_sl_order(
         self, position, target_price, reason,
@@ -3069,6 +3209,7 @@ class PositionManager:
 
     def poll_live(
         self, symbol, candles=None, htf_candles=None, cvd_snapshot=None, crash_snapshot=None,
+        btc_low=None, btc_high=None,
     ):
         """Returns an outcome string if the position closed this call,
         otherwise None. `candles` (LTF history for the symbol) is only
@@ -3079,7 +3220,10 @@ class PositionManager:
         _dca_breakeven_confirmation) and config.DCA_PRESSURE_CHECK_ENABLED
         (see _execute_dca) - also a no-op without them, same convention.
         `crash_snapshot` - config.CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED,
-        also only consumed by _execute_dca, same no-op-without-it shape."""
+        also only consumed by _execute_dca, same no-op-without-it shape.
+        `btc_low`/`btc_high` - config.BTC_ADVERSE_MOVE_TRACKING_ENABLED,
+        already-fetched in-memory values (see main.py), not a new fetch -
+        see _update_btc_adverse_move."""
         position = self.positions.get(symbol)
 
         if not position or position["shadow"]:
@@ -3119,6 +3263,14 @@ class PositionManager:
         ):
             current_price = exchange.get_mark_price(symbol)
             self._update_mae_mfe(position, current_price)
+
+        # Unconditional (and free - candles is already in memory, no
+        # fetch): catches any adverse/favorable wick that reversed between
+        # two poll ticks, which the mark-price sample above structurally
+        # cannot see. See _update_mae_mfe_from_candles for the real
+        # journal reading that proved the gap.
+        self._update_mae_mfe_from_candles(position, candles)
+        self._update_btc_adverse_move(position, btc_low, btc_high)
 
         if position["stage"] == DCA_PENDING:
             # DCA (adverse) checked before the early-promotion (favorable)
@@ -3845,7 +3997,7 @@ class PositionManager:
 
     def poll_shadow(
         self, symbol, latest_candle, candles=None, htf_candles=None, cvd_snapshot=None,
-        crash_snapshot=None,
+        crash_snapshot=None, btc_low=None, btc_high=None,
     ):
         """Simulates the same TP1 -> breakeven -> TP2/SL sequence against
         live price action. When both the stop and a target fall inside the
@@ -3857,7 +4009,9 @@ class PositionManager:
         are no-ops when it's not supplied. `htf_candles`/`cvd_snapshot`/
         `crash_snapshot` - see poll_live's own docstring, same
         DCA_BREAKEVEN_CONFIRMATION_ENABLED/DCA_PRESSURE_CHECK_ENABLED/
-        CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED no-op convention."""
+        CRASH_DETECTOR_FORCE_DCA_PRESSURE_ENABLED no-op convention.
+        `btc_low`/`btc_high` - config.BTC_ADVERSE_MOVE_TRACKING_ENABLED,
+        see poll_live's own docstring."""
         position = self.positions.get(symbol)
 
         if not position or not position["shadow"] or not latest_candle:
@@ -3868,6 +4022,7 @@ class PositionManager:
         side = position["side"]
 
         self._update_mae_mfe(position, low, high)
+        self._update_btc_adverse_move(position, btc_low, btc_high)
 
         if position["stage"] == TP1_PENDING:
             hit_sl = (
@@ -4250,7 +4405,7 @@ class PositionManager:
             f"tp1={position['tp1_price']} tp2={position['tp2_price']}"
         )
 
-    def _apply_pending_fill(self, position, order, settle=False):
+    def _apply_pending_fill(self, position, order, settle=False, btc_price=None):
         """A resting limit's executed_qty grew since it was last checked.
         On the FIRST fill, place SL now (closePosition=true protects
         whatever quantity is actually open right now, and stays valid
@@ -4275,6 +4430,11 @@ class PositionManager:
             position["risk_distance"] = abs(entry_price - position["sl_price"])
             position["mae_price"] = entry_price
             position["mfe_price"] = entry_price
+            # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real fill-time
+            # anchor, replacing the signal-time snapshot captured in
+            # main.py (a resting limit can fill minutes-to-hours later).
+            position["btc_entry_price"] = btc_price
+            position["btc_max_adverse_price"] = btc_price
 
             try:
                 sl_order = exchange.place_stop_loss(symbol, side, position["sl_price"])
@@ -4334,13 +4494,15 @@ class PositionManager:
         signal_journal.append_outcome(symbol, reason, position.get("trade_id"))
         return reason
 
-    def poll_pending_entry(self, symbol, latest_candle):
+    def poll_pending_entry(self, symbol, latest_candle, btc_price=None):
         """Returns an outcome string if the pending entry resolved this
         call (closed outright on an SL-placement failure, or dropped
         unfilled on cancel), otherwise None - including when it silently
         settled into TP1_PENDING, which is not itself a closed-trade
         outcome. Only meaningful for stage == PENDING_LIMIT_FILL,
-        non-shadow positions - see main.py's _poll_positions dispatch."""
+        non-shadow positions - see main.py's _poll_positions dispatch.
+        `btc_price` - config.BTC_ADVERSE_MOVE_TRACKING_ENABLED, only
+        consumed by _apply_pending_fill on a genuine first fill."""
         position = self.positions.get(symbol)
 
         if not position or position["shadow"] or position["stage"] != PENDING_LIMIT_FILL:
@@ -4352,7 +4514,7 @@ class PositionManager:
             return None  # transient fetch failure - retry next poll
 
         if order["executed_qty"] > position["filled_quantity"]:
-            outcome = self._apply_pending_fill(position, order)
+            outcome = self._apply_pending_fill(position, order, btc_price=btc_price)
 
             if outcome:
                 return outcome
@@ -4368,9 +4530,9 @@ class PositionManager:
         if not invalidated and not expired:
             return None
 
-        return self._resolve_pending_entry_cancel(position, invalidated)
+        return self._resolve_pending_entry_cancel(position, invalidated, btc_price=btc_price)
 
-    def _resolve_pending_entry_cancel(self, position, invalidated):
+    def _resolve_pending_entry_cancel(self, position, invalidated, btc_price=None):
         symbol = position["symbol"]
         exchange.cancel_order(symbol, position["limit_order_id"])
 
@@ -4382,7 +4544,7 @@ class PositionManager:
         order = exchange.get_order_status(symbol, position["limit_order_id"])
 
         if order["status"] != "UNKNOWN" and order["executed_qty"] > position["filled_quantity"]:
-            return self._apply_pending_fill(position, order, settle=True)
+            return self._apply_pending_fill(position, order, settle=True, btc_price=btc_price)
 
         if position["filled_quantity"] > 0:
             # Already protected via SL/TP2 from an earlier partial fill;
@@ -4393,9 +4555,11 @@ class PositionManager:
 
         return self._drop_unfilled_pending_entry(position, invalidated)
 
-    def poll_shadow_pending_entry(self, symbol, latest_candle):
+    def poll_shadow_pending_entry(self, symbol, latest_candle, btc_price=None):
         """SHADOW equivalent of poll_pending_entry, simulated against the
-        live candle stream the same way poll_shadow already is."""
+        live candle stream the same way poll_shadow already is.
+        `btc_price` - config.BTC_ADVERSE_MOVE_TRACKING_ENABLED real
+        fill-time anchor, only used on a would-have-filled touch."""
         position = self.positions.get(symbol)
 
         if (
@@ -4422,6 +4586,8 @@ class PositionManager:
             position["filled_quantity"] = position["quantity"]
             position["mae_price"] = entry_price
             position["mfe_price"] = entry_price
+            position["btc_entry_price"] = btc_price
+            position["btc_max_adverse_price"] = btc_price
             position["stage"] = TP1_PENDING
             log_info(f"{symbol} [SHADOW] limit entry would have filled | entry={entry_price}")
             return None
@@ -4530,7 +4696,7 @@ class PositionManager:
 
         return total_quantity, entry_price, True, None
 
-    def _finalize_retracement_entry(self, position, entry_price, quantity, fill_type):
+    def _finalize_retracement_entry(self, position, entry_price, quantity, fill_type, btc_price=None):
         """Common tail once a final entry_price/quantity is known - a
         genuine full limit fill, a blended limit+market-fallback fill, or
         (shadow mode) a simulated touch/fallback. Builds a settled plan
@@ -4575,6 +4741,14 @@ class PositionManager:
         settled_plan["breakeven_price"] = risk_manager.compute_breakeven_price(entry_price, side)
         risk_distance = abs(entry_price - plan["sl_price"])
         settled_plan["risk_distance"] = risk_distance if risk_distance > 0 else plan.get("risk_distance")
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real fill-time anchor
+        # overriding the stale signal-time snapshot, same "resting order
+        # can fill much later" reasoning as register_pending_entry's own
+        # backfill. Falls back to the original snapshot only if a fresh
+        # read wasn't available this call.
+        settled_plan["btc_entry_price"] = (
+            btc_price if btc_price is not None else plan.get("btc_entry_price")
+        )
 
         if not plan.get("single_tp"):
             settled_plan["tp1_price"] = _resolve_tp1_price(plan, entry_price, side)
@@ -4672,14 +4846,16 @@ class PositionManager:
         signal_journal.append_outcome(symbol, outcome, position.get("trade_id"))
         return outcome
 
-    def poll_retracement_pending(self, symbol, latest_candle):
+    def poll_retracement_pending(self, symbol, latest_candle, btc_price=None):
         """Returns an outcome string if this call closed things out
         outright (a genuine pre-fill invalidation, or a non-DCA settle's
         SL placement failure); None otherwise, including the ordinary
         case where this call either kept the limit resting or settled the
         position into DCA_PENDING/TP1_PENDING. Only meaningful for
         stage == RETRACEMENT_PENDING, non-shadow positions - see main.py's
-        _poll_positions dispatch."""
+        _poll_positions dispatch. `btc_price` -
+        config.BTC_ADVERSE_MOVE_TRACKING_ENABLED, only consumed on an
+        actual settle (see _finalize_retracement_entry)."""
         position = self.positions.get(symbol)
 
         if not position or position["shadow"] or position["stage"] != RETRACEMENT_PENDING:
@@ -4744,7 +4920,7 @@ class PositionManager:
                 f"chasing the remainder"
             )
             return self._finalize_retracement_entry(
-                position, filled_avg_price, filled_quantity, "PARTIAL_NO_CHASE"
+                position, filled_avg_price, filled_quantity, "PARTIAL_NO_CHASE", btc_price=btc_price
             )
 
         # Every other resolution (full fill, partial fill + invalidated,
@@ -4762,7 +4938,9 @@ class PositionManager:
             return None
 
         fill_type = "MARKET_FALLBACK" if used_fallback else "LIMIT"
-        return self._finalize_retracement_entry(position, entry_price, total_quantity, fill_type)
+        return self._finalize_retracement_entry(
+            position, entry_price, total_quantity, fill_type, btc_price=btc_price
+        )
 
     def _close_shadow_retracement_invalidated(self, position):
         symbol = position["symbol"]
@@ -4774,7 +4952,7 @@ class PositionManager:
         )
         return "SHADOW_RETRACEMENT_INVALIDATED_UNFILLED"
 
-    def poll_shadow_retracement_pending(self, symbol, latest_candle):
+    def poll_shadow_retracement_pending(self, symbol, latest_candle, btc_price=None):
         """SHADOW equivalent of poll_retracement_pending - no real orders
         exist, so "filled" is simulated against the candle's own range
         (same deliberately conservative "assume the adverse side touched
@@ -4782,7 +4960,9 @@ class PositionManager:
         documents for a real SL-vs-target ambiguity) and the market
         fallback on expiry just uses the candle's own close as the
         simulated fill price for the full planned quantity - there is no
-        real partial fill to blend against in shadow mode."""
+        real partial fill to blend against in shadow mode. `btc_price` -
+        config.BTC_ADVERSE_MOVE_TRACKING_ENABLED, see
+        _finalize_retracement_entry."""
         position = self.positions.get(symbol)
 
         if (
@@ -4808,7 +4988,7 @@ class PositionManager:
 
         if touches_retracement:
             return self._finalize_retracement_entry(
-                position, retracement_price, plan["quantity"], "LIMIT"
+                position, retracement_price, plan["quantity"], "LIMIT", btc_price=btc_price
             )
 
         expired = (
@@ -4828,7 +5008,7 @@ class PositionManager:
                 f"market fallback @ {latest_candle['close']}"
             )
             return self._finalize_retracement_entry(
-                position, latest_candle["close"], plan["quantity"], "MARKET_FALLBACK"
+                position, latest_candle["close"], plan["quantity"], "MARKET_FALLBACK", btc_price=btc_price
             )
 
         return None

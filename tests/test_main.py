@@ -1546,6 +1546,7 @@ class PollPositionsDispatchTests(unittest.TestCase):
             "BTCUSDT", candles=feed.candles.get("BTCUSDT"),
             htf_candles=feed.htf_candles.get("BTCUSDT"), cvd_snapshot=feed.cvd.snapshot("BTCUSDT"),
             crash_snapshot=feed.crash_detector.snapshot(),
+            btc_low=None, btc_high=None,
         )
         positions.poll_pending_entry.assert_not_called()
         positions.poll_shadow_pending_entry.assert_not_called()

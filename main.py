@@ -417,6 +417,19 @@ def _evaluate_symbol(
     # retracement reads this off plan, not result, to decide whether to
     # rest deeper/wait longer for a weak-depth_imbalance entry.
     plan["depth_imbalance"] = result.get("depth_imbalance")
+    # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real-time anchor for
+    # position_manager._update_btc_adverse_move. Reuses btc_candles already
+    # fetched above for btc_correlation/btc_return (zero new REST/WS
+    # calls). None for a BTCUSDT signal itself, same self-correlation
+    # exclusion btc_correlation/btc_return already apply. Backfilled with
+    # a fresher real price at the actual fill moment for LIMIT_ENTRY_MODE_
+    # ENABLED/RETRACEMENT_ENTRY_ENABLED entries - see _apply_pending_fill/
+    # poll_shadow_pending_entry/_finalize_retracement_entry.
+    plan["btc_entry_price"] = (
+        btc_candles[-1]["close"]
+        if btc_candles and symbol.upper() != config.CORRELATION_REFERENCE_SYMBOL
+        else None
+    )
 
     # config.TP_STATIC_ROI_ENABLED - see position_manager's heartbeat log
     # comment for why single-TP plans need their own display.
@@ -507,13 +520,23 @@ def _poll_positions(feed, positions):
         if not position:
             continue
 
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same cheap in-memory
+        # read as htf_candles/cvd_snapshot/crash_snapshot below, no new
+        # REST/WS call. btc_price (close) backfills a pending/resting
+        # entry's anchor at its real fill moment; btc_low/btc_high feed
+        # the running adverse-extreme tracker for an already-open position.
+        btc_candle = feed.candles.latest(config.CORRELATION_REFERENCE_SYMBOL)
+        btc_price = btc_candle.get("close") if btc_candle else None
+        btc_low = btc_candle.get("low") if btc_candle else None
+        btc_high = btc_candle.get("high") if btc_candle else None
+
         if position["stage"] == RETRACEMENT_PENDING:
             latest_candle = feed.candles.latest(symbol)
 
             if position["shadow"]:
-                positions.poll_shadow_retracement_pending(symbol, latest_candle)
+                positions.poll_shadow_retracement_pending(symbol, latest_candle, btc_price=btc_price)
             else:
-                positions.poll_retracement_pending(symbol, latest_candle)
+                positions.poll_retracement_pending(symbol, latest_candle, btc_price=btc_price)
 
             continue
 
@@ -521,9 +544,9 @@ def _poll_positions(feed, positions):
             latest_candle = feed.candles.latest(symbol)
 
             if position["shadow"]:
-                positions.poll_shadow_pending_entry(symbol, latest_candle)
+                positions.poll_shadow_pending_entry(symbol, latest_candle, btc_price=btc_price)
             else:
-                positions.poll_pending_entry(symbol, latest_candle)
+                positions.poll_pending_entry(symbol, latest_candle, btc_price=btc_price)
 
             continue
 
@@ -546,13 +569,13 @@ def _poll_positions(feed, positions):
             positions.poll_shadow(
                 symbol, latest_candle, candles=feed.candles.get(symbol),
                 htf_candles=htf_candles, cvd_snapshot=cvd_snapshot,
-                crash_snapshot=crash_snapshot,
+                crash_snapshot=crash_snapshot, btc_low=btc_low, btc_high=btc_high,
             )
         else:
             positions.poll_live(
                 symbol, candles=feed.candles.get(symbol),
                 htf_candles=htf_candles, cvd_snapshot=cvd_snapshot,
-                crash_snapshot=crash_snapshot,
+                crash_snapshot=crash_snapshot, btc_low=btc_low, btc_high=btc_high,
             )
 
     # Catches a real (non-shadow) position closed OUTSIDE the bot

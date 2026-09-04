@@ -337,6 +337,21 @@ class SignalJournalTests(unittest.TestCase):
         rows = self._read_rows()
         self.assertEqual(rows[1]["early_breakeven_applied"], "")
 
+    def test_append_outcome_writes_btc_max_adverse_move_pct(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome("BTCUSDT", "SL_HIT", trade_id, btc_max_adverse_move_pct=0.42)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["btc_max_adverse_move_pct"], "0.42")
+
+    def test_append_outcome_leaves_btc_max_adverse_move_pct_blank_when_not_given(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_outcome("BTCUSDT", "SL_HIT", trade_id)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["btc_max_adverse_move_pct"], "")
+
     def test_append_outcome_writes_dca_breakeven_direction_confirmed(self):
         trade_id = signal_journal.append_signal(_signal(), _plan())
         signal_journal.append_outcome(

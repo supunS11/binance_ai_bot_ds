@@ -1803,6 +1803,40 @@ STRUCTURE_STOP_MANAGEMENT_ENABLED = env_bool("STRUCTURE_STOP_MANAGEMENT_ENABLED"
 # observational - never gates or sizes anything.
 MAE_TRACKING_ENABLED = env_bool("MAE_TRACKING_ENABLED", "True")
 
+# BTC adverse-move tracking - real evidence (2026-09-04, 199 real LIVE
+# resolved trades, excluding BTCUSDT itself): loss rate against the real
+# max adverse BTC move (relative to BTC's own price at the position's
+# entry, in the direction that hurts THAT position's side - BTC falling
+# hurts a BUY, BTC rising hurts a SELL) at any point between entry and
+# close, bucketed:
+#   0-0.15%    n=42  loss rate  4.8%
+#   0.15-0.30% n=55  loss rate  9.1%
+#   0.30-0.50% n=28  loss rate 10.7%
+#   0.50-1.00% n=40  loss rate 25.0%
+#   1.00%+     n=34  loss rate 38.2%
+# Clean, monotonic, real Pearson correlation -0.325 - the strongest signal
+# found in a long session of mostly-null checks. Worst real losses were
+# dominated by CHOCH_RETEST (already this codebase's weakest trigger) and
+# real BTC moves well past 1% (up to 9.33%). Real incident that prompted
+# this: a real, sustained ~4.4% BTC rally over 3 hours hit a real open
+# SELL's SL while crash_detector.py (3-minute window, 1.5% threshold,
+# built for a fast flash-move) never fired once in the bot's entire
+# history (confirmed via log grep) - it was a slow sustained move, not a
+# spike, and even when crash_detector DOES fire it only ever blocks NEW
+# entries or resizes DCA - there is no existing path that reacts to a
+# market-wide move for an ordinary already-open position at all.
+#
+# Retrospective only so far - reconstructed after the fact from historical
+# BTC klines, not tracked prospectively while each trade was actually
+# open. Two-phase rollout, same convention as CRASH_DETECTOR_ENABLED/
+# MAE_TRACKING_ENABLED above: ships ON immediately as PURE tracking +
+# journaling (zero trading behavior change - see position_manager.
+# _update_btc_adverse_move) so the exact same bucketed analysis can be
+# repeated later against real, prospectively-tracked, larger data BEFORE
+# any live-behavior-changing mechanism (SL tightening, early exit, DCA
+# blocking - none of which exists yet) is ever considered.
+BTC_ADVERSE_MOVE_TRACKING_ENABLED = env_bool("BTC_ADVERSE_MOVE_TRACKING_ENABLED", "True")
+
 # =========================
 # DCA (single average-in, no SL before it fires)
 # =========================

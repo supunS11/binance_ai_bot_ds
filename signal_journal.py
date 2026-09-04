@@ -40,7 +40,7 @@ FIELDNAMES = [
     "vp_poc_price", "vp_value_area_high", "vp_value_area_low", "vp_position",
     "funding_rate", "funding_favorable", "long_short_ratio",
     "long_short_favorable", "quote_volume_usdt", "tp1_r_multiple", "tp2_r_multiple",
-    "execution_mode", "mae_r_multiple", "mfe_r_multiple", "early_breakeven_applied",
+    "execution_mode", "mae_r_multiple", "mfe_r_multiple", "btc_max_adverse_move_pct", "early_breakeven_applied",
     "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed",
     "dca_pressure_confirmed", "retracement_fill_type", "retracement_fill_lag_seconds",
     "used_deep_retracement", "dca_protective_stop_hit",
@@ -272,7 +272,7 @@ def append_outcome(
     symbol, outcome, trade_id=None, mae_r_multiple=None, mfe_r_multiple=None,
     early_breakeven_applied=None, break_confirmed_by_close=None, dca_applied=None,
     dca_breakeven_direction_confirmed=None, dca_pressure_confirmed=None,
-    dca_protective_stop_hit=None,
+    dca_protective_stop_hit=None, btc_max_adverse_move_pct=None,
 ):
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
@@ -285,6 +285,14 @@ def append_outcome(
 
     if mfe_r_multiple is not None:
         row["mfe_r_multiple"] = mfe_r_multiple
+
+    # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real max adverse BTC move
+    # (%) seen during this position's real open life, against the
+    # direction that hurts its own side. Purely observational - see that
+    # flag's own config.py comment for the real evidence this keeps
+    # gathering prospectively.
+    if btc_max_adverse_move_pct is not None:
+        row["btc_max_adverse_move_pct"] = btc_max_adverse_move_pct
 
     if early_breakeven_applied is not None:
         row["early_breakeven_applied"] = early_breakeven_applied

@@ -411,6 +411,10 @@ class ReconcileOnStartupTests(unittest.TestCase):
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertIsNone(position["risk_distance"])
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same restart-loses-
+        # the-true-window honesty policy as risk_distance above.
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
 
     def test_early_breakeven_promoted_position_is_recognized_even_with_tp1_still_open(self):
         # Real bug found live (2026-08-10): the early-1R trigger moves the
@@ -562,6 +566,9 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["tp2_price"], 104.0)
         self.assertEqual(position["tp1_quantity"], 0.8)
         self.assertIsNone(position["risk_distance"])  # honest - no recoverable original stop
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same honesty policy.
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
         place_sl.assert_not_called()  # no emergency stop - the DCA mechanism survived instead
         compute_dca.assert_called_once_with(100.0, "BUY", [], atr=0.5)
 
@@ -658,6 +665,8 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertIsNone(position["tp1_price"])
         self.assertIsNone(position["tp2_price"])
         self.assertIsNone(position["risk_distance"])  # honest - no recoverable original stop
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
         place_sl.assert_not_called()  # no emergency stop - the DCA mechanism survived instead
         compute_dca.assert_called_once_with(100.0, "BUY", [], atr=0.5)
 
@@ -714,6 +723,10 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertFalse(position["single_tp"])
         self.assertFalse(position["dca_applied"])
         self.assertIsNone(position["dca_protective_stop_hit"])
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same restart-loses-
+        # the-true-window honesty policy as risk_distance elsewhere.
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
 
     def test_protective_dca_pending_single_tp_shape_is_recovered_as_dca_pending(self):
         manager = PositionManager()
@@ -736,6 +749,8 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertEqual(position["dca_protective_sl_order_id"], "prot_sl_real")
         self.assertEqual(position["tp_price"], 106.0)
         self.assertEqual(position["tp_order_id"], "tp_solo")
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
 
     def test_protective_tag_without_matching_tp_shape_falls_through(self):
         # A protective-tagged SL with only ONE side of TP1/TP2 (neither
@@ -789,6 +804,9 @@ class ReconcileOnStartupTests(unittest.TestCase):
         self.assertTrue(position["dca_applied"])
         self.assertFalse(position["dca_breakeven_applied"])
         self.assertIsNone(position["risk_distance"])  # honest - no original stop survives a restart
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same honesty policy.
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
         # DCA_ACTIVE has no TP1/TP2 concept - the keys exist (every
         # position dict shape does, config.TP_STATIC_ROI_ENABLED needs
         # this consistency) but are always None here.
@@ -1203,6 +1221,26 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(position["risk_distance"], 2.0)
         self.assertEqual(position["mae_price"], 100)
         self.assertEqual(position["mfe_price"], 100)
+
+    def test_captures_btc_entry_price_from_plan(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - main.py's own
+        # _evaluate_symbol is what decides the value (None for BTCUSDT
+        # itself); register() just copies whatever plan carries verbatim.
+        manager = PositionManager()
+        plan = {**_plan(), "btc_entry_price": 45000.0}
+        position = manager.register(plan, {"shadow": True})
+
+        self.assertEqual(position["btc_entry_price"], 45000.0)
+        self.assertEqual(position["btc_max_adverse_price"], 45000.0)
+
+    def test_btc_entry_price_is_none_when_plan_omits_it(self):
+        # _plan()'s own default shape (e.g. a BTCUSDT signal itself, or
+        # main.py's btc_candles unavailable) never sets this key at all.
+        manager = PositionManager()
+        position = manager.register(_plan(), {"shadow": True})
+
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
 
     def test_real_entry_price_corrects_entry_breakeven_and_risk_distance(self):
         # entry=100 planned, sl=98 (_plan()) - a real fill at 100.5 (0.5%
@@ -1776,6 +1814,72 @@ class MaeMfeTrackingTests(unittest.TestCase):
         self.assertIsNone(mae_r)
         self.assertIsNone(mfe_r)
 
+    # _update_mae_mfe_from_candles (2026-09-04) - live mode sampled only
+    # the mark price, so a wick that reversed between two poll ticks was
+    # invisible to MAE. Real proof it mattered: 1000LUNCUSDT journaled
+    # mae_r_multiple=0.46R while its DCA had already fired at 0.65R -
+    # impossible unless the recorded MAE missed the move.
+
+    def test_candle_range_captures_a_wick_the_point_sample_would_miss(self):
+        position = self._position(mae_price=100, mfe_price=100)
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe_from_candles(
+                position, [{"high": 101.0, "low": 96.5}]
+            )
+
+        self.assertEqual(position["mae_price"], 96.5)
+        self.assertEqual(position["mfe_price"], 101.0)
+
+    def test_candle_range_tracks_the_high_as_adverse_for_a_sell(self):
+        position = self._position(side="SELL", mae_price=100, mfe_price=100)
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe_from_candles(
+                position, [{"high": 103.0, "low": 99.0}]
+            )
+
+        self.assertEqual(position["mae_price"], 103.0)
+        self.assertEqual(position["mfe_price"], 99.0)
+
+    def test_only_the_latest_candle_is_read(self):
+        # candles[-1] is the still-forming one; older closed candles were
+        # already folded in by earlier polls.
+        position = self._position(mae_price=100, mfe_price=100)
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True):
+            PositionManager._update_mae_mfe_from_candles(
+                position, [{"high": 120.0, "low": 80.0}, {"high": 101.0, "low": 99.0}]
+            )
+
+        self.assertEqual(position["mae_price"], 99.0)
+        self.assertEqual(position["mfe_price"], 101.0)
+
+    def test_empty_or_incomplete_candles_are_a_noop(self):
+        # Same never-act-on-incomplete-data rule
+        # _dca_price_reached_in_range already applies.
+        # "candle" (a bare string) stands in for a malformed feed entry -
+        # must degrade quietly, never raise inside poll_live.
+        for candles in ([], None, [{"high": 101.0}], [{"low": 99.0}], [{}], ["candle"]):
+            position = self._position(mae_price=100, mfe_price=100)
+
+            with patch.object(config, "MAE_TRACKING_ENABLED", True):
+                PositionManager._update_mae_mfe_from_candles(position, candles)
+
+            self.assertEqual(position["mae_price"], 100, candles)
+            self.assertEqual(position["mfe_price"], 100, candles)
+
+    def test_candle_range_respects_the_disabled_flag(self):
+        position = self._position(mae_price=100, mfe_price=100)
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", False):
+            PositionManager._update_mae_mfe_from_candles(
+                position, [{"high": 110.0, "low": 90.0}]
+            )
+
+        self.assertEqual(position["mae_price"], 100)
+        self.assertEqual(position["mfe_price"], 100)
+
     # config.DCA_ENABLED (2026-08-31) - _execute_dca legitimately
     # overwrites entry_price/risk_distance with the new blended values
     # once DCA fires, which would silently break this function's own
@@ -1825,6 +1929,104 @@ class MaeMfeTrackingTests(unittest.TestCase):
 
         self.assertAlmostEqual(mae_r, 1.5)
         self.assertAlmostEqual(mfe_r, 1.5)
+
+
+class BtcAdverseMoveTrackingTests(unittest.TestCase):
+    """config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real evidence (199 real
+    LIVE resolved trades) that the max real adverse BTC move during a
+    position's real open life predicts loss rate cleanly and monotonically
+    (4.8% -> 38.2% loss rate as the move grows). Mirrors MaeMfeTrackingTests
+    one step removed: side-based min/max, but against BTC's own low/high."""
+
+    def _position(self, side="BUY", btc_entry_price=45000.0, **overrides):
+        position = {
+            "side": side,
+            "btc_entry_price": btc_entry_price,
+            "btc_max_adverse_price": btc_entry_price,
+        }
+        position.update(overrides)
+        return position
+
+    def test_disabled_config_leaves_tracking_untouched(self):
+        position = self._position()
+
+        with patch.object(config, "BTC_ADVERSE_MOVE_TRACKING_ENABLED", False):
+            PositionManager._update_btc_adverse_move(position, 44000, 46000)
+
+        self.assertEqual(position["btc_max_adverse_price"], 45000.0)
+
+    def test_buy_tracks_the_low_as_adverse(self):
+        position = self._position(side="BUY")
+
+        with patch.object(config, "BTC_ADVERSE_MOVE_TRACKING_ENABLED", True):
+            PositionManager._update_btc_adverse_move(position, 44550, 45200)
+
+        self.assertEqual(position["btc_max_adverse_price"], 44550)
+
+    def test_sell_tracks_the_high_as_adverse(self):
+        position = self._position(side="SELL")
+
+        with patch.object(config, "BTC_ADVERSE_MOVE_TRACKING_ENABLED", True):
+            PositionManager._update_btc_adverse_move(position, 44800, 45450)
+
+        self.assertEqual(position["btc_max_adverse_price"], 45450)
+
+    def test_extremes_only_ever_move_in_the_worse_direction(self):
+        # A later, less-adverse sample must not undo an already-recorded
+        # worst BTC price.
+        position = self._position(side="BUY")
+
+        with patch.object(config, "BTC_ADVERSE_MOVE_TRACKING_ENABLED", True):
+            PositionManager._update_btc_adverse_move(position, 44000, 45100)
+            PositionManager._update_btc_adverse_move(position, 44700, 45050)
+
+        self.assertEqual(position["btc_max_adverse_price"], 44000)
+
+    def test_none_low_or_high_is_ignored(self):
+        position = self._position()
+
+        with patch.object(config, "BTC_ADVERSE_MOVE_TRACKING_ENABLED", True):
+            PositionManager._update_btc_adverse_move(position, None, None)
+
+        self.assertEqual(position["btc_max_adverse_price"], 45000.0)
+
+    def test_no_op_when_btc_entry_price_is_none(self):
+        # A BTCUSDT position itself, a still-pending resting order, or a
+        # restart-adopted position - see register()/_adopt_position.
+        position = self._position(btc_entry_price=None, btc_max_adverse_price=None)
+
+        with patch.object(config, "BTC_ADVERSE_MOVE_TRACKING_ENABLED", True):
+            PositionManager._update_btc_adverse_move(position, 44000, 46000)
+
+        self.assertIsNone(position["btc_max_adverse_price"])
+
+    def test_pct_is_always_positive_and_normalized_to_entry(self):
+        position = self._position(btc_entry_price=45000.0, btc_max_adverse_price=44550.0)
+
+        pct = PositionManager._btc_max_adverse_move_pct(position)
+
+        self.assertAlmostEqual(pct, (45000.0 - 44550.0) / 45000.0 * 100)
+
+    def test_pct_is_positive_for_a_sell_too(self):
+        # SELL's adverse direction is BTC rising - abs() makes the sign
+        # irrelevant either way, same convention as _mae_mfe_r_multiples.
+        position = self._position(btc_entry_price=45000.0, btc_max_adverse_price=45450.0)
+
+        pct = PositionManager._btc_max_adverse_move_pct(position)
+
+        self.assertAlmostEqual(pct, (45450.0 - 45000.0) / 45000.0 * 100)
+
+    def test_pct_is_none_without_an_entry_price(self):
+        position = self._position(btc_entry_price=None, btc_max_adverse_price=None)
+
+        self.assertIsNone(PositionManager._btc_max_adverse_move_pct(position))
+
+    def test_pct_is_zero_without_any_update(self):
+        # Seeded to entry_price at registration, never moved - a genuine
+        # 0% reading, not unknown.
+        position = self._position(btc_entry_price=45000.0, btc_max_adverse_price=45000.0)
+
+        self.assertEqual(PositionManager._btc_max_adverse_move_pct(position), 0.0)
 
 
 class _FakeCandleStore:
@@ -2561,6 +2763,21 @@ class PollShadowTests(unittest.TestCase):
         manager.register(_plan(side), {"shadow": True})
         return manager
 
+    def test_btc_low_high_update_the_adverse_tracker(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED
+        manager = self._manager_with_position(side="SELL")
+        manager.positions["BTCUSDT"]["btc_entry_price"] = 45000.0
+        manager.positions["BTCUSDT"]["btc_max_adverse_price"] = 45000.0
+
+        # A neutral candle (touches neither entry's sl=102 nor tp1=98) so
+        # this poll doesn't also resolve/close the position.
+        manager.poll_shadow(
+            "BTCUSDT", _candle(high=100.5, low=99.5), btc_low=44700.0, btc_high=45300.0,
+        )
+
+        # side="SELL" - high is the adverse extreme.
+        self.assertEqual(manager.positions["BTCUSDT"]["btc_max_adverse_price"], 45300.0)
+
     def test_tp1_pending_sl_hit_closes_as_sl(self):
         manager = self._manager_with_position()
         outcome = manager.poll_shadow("BTCUSDT", _candle(high=99, low=97))  # low <= sl(98)
@@ -2982,6 +3199,71 @@ class PollLiveTests(unittest.TestCase):
         }
         manager.register(_plan(), execution_result)
         return manager
+
+    def test_btc_low_high_update_the_adverse_tracker_with_no_new_fetch(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - btc_low/btc_high are
+        # already-fetched in-memory values (main.py), never a new
+        # exchange call from inside poll_live itself.
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["btc_entry_price"] = 45000.0
+        manager.positions["BTCUSDT"]["btc_max_adverse_price"] = 45000.0
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[]):
+            manager.poll_live("BTCUSDT", btc_low=44550.0, btc_high=45100.0)
+
+        # side="BUY" (_plan()'s default) - low is the adverse extreme.
+        self.assertEqual(manager.positions["BTCUSDT"]["btc_max_adverse_price"], 44550.0)
+
+    def test_omitted_btc_low_high_is_a_safe_noop(self):
+        manager = self._manager_with_position()
+        manager.positions["BTCUSDT"]["btc_entry_price"] = 45000.0
+        manager.positions["BTCUSDT"]["btc_max_adverse_price"] = 45000.0
+
+        with patch.object(exchange, "get_open_algo_orders", return_value=[]):
+            manager.poll_live("BTCUSDT")  # btc_low/btc_high both default None
+
+        self.assertEqual(manager.positions["BTCUSDT"]["btc_max_adverse_price"], 45000.0)
+
+    def test_candle_wick_is_recorded_in_mae_even_when_the_mark_sample_misses_it(self):
+        # The real 2026-09-04 bug: an adverse wick that reversed between
+        # two poll ticks never reached mae_price, because live mode only
+        # ever sampled exchange.get_mark_price. Mark price here is a
+        # perfectly ordinary 100 while the forming candle already printed
+        # a 97 low - the 97 must win.
+        manager = self._manager_with_position()
+        candles = [{"open_time": 0, "high": 100.5, "low": 97.0, "close": 100.0}]
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=100.0), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]):
+            manager.poll_live("BTCUSDT", candles=candles)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["mae_price"], 97.0)   # the wick, not the 100 sample
+        self.assertEqual(position["mfe_price"], 100.5)
+
+    def test_mark_price_still_wins_when_it_is_the_more_extreme_reading(self):
+        # The two sources compose - whichever is worse/better survives, so
+        # adding the candle range can never make MAE/MFE less accurate.
+        manager = self._manager_with_position()
+        candles = [{"open_time": 0, "high": 100.2, "low": 99.5, "close": 100.0}]
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=98.5), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]):
+            manager.poll_live("BTCUSDT", candles=candles)
+
+        self.assertEqual(manager.positions["BTCUSDT"]["mae_price"], 98.5)
+
+    def test_missing_candles_leaves_mae_to_the_mark_sample_alone(self):
+        manager = self._manager_with_position()
+
+        with patch.object(config, "MAE_TRACKING_ENABLED", True), \
+             patch.object(exchange, "get_mark_price", return_value=99.0), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]):
+            manager.poll_live("BTCUSDT")  # candles defaults to None
+
+        self.assertEqual(manager.positions["BTCUSDT"]["mae_price"], 99.0)
 
     def test_tp1_finished_promotes_to_breakeven(self):
         # A genuine TP1 fill now locks real profit (EARLY_BREAKEVEN_LOCK_
@@ -3768,6 +4050,10 @@ class RegisterPendingEntryTests(unittest.TestCase):
         self.assertEqual(position["limit_order_id"], "limit1")
         self.assertIsNone(position["mae_price"])
         self.assertIsNone(position["mfe_price"])
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - tracking a not-yet-
+        # real fill's excursion is meaningless, same reasoning as mae/mfe.
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
 
     def test_reserves_a_max_total_positions_slot_immediately(self):
         # No separate pending-entry accounting - same dict as register(),
@@ -3818,6 +4104,24 @@ class PollPendingEntryFillTests(unittest.TestCase):
         place_sl.assert_called_once()
         place_tp2.assert_called_once()
         place_tp1.assert_called_once()
+
+    def test_first_fill_backfills_the_btc_entry_price_anchor(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - a resting limit can
+        # fill minutes-to-hours after the signal-time snapshot, so the
+        # real anchor comes from the real fill moment (main.py's own
+        # btc_price, passed through poll_pending_entry), not whatever was
+        # in the plan at signal time.
+        manager = _pending_manager()
+
+        with patch.object(exchange, "get_order_status", return_value=_pending_order_status("FILLED", executed_qty=1.0, avg_price=100.0)), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}):
+            manager.poll_pending_entry("BTCUSDT", latest_candle=None, btc_price=45000.0)
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["btc_entry_price"], 45000.0)
+        self.assertEqual(position["btc_max_adverse_price"], 45000.0)
 
     def test_partial_fill_places_sl_and_tp2_but_defers_tp1(self):
         manager = _pending_manager()
@@ -3998,7 +4302,9 @@ class PollShadowPendingEntryTests(unittest.TestCase):
 
     def test_candle_touching_entry_fills_and_transitions(self):
         manager = self._shadow_manager()  # entry=100
-        outcome = manager.poll_shadow_pending_entry("BTCUSDT", _candle(high=101, low=99))  # range covers 100
+        outcome = manager.poll_shadow_pending_entry(
+            "BTCUSDT", _candle(high=101, low=99), btc_price=45000.0
+        )  # range covers 100
 
         self.assertIsNone(outcome)
         position = manager.positions["BTCUSDT"]
@@ -4006,6 +4312,10 @@ class PollShadowPendingEntryTests(unittest.TestCase):
         self.assertEqual(position["filled_quantity"], position["quantity"])
         self.assertEqual(position["mae_price"], 100)
         self.assertEqual(position["mfe_price"], 100)
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - same real fill-time
+        # backfill as the live poll_pending_entry path.
+        self.assertEqual(position["btc_entry_price"], 45000.0)
+        self.assertEqual(position["btc_max_adverse_price"], 45000.0)
 
     def test_candle_touching_both_entry_and_sl_assumes_sl_first_no_fill(self):
         manager = self._shadow_manager()  # entry=100, sl=98
@@ -4504,6 +4814,35 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         tp1.assert_called_once()
         tp2.assert_called_once()
 
+    def test_btc_price_overrides_the_stale_signal_time_anchor(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - a resting retracement
+        # limit can fill minutes-to-hours after the signal-time snapshot
+        # in plan["btc_entry_price"] - the real fill-moment btc_price
+        # (threaded from main.py) must win.
+        manager = _retracement_manager(dca=True, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["btc_entry_price"] = 44000.0  # stale signal-time snapshot
+
+        with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT", btc_price=45000.0)
+
+        final = manager.positions["BTCUSDT"]
+        self.assertEqual(final["btc_entry_price"], 45000.0)
+        self.assertEqual(final["btc_max_adverse_price"], 45000.0)
+
+    def test_btc_price_falls_back_to_the_signal_time_anchor_when_unavailable(self):
+        manager = _retracement_manager(dca=True, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["btc_entry_price"] = 44000.0
+
+        with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")  # btc_price omitted
+
+        final = manager.positions["BTCUSDT"]
+        self.assertEqual(final["btc_entry_price"], 44000.0)
+
     def test_static_tp1_is_recomputed_from_the_real_fill_not_the_stale_trigger(self):
         # Real bug found live (2026-08-21, SLXUSDT): TP1 stayed computed
         # off the planned trigger price even though the retracement limit
@@ -4812,7 +5151,14 @@ class PollRetracementPendingTests(unittest.TestCase):
         market_order.assert_not_called()
 
     def test_expiry_with_zero_fill_falls_back_to_a_full_market_order(self):
-        manager = _retracement_manager(dca=True, single_tp=False)
+        # retracement_timeout_seconds=300 captured explicitly at
+        # registration, not left to the ambient config default (which a
+        # live .env can freely override) - the later patch.object(config,
+        # "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300) below only affects a
+        # FRESH read, not this already-captured per-position value (see
+        # register_retracement_pending's own retracement_timeout_seconds
+        # comment).
+        manager = _retracement_manager(dca=True, single_tp=False, retracement_timeout_seconds=300)
         manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
 
         with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
@@ -4833,7 +5179,7 @@ class PollRetracementPendingTests(unittest.TestCase):
         market_order.assert_called_once_with("BTCUSDT", "BUY", 1.0)
 
     def test_expiry_with_a_partial_fill_blends_with_the_market_fallback(self):
-        manager = _retracement_manager(dca=True, single_tp=False)
+        manager = _retracement_manager(dca=True, single_tp=False, retracement_timeout_seconds=300)
         manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
 
         with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
@@ -4856,7 +5202,7 @@ class PollRetracementPendingTests(unittest.TestCase):
         # documents: a fill can land microseconds before the cancel takes
         # effect, so the post-cancel re-check must catch it instead of
         # treating this as a clean, unfilled expiry.
-        manager = _retracement_manager(dca=True, single_tp=False)
+        manager = _retracement_manager(dca=True, single_tp=False, retracement_timeout_seconds=300)
         manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
 
         order_statuses = iter([
@@ -4898,7 +5244,7 @@ class PollRetracementPendingTests(unittest.TestCase):
         self.assertEqual(append_settle.call_args.args[3], "LIMIT")
 
     def test_expired_fallback_journals_fill_type_market_fallback(self):
-        manager = _retracement_manager(dca=True, single_tp=False)
+        manager = _retracement_manager(dca=True, single_tp=False, retracement_timeout_seconds=300)
         manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
 
         with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
@@ -4914,7 +5260,7 @@ class PollRetracementPendingTests(unittest.TestCase):
         self.assertEqual(append_settle.call_args.args[3], "MARKET_FALLBACK")
 
     def test_partial_fill_plus_fallback_journals_fill_type_market_fallback(self):
-        manager = _retracement_manager(dca=True, single_tp=False)
+        manager = _retracement_manager(dca=True, single_tp=False, retracement_timeout_seconds=300)
         manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
 
         with patch.object(config, "RETRACEMENT_ENTRY_TIMEOUT_SECONDS", 300), \
@@ -5107,7 +5453,10 @@ class PollShadowRetracementPendingTests(unittest.TestCase):
         self.assertFalse(manager.has_open_position("BTCUSDT"))
 
     def test_expiry_falls_back_to_the_candle_close(self):
-        manager = _retracement_manager(dca=True, single_tp=False, shadow=True, retracement_price=99.8)
+        manager = _retracement_manager(
+            dca=True, single_tp=False, shadow=True, retracement_price=99.8,
+            retracement_timeout_seconds=300,
+        )
         manager.positions["BTCUSDT"]["limit_placed_at"] = time.time() - 1000
         candle = _candle(high=100.5, low=100.2, close=100.3)  # never reaches retracement or sl
 
@@ -5253,6 +5602,23 @@ class RegisterDcaPendingTests(unittest.TestCase):
         self.assertFalse(position["dca_applied"])
         self.assertEqual(position["dca_price"], 96)
         self.assertEqual(position["dca_quantity"], 1.0)
+
+    def test_captures_btc_entry_price_from_plan(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - see RegisterTests'
+        # own identical test for the full rationale.
+        manager = PositionManager()
+        plan = {**_dca_plan(), "btc_entry_price": 45000.0}
+        position = manager.register_dca_pending(plan, {"shadow": True})
+
+        self.assertEqual(position["btc_entry_price"], 45000.0)
+        self.assertEqual(position["btc_max_adverse_price"], 45000.0)
+
+    def test_btc_entry_price_is_none_when_plan_omits_it(self):
+        manager = PositionManager()
+        position = manager.register_dca_pending(_dca_plan(), {"shadow": True})
+
+        self.assertIsNone(position["btc_entry_price"])
+        self.assertIsNone(position["btc_max_adverse_price"])
 
     def test_live_registration_never_reads_an_sl_order_even_if_present(self):
         # execution.enter_trade_dca_pending never returns an "sl_order"
@@ -5519,6 +5885,24 @@ class ExecuteDcaShadowTests(unittest.TestCase):
         # entry (see _execute_dca's own docstring).
         args, _ = build_plan.call_args
         self.assertEqual(args[2], 96)
+
+    def test_never_touches_btc_entry_price_or_max_adverse_price(self):
+        # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - unlike entry_price/
+        # risk_distance (which _execute_dca legitimately overwrites with
+        # the new blended values), the BTC anchor is never derived from
+        # this position's own entry_price, so it must survive a DCA fire
+        # completely untouched - defensive regression test guarding
+        # against a future dev copying the entry-overwrite pattern here.
+        manager = self._manager_with_dca_pending()
+        position = manager.positions["BTCUSDT"]
+        position["btc_entry_price"] = 45000.0
+        position["btc_max_adverse_price"] = 44700.0
+
+        with patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN):
+            manager._execute_dca(position)
+
+        self.assertEqual(position["btc_entry_price"], 45000.0)
+        self.assertEqual(position["btc_max_adverse_price"], 44700.0)
 
     def test_breakeven_price_is_recomputed_from_the_new_blended_entry(self):
         # Real gap this closes: left stale at the ORIGINAL (pre-DCA)
