@@ -140,6 +140,15 @@ class RealtimeMarketData:
 
         self.candles = CandleStore(maxlen=config.WS_KLINE_HISTORY_LIMIT)
         self.htf_candles = CandleStore(maxlen=config.HTF_KLINE_HISTORY_LIMIT)
+        # config.EMA_TREND_MIXED_REJECT_ENABLED - deeper, SEPARATE buffers
+        # feeding nothing but signal_engine._ema_regime's EMA50/EMA200 read.
+        # Deliberately not the same stores as above: those feed
+        # market_structure.analyze()/structure_state(), which consume the
+        # whole buffer unbounded, so deepening them would move swing points,
+        # liquidity pools, structure_level, TP resolution and dca_price on
+        # every trade. See EMA_TREND_HISTORY_LIMIT's own config.py comment.
+        self.trend_candles = CandleStore(maxlen=config.EMA_TREND_HISTORY_LIMIT)
+        self.htf_trend_candles = CandleStore(maxlen=config.EMA_TREND_HISTORY_LIMIT)
         self.cvd = CVDEngine()
         self.depth = DepthImbalanceEngine()
         self.open_interest = OpenInterestEngine()
@@ -258,13 +267,24 @@ class RealtimeMarketData:
         self._close_websockets(market_sockets + depth_sockets + liquidation_sockets)
 
     def _seed_history(self):
+        # config.EMA_TREND_MIXED_REJECT_ENABLED - ONE fetch per timeframe at
+        # the deeper of the two depths, used to seed both stores. CandleStore.
+        # seed builds its own deque(maxlen=self.maxlen), so the 200-deep
+        # stores keep exactly the last 200 rows and see precisely what they
+        # see today; only the extra rows the trend stores need are added to
+        # the payload. No additional REST calls, and 400 stays inside
+        # Binance's [100,500) -> weight 2 tier (KLINE_REQUEST_WEIGHT).
+        ltf_limit = max(config.WS_KLINE_HISTORY_LIMIT, config.EMA_TREND_HISTORY_LIMIT)
+        htf_limit = max(config.HTF_KLINE_HISTORY_LIMIT, config.EMA_TREND_HISTORY_LIMIT)
+
         for symbol in self.symbols:
             ltf_df = get_klines(
                 symbol,
                 config.WS_KLINE_INTERVAL,
-                limit=config.WS_KLINE_HISTORY_LIMIT,
+                limit=ltf_limit,
             )
             self.candles.seed(symbol, ltf_df)
+            self.trend_candles.seed(symbol, ltf_df)
 
             if config.CVD_DIVERGENCE_TRIGGER_ENABLED:
                 # Reuses ltf_df above - no separate REST call needed, see
@@ -274,9 +294,10 @@ class RealtimeMarketData:
             htf_df = get_klines(
                 symbol,
                 config.HTF_KLINE_INTERVAL,
-                limit=config.HTF_KLINE_HISTORY_LIMIT,
+                limit=htf_limit,
             )
             self.htf_candles.seed(symbol, htf_df)
+            self.htf_trend_candles.seed(symbol, htf_df)
 
             if config.OI_DIVERGENCE_TRIGGER_ENABLED:
                 self.open_interest.seed_from_history(
@@ -552,8 +573,12 @@ class RealtimeMarketData:
 
         if interval == config.HTF_KLINE_INTERVAL and interval != config.WS_KLINE_INTERVAL:
             self.htf_candles.update(symbol, candle)
+            # config.EMA_TREND_MIXED_REJECT_ENABLED - same candle, deeper
+            # buffer; see __init__ for why this is a separate store.
+            self.htf_trend_candles.update(symbol, candle)
         else:
             self.candles.update(symbol, candle)
+            self.trend_candles.update(symbol, candle)
 
             # Only the LTF stream feeds CVD divergence (cvd_divergence.py
             # compares CVD against LTF swing points, same timeframe every

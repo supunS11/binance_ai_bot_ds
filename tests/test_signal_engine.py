@@ -103,6 +103,11 @@ class SignalEngineTests(unittest.TestCase):
         volume_profile_snapshot=None,
         htf_candles=None,
         htf_trend_ema_primary_enabled=False,
+        ltf_trend_ema=None,
+        ltf_ema_fast=None,
+        ltf_ema_slow=None,
+        htf_ema_fast=None,
+        htf_ema_slow=None,
         liquidation_snapshot_bybit=None,
         liquidation_snapshot_okx=None,
     ):
@@ -179,22 +184,49 @@ class SignalEngineTests(unittest.TestCase):
         )
         btc_candles = ["btc_candle_placeholder"] if btc_candles == "default" else btc_candles
 
-        # Three distinct callers share this one mocked function: the
-        # existing informational LTF ema_value (called with just
-        # ltf_candles, no period=), the faster ema_alignment_value used
-        # only for ema_aligned (always called with period=
-        # config.EMA_ALIGNMENT_PERIOD), and the HTF_TREND_FRESHNESS_ENABLED
-        # gate's htf_trend_ema (always called with period=
-        # config.HTF_TREND_EMA_PERIOD - see signal_engine.py). Routing on
-        # the exact period value keeps all three independently
-        # controllable - htf_trend_ema defaults to None (gate is a no-op)
-        # so no existing test is affected unless it explicitly opts in.
+        # FOUR distinct callers now share this one mocked function: the
+        # existing informational LTF ema_value (ltf_candles, no period=),
+        # the faster ema_alignment_value used only for ema_aligned
+        # (ltf_candles, period=config.EMA_ALIGNMENT_PERIOD), the
+        # HTF_TREND_FRESHNESS_ENABLED gate's htf_trend_ema (htf_candles,
+        # period=config.HTF_TREND_EMA_PERIOD), and config.LTF_TREND_FILTER_
+        # ENABLED's ltf_trend_ema (ltf_candles, period=config.LTF_TREND_
+        # EMA_PERIOD).
+        #
+        # Routing on period ALONE is no longer safe: LTF_TREND_EMA_PERIOD
+        # and HTF_TREND_EMA_PERIOD both default to 20, so the 1h call would
+        # silently receive the 4h value and every LTF_TREND_OPPOSED test
+        # would be meaningless. Route on WHICH CANDLE LIST was passed first
+        # (the two lists are distinct objects), then on period within the
+        # LTF ones. ltf_trend_ema defaults to None (gate is a no-op) so no
+        # existing test is affected unless it explicitly opts in.
+        ltf_candle_list = _ltf_candles(ltf_close)
+
+        # config.EMA_TREND_MIXED_REJECT_ENABLED adds two MORE callers per
+        # timeframe (_ema_regime's EMA50 and EMA200 reads, on both lists).
+        # 50/200 don't collide with the 20/4 above, but the HTF branch has
+        # to check them BEFORE its catch-all htf_trend_ema return or both
+        # would come back equal. All four default to None, which makes
+        # _ema_regime return None and leaves the gate inert - so no existing
+        # test changes behaviour unless it opts in.
         def _ema_side_effect(candles, period=None):
+            if candles is htf_candles:
+                if period == config.EMA_TREND_FAST_PERIOD:
+                    return htf_ema_fast
+                if period == config.EMA_TREND_SLOW_PERIOD:
+                    return htf_ema_slow
+                return htf_trend_ema
             if period is None:
                 return ema_value
             if period == config.EMA_ALIGNMENT_PERIOD:
                 return ema_alignment_value
-            return htf_trend_ema
+            if period == config.LTF_TREND_EMA_PERIOD:
+                return ltf_trend_ema
+            if period == config.EMA_TREND_FAST_PERIOD:
+                return ltf_ema_fast
+            if period == config.EMA_TREND_SLOW_PERIOD:
+                return ltf_ema_slow
+            return ema_value
 
         # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED's slope input -
         # mocked as its own separate function (not a second exponential_
@@ -242,7 +274,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(cvd_divergence, "detect_divergence", return_value=divergence), \
              patch.object(oi_divergence, "detect_divergence", return_value=oi_divergence_result):
             return signal_engine.evaluate(
-                symbol, htf_candles, _ltf_candles(ltf_close), cvd, depth,
+                symbol, htf_candles, ltf_candle_list, cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
                 quote_volume_usdt=quote_volume_usdt, btc_candles=btc_candles,
                 funding_rate=funding_rate, crash_snapshot=crash_snapshot,
@@ -584,6 +616,256 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
         self.assertAlmostEqual(result["htf_trend_live_distance_pct"], 5.0, places=4)
         self.assertAlmostEqual(result["htf_trend_live_slope_pct"], 5.263157, places=4)
+
+    # config.LTF_TREND_FILTER_ENABLED (2026-09-05) - the 1h sibling of
+    # AGAINST_HTF_BIAS. Real evidence in that flag's own config.py comment:
+    # the median real trade lives 2.0h while htf_trend_live has 80h of
+    # memory; re-evaluated against real 1h klines at 103 real entry
+    # timestamps, trades opposing a 1h EMA20 carried 2.6x the drawdown
+    # (median MAE 0.96R vs 0.37R). _run's default ltf_close is 100.0.
+
+    def test_ltf_trend_opposed_rejects_a_buy_below_the_1h_ema(self):
+        # _run's default ltf_close is 93.0; ema 95.0 sits above it, so the
+        # 1h reads BEARISH while the candidate is BUY.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", True):
+            result = self._run(ltf_trend_ema=95.0)
+
+        self.assertEqual(result["reason"], "LTF_TREND_OPPOSED")
+
+    def test_ltf_trend_opposed_rejects_a_sell_above_the_1h_ema(self):
+        # Standard SELL fixture (ltf_close=108.0); ema 100.0 sits below it,
+        # so the 1h reads BULLISH while the candidate is SELL.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0,
+                ltf_trend_ema=100.0,
+            )
+
+        self.assertEqual(result["reason"], "LTF_TREND_OPPOSED")
+
+    def test_ltf_trend_agreeing_buy_passes(self):
+        # close 93.0 > ema 85.0 -> 1h BULLISH, candidate BUY.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", True):
+            result = self._run(ltf_trend_ema=85.0)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["ltf_trend_live"], "BULLISH")
+
+    def test_ltf_trend_agreeing_sell_passes(self):
+        # close 108.0 < ema 115.0 -> 1h BEARISH, candidate SELL.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0,
+                ltf_trend_ema=115.0,
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["ltf_trend_live"], "BEARISH")
+
+    def test_ltf_trend_filter_off_never_rejects(self):
+        # The one-flag revert path - identical opposed setup to the first
+        # test in this block.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", False):
+            result = self._run(ltf_trend_ema=95.0)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_ltf_trend_unavailable_ema_never_rejects(self):
+        # exponential_moving_average returns None with too little history -
+        # absence must never block a trade, same fail-open convention as
+        # every other gate here.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", True):
+            result = self._run(ltf_trend_ema=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["ltf_trend_live"])
+
+    def test_ltf_trend_price_exactly_on_the_ema_never_rejects(self):
+        # Neither strictly above nor below - ltf_trend_live stays None,
+        # mirroring htf_trend_live's own equality handling.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", True):
+            result = self._run(ltf_trend_ema=93.0)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["ltf_trend_live"])
+
+    def test_ltf_trend_applies_to_reversal_triggers_too(self):
+        # THE deliberate difference from AGAINST_HTF_BIAS, which
+        # _TREND_AGREEMENT_EXEMPT_TRIGGERS waives for reversal triggers.
+        # This gate is universal (never read from trigger_gate_profiles) -
+        # 2 of the 6 worst real losses it catches (ZKPUSDT/CVD_DIVERGENCE,
+        # 1000BONKUSDT/LIQUIDATION_SWEEP_CONFIRMED) come from exactly those
+        # exempt triggers, and the +86.21 validation applied it to every
+        # trigger with no exemption. Same CVD_DIVERGENCE fixture as
+        # test_cvd_divergence_triggered_signal_when_enabled, which passes
+        # without this gate; ema 95.0 > close 93.0 opposes the BUY.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", True),              patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                divergence_open_time=555, ltf_trend_ema=95.0,
+            )
+
+        self.assertEqual(result["reason"], "LTF_TREND_OPPOSED")
+
+    def test_ltf_trend_live_is_journaled_even_with_the_gate_off(self):
+        # Ships OFF but must still populate the field, so the prospective
+        # 1h-vs-4h comparison keeps building real forward data.
+        with patch.object(config, "LTF_TREND_FILTER_ENABLED", False):
+            result = self._run(ltf_trend_ema=85.0)
+
+        self.assertEqual(result["ltf_trend_live"], "BULLISH")
+
+    # config.EMA_TREND_MIXED_REJECT_ENABLED (2026-09-05) - the operator's
+    # "Mixed" gate. EMA50 vs EMA200 on BOTH 1h and 4h; ONLY the 1-of-2
+    # bucket rejects. Real evidence over 111 trades in that flag's config.py
+    # comment: MIXED -114.18 (32% DCA, 0.74R median MAE), BOTH_OPPOSED
+    # +88.59 across 69 trades and deliberately NOT gated.
+    #
+    # Standard fixture is a BUY, so want=BULLISH: fast > slow reads BULLISH
+    # (agrees), fast < slow reads BEARISH (opposes).
+
+    def _mixed_buy(self, **kwargs):
+        # 1h agrees (50 > 200), 4h opposes (50 < 200) -> exactly 1 of 2.
+        return self._run(
+            ltf_ema_fast=110.0, ltf_ema_slow=100.0,
+            htf_ema_fast=100.0, htf_ema_slow=110.0, **kwargs
+        )
+
+    def test_ema_trend_mixed_rejects_when_only_the_1h_agrees(self):
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._mixed_buy()
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
+    def test_ema_trend_mixed_rejects_when_only_the_4h_agrees(self):
+        # The mirror image - the bucket is symmetric, it counts agreements
+        # rather than caring which timeframe supplied them.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_ema_fast=100.0, ltf_ema_slow=110.0,
+                htf_ema_fast=110.0, htf_ema_slow=100.0,
+            )
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
+    def test_ema_trend_both_agree_passes(self):
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_ema_fast=110.0, ltf_ema_slow=100.0,
+                htf_ema_fast=110.0, htf_ema_slow=100.0,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["ema_trend_bucket"], "BOTH_AGREE")
+
+    def test_ema_trend_both_opposed_passes(self):
+        # REGRESSION GUARD, not a formality: "both opposed" measured +88.59
+        # over 69 real trades and is 62% of all flow. Gating it would cost
+        # money and drop 51 winners, so it must stay reachable even with the
+        # Mixed gate fully on.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_ema_fast=100.0, ltf_ema_slow=110.0,
+                htf_ema_fast=100.0, htf_ema_slow=110.0,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["ema_trend_bucket"], "BOTH_OPPOSED")
+
+    def test_ema_trend_mixed_gate_off_never_rejects(self):
+        # The one-flag revert path.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", False):
+            result = self._mixed_buy()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["ema_trend_bucket"], "MIXED")
+
+    def test_ema_trend_unreadable_regime_never_rejects(self):
+        # exponential_moving_average returns None below `period` - with a
+        # 200-period slow EMA that is the normal state until the deeper
+        # trend buffer fills. Absence must never block a trade.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_ema_fast=110.0, ltf_ema_slow=None,
+                htf_ema_fast=100.0, htf_ema_slow=110.0,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["ltf_ema_regime"])
+        self.assertIsNone(result["ema_trend_bucket"])
+
+    def test_ema_trend_exact_tie_never_rejects(self):
+        # fast == slow is neither bullish nor bearish - same equality
+        # handling as htf_trend_live/ltf_trend_live.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_ema_fast=100.0, ltf_ema_slow=100.0,
+                htf_ema_fast=100.0, htf_ema_slow=110.0,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["ltf_ema_regime"])
+        self.assertIsNone(result["ema_trend_bucket"])
+
+    def test_ema_trend_mixed_applies_to_reversal_triggers_too(self):
+        # Universal, like LTF_TREND_OPPOSED - but here the exemption would
+        # point the WRONG way: reversal triggers are the worst cell inside
+        # MIXED (2 real trades, 0% win, -127.30) against +13.12 for the
+        # other 23. Same CVD_DIVERGENCE fixture used above.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._mixed_buy(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                divergence_open_time=555,
+            )
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
+    def test_ema_trend_regimes_are_journaled_with_the_gate_off(self):
+        # Ships OFF but must still populate all three fields so the live
+        # bucket mix can be compared against the backtest.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", False):
+            result = self._run(
+                ltf_ema_fast=110.0, ltf_ema_slow=100.0,
+                htf_ema_fast=100.0, htf_ema_slow=110.0,
+            )
+
+        self.assertEqual(result["ltf_ema_regime"], "BULLISH")
+        self.assertEqual(result["htf_ema_regime"], "BEARISH")
+        self.assertEqual(result["ema_trend_bucket"], "MIXED")
+
+    def test_ema_trend_bucket_is_side_relative_for_a_sell(self):
+        # want flips to BEARISH for a SELL, so the SAME pair of regimes that
+        # reads BOTH_AGREE for a BUY must read BOTH_OPPOSED here.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0,
+                ltf_ema_fast=110.0, ltf_ema_slow=100.0,
+                htf_ema_fast=110.0, htf_ema_slow=100.0,
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["ema_trend_bucket"], "BOTH_OPPOSED")
 
     def test_htf_trend_live_strength_reject_disabled_lets_weak_reads_through(self):
         # Thresholds pinned explicitly - see comment on the first test in

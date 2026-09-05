@@ -208,6 +208,52 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["htf_trend_live_distance_pct"], "1.25")
         self.assertEqual(rows[0]["htf_trend_live_slope_pct"], "-0.4")
 
+    def test_append_signal_writes_ltf_trend_live(self):
+        # config.LTF_TREND_FILTER_ENABLED - journaled unconditionally, even
+        # while that gate ships off, so the prospective 1h-vs-4h horizon
+        # comparison keeps accumulating real forward data.
+        signal_journal.append_signal(_signal(ltf_trend_live="BEARISH"), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["ltf_trend_live"], "BEARISH")
+
+    def test_append_signal_leaves_ltf_trend_live_blank_when_absent(self):
+        # None with too little 1h history, or price exactly on the EMA.
+        signal_journal.append_signal(_signal(), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["ltf_trend_live"], "")
+
+    def test_append_signal_writes_the_ema_trend_bucket_fields(self):
+        # config.EMA_TREND_MIXED_REJECT_ENABLED - all three journaled
+        # unconditionally. The two raw regimes travel with the bucket so the
+        # live 400-candle EMA200 can be checked against the 1000-candle
+        # backtest the gate's evidence came from.
+        signal_journal.append_signal(
+            _signal(
+                ltf_ema_regime="BULLISH",
+                htf_ema_regime="BEARISH",
+                ema_trend_bucket="MIXED",
+            ),
+            _plan(),
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["ltf_ema_regime"], "BULLISH")
+        self.assertEqual(rows[0]["htf_ema_regime"], "BEARISH")
+        self.assertEqual(rows[0]["ema_trend_bucket"], "MIXED")
+
+    def test_append_signal_leaves_ema_trend_fields_blank_when_absent(self):
+        # None until the deeper trend buffer holds EMA_TREND_SLOW_PERIOD
+        # candles - the gate is inert in that window and must not journal a
+        # misleading bucket.
+        signal_journal.append_signal(_signal(), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["ltf_ema_regime"], "")
+        self.assertEqual(rows[0]["htf_ema_regime"], "")
+        self.assertEqual(rows[0]["ema_trend_bucket"], "")
+
     def test_append_signal_writes_depth_trend_and_whale_fields(self):
         # config.DEPTH_TREND_TRACKING_ENABLED/WHALE_TRADE_TRACKING_ENABLED -
         # real orderbook.py/order_flow.py/signal_engine.py logic covered in

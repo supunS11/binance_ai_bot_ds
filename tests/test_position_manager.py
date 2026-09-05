@@ -3,7 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import config
 import exchange
@@ -7366,16 +7366,24 @@ class PollLiveDcaRestingOrderTests(unittest.TestCase):
         self.assertIsNone(manager.positions["BTCUSDT"]["dca_order_id"])
 
     def test_partial_fill_uses_the_real_partial_quantity_not_the_planned_one(self):
+        # 0.6/1.0 = 60%, comfortably above DCA_MIN_RESTING_FILL_RATIO -
+        # a genuine partial that SHOULD still become a DCA. orig_qty is
+        # stated explicitly so this exercises the above-threshold branch
+        # deliberately rather than slipping through the unusable-orig_qty
+        # fail-open.
         manager = self._manager_with_resting_dca()
 
         with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
              patch.object(exchange, "get_mark_price", return_value=96.0), \
              patch.object(
                  exchange, "get_order_status",
-                 return_value={"status": "PARTIALLY_FILLED", "executed_qty": 0.4, "avg_price": 95.9},
+                 return_value={"status": "PARTIALLY_FILLED", "executed_qty": 0.6,
+                               "avg_price": 95.9, "orig_qty": 1.0},
              ), \
              patch.object(exchange, "cancel_order") as cancel_order, \
              patch.object(exchange, "place_market_order") as market_order, \
+             patch.object(exchange, "close_position_market") as flatten, \
              patch.object(exchange, "get_open_algo_orders", return_value=[]), \
              patch.object(exchange, "cancel_algo_order"), \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
@@ -7384,13 +7392,186 @@ class PollLiveDcaRestingOrderTests(unittest.TestCase):
             outcome = manager.poll_live("BTCUSDT")
 
         market_order.assert_not_called()
+        flatten.assert_not_called()
         args = build_plan.call_args.args
         self.assertEqual(args[2], 95.9)
-        self.assertEqual(args[3], 0.4)
+        self.assertEqual(args[3], 0.6)
         # The still-unfilled remainder must not keep resting once the
         # position has moved to the new post-DCA plan.
         cancel_order.assert_called_once_with("BTCUSDT", "dca_resting_1")
         self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    # config.DCA_MIN_RESTING_FILL_RATIO (2026-09-05, MANAUSDT LIVE) - a
+    # resting DCA order that filled only a sliver (1,034/13,657 = 8%) was
+    # still accepted as "the DCA", and the post-DCA stop re-anchored to
+    # the fill PRICE regardless: risk distance 2.47x, dollar risk 2.66x,
+    # for a 0.068% improvement in the blended entry. Below the ratio the
+    # remainder is cancelled and the dribble flattened, restoring the
+    # exact pre-fill state for the candle-range fallback.
+
+    def _dribble(self, manager, executed_qty=0.08, orig_qty=1.0, settled=None,
+                 flatten_side_effect=None, ratio=0.5):
+        """Runs one poll_live tick against a sub-threshold resting fill.
+        `settled` overrides the post-cancel re-read (defaults to the same
+        reading, i.e. no race)."""
+        first = {"status": "PARTIALLY_FILLED", "executed_qty": executed_qty,
+                 "avg_price": 95.9, "orig_qty": orig_qty}
+        statuses = [first, settled if settled is not None else first]
+        return statuses, patch.multiple(
+            exchange,
+            get_order_status=MagicMock(side_effect=lambda *a, **k: statuses.pop(0)
+                                       if len(statuses) > 1 else statuses[0]),
+            get_mark_price=MagicMock(return_value=96.0),
+            cancel_order=MagicMock(),
+            close_position_market=MagicMock(side_effect=flatten_side_effect),
+            place_market_order=MagicMock(),
+            get_open_algo_orders=MagicMock(return_value=[]),
+            cancel_algo_order=MagicMock(),
+            place_take_profit_full=MagicMock(return_value={"algoId": "tp_new"}),
+            place_stop_loss=MagicMock(return_value={"algoId": "sl_new"}),
+        )
+
+    def test_dribble_fill_is_flattened_and_never_becomes_a_dca(self):
+        manager = self._manager_with_resting_dca()
+        _, patches = self._dribble(manager, executed_qty=0.08, orig_qty=1.0)
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
+             patch.object(risk_manager, "build_dca_plan") as build_plan, \
+             patches:
+            outcome = manager.poll_live("BTCUSDT")
+
+            exchange.cancel_order.assert_called_once_with("BTCUSDT", "dca_resting_1")
+            # side is the POSITION's own side - close_position_market
+            # places the opposite-side reduceOnly order itself.
+            exchange.close_position_market.assert_called_once_with("BTCUSDT", "BUY", 0.08)
+
+        build_plan.assert_not_called()          # never became a DCA
+        self.assertIsNone(outcome)
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], DCA_PENDING)   # unchanged
+        self.assertFalse(position["dca_applied"])
+        self.assertIsNone(position["dca_order_id"])        # fallback takes over
+
+    def test_flattened_dribble_lets_the_next_poll_use_the_candle_range_fallback(self):
+        manager = self._manager_with_resting_dca()
+        _, patches = self._dribble(manager)
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
+             patch.object(risk_manager, "build_dca_plan"), \
+             patches:
+            manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(manager.positions["BTCUSDT"]["dca_order_id"])
+
+        # Next tick: no order id, so the candle-range path runs instead.
+        candles = [{"open_time": 0, "high": 100.0, "low": 95.0, "close": 96.0}]
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
+             patch.object(exchange, "get_mark_price", return_value=96.0), \
+             patch.object(exchange, "get_open_algo_orders", return_value=[]), \
+             patch.object(exchange, "cancel_algo_order"), \
+             patch.object(exchange, "place_market_order", return_value={"orderId": 9}), \
+             patch.object(exchange, "resolve_market_fill_price", return_value=95.5), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_new"}), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_new"}), \
+             patch.object(risk_manager, "build_dca_plan", return_value=_DCA_RESULT_PLAN) as build_plan:
+            manager.poll_live("BTCUSDT", candles=candles)
+
+        build_plan.assert_called_once()
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_fill_exactly_at_the_ratio_is_accepted(self):
+        # Boundary: >= the floor must DCA, not flatten.
+        manager = self._manager_with_resting_dca()
+        _, patches = self._dribble(manager, executed_qty=0.5, orig_qty=1.0)
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
+             patch.object(risk_manager, "build_dca_plan",
+                          return_value=_DCA_RESULT_PLAN) as build_plan, \
+             patches:
+            manager.poll_live("BTCUSDT")
+            exchange.close_position_market.assert_not_called()
+
+        build_plan.assert_called_once()
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_unusable_orig_qty_fails_open_and_still_dcas(self):
+        # Missing/zero/garbage orig_qty must never block a DCA - the
+        # position would otherwise be left holding real quantity with no
+        # route to a stop, since DCA_PENDING carries no SL.
+        for orig in (None, 0, "not-a-number"):
+            manager = self._manager_with_resting_dca()
+            _, patches = self._dribble(manager, executed_qty=0.08, orig_qty=orig)
+
+            with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+                 patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
+                 patch.object(risk_manager, "build_dca_plan",
+                              return_value=_DCA_RESULT_PLAN) as build_plan, \
+                 patches:
+                manager.poll_live("BTCUSDT")
+                exchange.close_position_market.assert_not_called()
+
+            build_plan.assert_called_once()
+            self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE, orig)
+
+    def test_flatten_failure_falls_through_to_the_ordinary_dca(self):
+        # If the unwind can't be placed the position MUST still end the
+        # tick with a real SL - accepting the bad DCA beats holding
+        # unprotected size.
+        manager = self._manager_with_resting_dca()
+        _, patches = self._dribble(manager, flatten_side_effect=RuntimeError("boom"))
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
+             patch.object(risk_manager, "build_dca_plan",
+                          return_value=_DCA_RESULT_PLAN) as build_plan, \
+             patches:
+            manager.poll_live("BTCUSDT")
+
+        build_plan.assert_called_once()
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_fill_racing_the_cancel_is_re_read_and_accepted(self):
+        # The post-cancel re-read exists because a fill can land between
+        # the ratio check and the cancel - if it settles above the floor
+        # it must become a normal DCA, not get flattened.
+        manager = self._manager_with_resting_dca()
+        _, patches = self._dribble(
+            manager, executed_qty=0.08, orig_qty=1.0,
+            settled={"status": "FILLED", "executed_qty": 1.0,
+                     "avg_price": 95.9, "orig_qty": 1.0},
+        )
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0.5), \
+             patch.object(risk_manager, "build_dca_plan",
+                          return_value=_DCA_RESULT_PLAN) as build_plan, \
+             patches:
+            manager.poll_live("BTCUSDT")
+            exchange.close_position_market.assert_not_called()
+
+        build_plan.assert_called_once()
+        self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
+
+    def test_ratio_of_zero_disables_the_check_entirely(self):
+        # Escape hatch back to the pre-2026-09-05 behaviour.
+        manager = self._manager_with_resting_dca()
+        _, patches = self._dribble(manager, executed_qty=0.08, orig_qty=1.0)
+
+        with patch.object(config, "DCA_RESTING_ORDER_ENABLED", True), \
+             patch.object(config, "DCA_MIN_RESTING_FILL_RATIO", 0), \
+             patch.object(risk_manager, "build_dca_plan",
+                          return_value=_DCA_RESULT_PLAN) as build_plan, \
+             patches:
+            manager.poll_live("BTCUSDT")
+            exchange.close_position_market.assert_not_called()
+
+        build_plan.assert_called_once()
         self.assertEqual(manager.positions["BTCUSDT"]["stage"], DCA_ACTIVE)
 
     def test_remainder_cancel_failure_does_not_raise(self):

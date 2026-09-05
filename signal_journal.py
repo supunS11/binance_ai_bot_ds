@@ -26,7 +26,7 @@ JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
 FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
-    "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "htf_trend_swing_age_hours", "premium_discount_zone",
+    "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "ltf_trend_live", "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket", "htf_trend_swing_age_hours", "premium_discount_zone",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising",
@@ -176,6 +176,17 @@ def append_signal(signal, plan, execution_result=None):
         "htf_trend_live": signal.get("htf_trend_live"),
         "htf_trend_live_distance_pct": signal.get("htf_trend_live_distance_pct"),
         "htf_trend_live_slope_pct": signal.get("htf_trend_live_slope_pct"),
+        # config.LTF_TREND_FILTER_ENABLED - the 1h trend reading,
+        # journaled even while that gate is off so the 1h-vs-4h horizon
+        # comparison keeps accumulating real forward data.
+        "ltf_trend_live": signal.get("ltf_trend_live"),
+        # config.EMA_TREND_MIXED_REJECT_ENABLED - the EMA50/200 regime on
+        # each timeframe plus the agree/mixed/opposed bucket they produce
+        # for this side. Written whether or not that gate is on, so the
+        # bucket mix can be compared against the backtest it came from.
+        "ltf_ema_regime": signal.get("ltf_ema_regime"),
+        "htf_ema_regime": signal.get("htf_ema_regime"),
+        "ema_trend_bucket": signal.get("ema_trend_bucket"),
         "htf_trend_swing_age_hours": signal.get("htf_trend_swing_age_hours"),
         "premium_discount_zone": signal.get("premium_discount_zone"),
         "zone_retracement_pct": signal.get("zone_retracement_pct"),

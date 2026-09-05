@@ -581,6 +581,108 @@ HTF_TREND_MAX_SWING_AGE_HOURS = env_float("HTF_TREND_MAX_SWING_AGE_HOURS", 72.0)
 # ENABLED's own reject checks while this is on (see signal_engine.py) -
 # both existed only to catch staleness in the mechanism this replaces.
 HTF_TREND_EMA_PRIMARY_ENABLED = env_bool("HTF_TREND_EMA_PRIMARY_ENABLED", "False")
+
+# --- 1H (LTF) TREND FILTER ------------------------------------------------
+# 2026-09-05: the directional filter runs on a horizon ~40x longer than the
+# trades actually live. Real measurement, 103 resolved LIVE $100-margin
+# trades: median hold time fill->close is 2.0 HOURS (50% inside 2h, 87%
+# inside 8h), while htf_trend_live is an EMA20 on 4h = 80h of memory, and a
+# 4h swing (SWING_LEFT/RIGHT=4) needs 36h just to confirm. 4h supplies only
+# htf_trend + htf_trend_live; triggers, swings, order blocks, FVGs, ATR,
+# stops and targets are ALL computed on 1h ltf_candles. So this is a 1h
+# system wearing a 4h direction label.
+#
+# Validated BEFORE writing any code, against real 1h klines re-evaluated at
+# each of those 103 entry timestamps (all 79 symbols fetched):
+#     filter            agree  win%  medMAE | oppose  win%  medMAE | if blocked
+#     1H EMA10 (10h)       53   83%   0.37  |    50    78%   0.62  |   -17.41
+#     1H EMA20 (20h)       72   83%   0.37  |    31    74%   0.96  |   +86.21
+#     1H EMA50 (50h)       86   81%   0.38  |    17    76%   1.01  |   +33.30
+#     4H EMA20 (80h) now   89   80%   0.40  |    14    86%   0.55  |   +13.84
+# EMA20 on 1h is the best horizon (20h of memory vs a 2h trade = 10x, not
+# 40x): +259.67 -> +345.88 keeping 72/103 trades, and it catches 6 of the 10
+# worst losses in the book (ZKPUSDT -85.63, BANKUSDT -61.91, OPUSDT -43.28,
+# 1000BONKUSDT -41.67, LDOUSDT -29.47, PAXGUSDT -28.22).
+#
+# ROBUST: the behavioural split. Opposing trades carry 2.6x the drawdown
+# (median MAE 0.96R vs 0.37R) and a lower win rate (74% vs 83%) across 72 vs
+# 31 trades - a distributional result, not an outlier, and exactly the
+# "moves too far in the wrong direction after entry" complaint that prompted
+# this.
+#
+# NOT ROBUST - the reason this ships OFF: the +86.21 is concentrated.
+# Blocking drops 23 winners (+204.83) and 8 losers (-291.04); remove
+# ZKPUSDT alone and the net benefit collapses to +0.58. The MAE/win-rate
+# case stands on its own, the PnL case rests on one trade. Same "earns a
+# live default only after real forward data" rule as every other
+# entry-affecting mechanism here.
+LTF_TREND_FILTER_ENABLED = env_bool("LTF_TREND_FILTER_ENABLED", "False")
+# Deliberately NOT read from trigger_gate_profiles() - the validation above
+# applied this to EVERY trigger with no exemption, so scoping it per-trigger
+# would invalidate the measured result. Two of the six worst losses it
+# catches (ZKPUSDT/CVD_DIVERGENCE, 1000BONKUSDT/LIQUIDATION_SWEEP_CONFIRMED)
+# come from triggers that ARE exempt from AGAINST_HTF_BIAS - an exemption
+# justified for an 80h filter ("reversal triggers exist to catch a turn
+# before it is confirmed") but not for a 20h one, where a genuine turn
+# should already have crossed. Universal-gate precedent: OI_RISING,
+# NOT_IN_DISCOUNT/NOT_IN_PREMIUM, DEPTH_OPPOSING,
+# HTF_TREND_SWING_AGE_REJECT_ENABLED.
+LTF_TREND_EMA_PERIOD = env_int("LTF_TREND_EMA_PERIOD", 20)
+# config.EMA_TREND_MIXED_REJECT_ENABLED - 2026-09-05, operator-requested
+# ("Mixed" gate), real evidence over 111 resolved LIVE trades. EMA50 vs
+# EMA200 read on BOTH 1h and 4h at entry (EMA50 > EMA200 = BULLISH), then
+# bucketed by how many of the two timeframes agree with the trade side:
+#     bucket          n   win%  DCA%      PnL  perTrade  medMAE
+#     both agree     17    94%   12%  +125.64    +7.39     0.38
+#     MIXED          25    68%   32%  -114.18    -4.57     0.74
+#     both opposed   69    74%   28%   +88.59    +1.28     0.42
+# Only MIXED is gated. "Both opposed" is PROFITABLE and is 62% of all real
+# flow - blocking it costs -88.59 and drops 51 winners, so it is explicitly
+# left alone (the operator's original request covered it; the data did not
+# support it). MIXED is negative in both halves of the sample (H1 -46.32,
+# H2 -67.85).
+#
+# WHY IT SHIPS OFF, honestly:
+#  1. The -114.18 is really TWO trades - ZKPUSDT (-85.63) and 1000BONKUSDT
+#     (-41.67), both reversal triggers, both DCA'd, together -127.30. The
+#     other 23 MIXED trades were +13.12. Under DCA_PROTECTIVE_FIRST_ENABLED
+#     those two now stop at ~1R (~-15 each), so the forward PnL benefit is
+#     far smaller than the headline.
+#  2. The real case is CHURN, not PnL: MIXED carries 32% DCA incidence vs
+#     12% for both-agree, and 0.74R vs 0.38R median MAE - i.e. stop-out
+#     frequency once a real stop exists behind every position.
+#  3. Blocking MIXED removes 25 trades, 17 of them winners.
+#  4. A 4h EMA200 is an ~800-hour lookback on a trade whose median hold is
+#     1.9 hours - the same horizon mismatch LTF_TREND_FILTER_ENABLED above
+#     was built to address, so treat the measured edge as provisional.
+# Same "earns a live default only after real forward data" rule as every
+# other entry-affecting mechanism in this file.
+EMA_TREND_MIXED_REJECT_ENABLED = env_bool("EMA_TREND_MIXED_REJECT_ENABLED", "False")
+# Deliberately NOT read from trigger_gate_profiles(), same reasoning as
+# LTF_TREND_FILTER_ENABLED above: the validation applied this to every
+# trigger with no exemption. Here an exemption would point the WRONG way -
+# the worst cell inside MIXED is the reversal triggers themselves (2 trades,
+# 0% win, -127.30) against +13.12 for the other 23.
+EMA_TREND_FAST_PERIOD = env_int("EMA_TREND_FAST_PERIOD", 50)
+EMA_TREND_SLOW_PERIOD = env_int("EMA_TREND_SLOW_PERIOD", 200)
+# EMA_TREND_SLOW_PERIOD candles is the bare MINIMUM exponential_moving_
+# average() will compute at all (it returns None below `period`), and at
+# exactly `period` it degenerates to a plain seed SMA with zero smoothing
+# steps. Hence a dedicated, deeper buffer.
+#
+# This is NOT WS_KLINE_HISTORY_LIMIT/HTF_KLINE_HISTORY_LIMIT raised: those
+# feed market_structure.analyze()/structure_state(), whose find_swing_points/
+# find_structure_events/find_order_blocks/find_fair_value_gaps all consume
+# the WHOLE buffer unbounded (STRUCTURE_LOOKBACK_CANDLES is dead config -
+# referenced nowhere). Doubling them would silently change swing points ->
+# liquidity pools -> structure_level, TP resolution AND dca_price on every
+# trade. ws_client keeps separate trend_candles/htf_trend_candles stores at
+# this depth instead, seeded from the SAME REST call (CandleStore.seed's
+# deque(maxlen=...) trims the 200-buffers to exactly what they hold today),
+# so nothing else changes. 400 also stays inside Binance's [100,500) ->
+# weight 2 tier, matching KLINE_REQUEST_WEIGHT, so the REST budget is
+# unchanged.
+EMA_TREND_HISTORY_LIMIT = env_int("EMA_TREND_HISTORY_LIMIT", 400)
 # 2026-09-01, real evidence: reconstructed real 4h-EMA distance/slope
 # from actual klines for 57 historical trades where htf_trend_live
 # agreed with the trade (the population HTF_TREND_EMA_PRIMARY_ENABLED
@@ -2033,6 +2135,39 @@ DCA_PRESSURE_TIGHT_STOP_ATR_BUFFER = env_float("DCA_PRESSURE_TIGHT_STOP_ATR_BUFF
 # DCA_PRESSURE_CHECK_ENABLED itself and every other unvalidated
 # mechanism here.
 DCA_RESTING_ORDER_ENABLED = env_bool("DCA_RESTING_ORDER_ENABLED", "False")
+# Minimum fraction of the resting DCA order that must actually fill before
+# the fill is treated as a real DCA at all.
+#
+# Real incident (2026-09-05, MANAUSDT LIVE): the resting DCA limit at
+# 0.074035 was touched but only 1,034 of 13,657 units filled (8%).
+# _poll_dca_resting_order accepted that 8% as "the DCA" and the position
+# transitioned to DCA_ACTIVE with its stop re-anchored to the DCA FILL
+# PRICE:
+#     entry          0.07332   -> 0.073370   (+0.068%, blend barely moved)
+#     SL             0.074035  -> 0.075137
+#     risk distance  0.000715  -> 0.001767   (2.47x)
+#     dollar risk    ~$9.77    -> ~$25.96    (2.66x)
+# i.e. 2.66x the risk to gain 0.068% on the average entry. The asymmetry
+# is structural, not a one-off: risk_manager.build_dca_plan derives
+# sl_price from compute_dca_sl_price(dca_fill_price, ...) - the next
+# structure level beyond the FILL PRICE - so dca_quantity only ever moves
+# the blended entry, never the stop. An 8% fill therefore widens the stop
+# exactly as far as a 100% fill would while delivering ~8% of the
+# averaging benefit.
+#
+# Rare but real: across 71 real LIVE DCAs only two genuine partial fills -
+# MANAUSDT (8%) and MOVRUSDT (71%). (The ~37 events showing exactly 50%
+# are NOT partial fills - DCA_SIZE_MULTIPLIER was 0.5 from 2026-08-20 to
+# 09-03.) 0.5 rejects MANAUSDT and accepts MOVRUSDT, whose 71% fill does
+# deliver proportionate averaging for its widened stop.
+#
+# Below this ratio the remainder is cancelled and the dribble is flattened
+# back out (see position_manager._poll_dca_resting_order), restoring the
+# exact pre-fill state so the existing candle-range fallback fires a
+# proper full-size DCA on the next touch - no new DCA mechanism. Set 0 to
+# disable the check and accept any non-zero fill (the pre-2026-09-05
+# behavior).
+DCA_MIN_RESTING_FILL_RATIO = env_float("DCA_MIN_RESTING_FILL_RATIO", 0.5)
 # config.DCA_PROTECTIVE_FIRST_ENABLED - 2026-09-02, real evidence (38
 # resolved LIVE dca_applied=True trades): 14.3% win rate (5/35) vs 99.3%
 # (147/148) for trades that never needed DCA - DCA is a severe value-

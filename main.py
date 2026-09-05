@@ -188,6 +188,11 @@ def _evaluate_symbol(
     btc_candles = feed.candles.get(config.CORRELATION_REFERENCE_SYMBOL)
     funding_rate = feed.funding_rates.get(symbol)
     crash_snapshot = feed.crash_detector.snapshot()
+    # config.EMA_TREND_MIXED_REJECT_ENABLED - the deeper EMA50/200 buffers,
+    # same cheap in-memory read as candles/htf_candles above. Kept separate
+    # from them on purpose; see EMA_TREND_HISTORY_LIMIT in config.py.
+    ltf_trend_candles = feed.trend_candles.get(symbol)
+    htf_trend_candles = feed.htf_trend_candles.get(symbol)
 
     result = signal_engine.evaluate(
         symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
@@ -198,6 +203,8 @@ def _evaluate_symbol(
         volume_profile_snapshot=volume_profile_snapshot,
         liquidation_snapshot_bybit=liquidation_snapshot_bybit,
         liquidation_snapshot_okx=liquidation_snapshot_okx,
+        ltf_trend_candles=ltf_trend_candles,
+        htf_trend_candles=htf_trend_candles,
     )
 
     if not result.get("signal"):

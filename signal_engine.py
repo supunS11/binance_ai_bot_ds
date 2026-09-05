@@ -69,12 +69,45 @@ def taker_flow_agrees(side, taker_ratio):
     return taker_ratio > 1 if side == "BUY" else taker_ratio < 1
 
 
+def _ema_regime(candles):
+    """config.EMA_TREND_MIXED_REJECT_ENABLED - the classic EMA50-vs-EMA200
+    trend read: BULLISH while the fast EMA sits above the slow one, BEARISH
+    below. Needs config.EMA_TREND_SLOW_PERIOD candles of history, which is
+    why it is fed ws_client's deeper trend_candles/htf_trend_candles rather
+    than the 200-deep structure buffers.
+
+    None on too little history (exponential_moving_average's own contract)
+    or an exact tie, so every caller fails open - same shape as
+    htf_trend_live/ltf_trend_live."""
+    if not candles:
+        return None
+
+    fast = market_structure.exponential_moving_average(
+        candles, period=config.EMA_TREND_FAST_PERIOD
+    )
+    slow = market_structure.exponential_moving_average(
+        candles, period=config.EMA_TREND_SLOW_PERIOD
+    )
+
+    if fast is None or slow is None:
+        return None
+
+    if fast > slow:
+        return "BULLISH"
+
+    if fast < slow:
+        return "BEARISH"
+
+    return None
+
+
 def evaluate(
     symbol, htf_candles, ltf_candles, cvd_snapshot, depth_snapshot,
     oi_snapshot=None, liquidation_snapshot=None, quote_volume_usdt=None,
     btc_candles=None, funding_rate=None, crash_snapshot=None,
     oi_snapshot_bybit=None, oi_snapshot_okx=None, volume_profile_snapshot=None,
     liquidation_snapshot_bybit=None, liquidation_snapshot_okx=None,
+    ltf_trend_candles=None, htf_trend_candles=None,
 ):
     if not htf_candles or not ltf_candles:
         return _reject("INSUFFICIENT_CANDLES")
@@ -158,6 +191,40 @@ def evaluate(
             htf_candles, period=config.HTF_TREND_EMA_PERIOD,
             candles_back=config.HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES,
         )
+
+    # config.LTF_TREND_FILTER_ENABLED - the same "where does price sit
+    # relative to its own EMA" classification as htf_trend_live above, one
+    # timeframe down. Hoisted here (not inside _evaluate_direction) because
+    # it's direction-independent, exactly like htf_trend_live. See that
+    # flag's own config.py comment for the real evidence: the 4h reading has
+    # 80h of memory while the median real trade lives 2.0h, and re-evaluated
+    # against real 1h klines at 103 real entry timestamps a 1h EMA20 split
+    # outcomes far better (opposing trades carry 2.6x the drawdown).
+    # Journaled unconditionally so the prospective dataset builds even while
+    # the gate itself is off.
+    ltf_trend_ema = market_structure.exponential_moving_average(
+        ltf_candles, period=config.LTF_TREND_EMA_PERIOD
+    )
+    ltf_trend_live = None
+    latest_ltf_close = ltf_candles[-1].get("close") if ltf_candles else None
+
+    if ltf_trend_ema is not None and latest_ltf_close is not None:
+        if latest_ltf_close > ltf_trend_ema:
+            ltf_trend_live = "BULLISH"
+        elif latest_ltf_close < ltf_trend_ema:
+            ltf_trend_live = "BEARISH"
+
+    # config.EMA_TREND_MIXED_REJECT_ENABLED - EMA50-vs-EMA200 regime on each
+    # timeframe, read off the dedicated deeper buffers (ws_client.
+    # trend_candles/htf_trend_candles) rather than the 200-deep structure
+    # buffers, which cannot compute a real EMA200. Direction-independent, so
+    # hoisted here alongside ltf_trend_live; the agree/mixed/opposed bucket
+    # itself needs a side and is resolved in _evaluate_direction. Falls back
+    # to the structure buffers when the trend ones weren't supplied (shadow
+    # callers, tests) - _ema_regime returns None on too little history, which
+    # leaves the gate inert rather than guessing.
+    ltf_ema_regime = _ema_regime(ltf_trend_candles or ltf_candles)
+    htf_ema_regime = _ema_regime(htf_trend_candles or htf_candles)
 
     zone = market_structure.premium_discount_zone(htf_candles)
 
@@ -735,6 +802,56 @@ def evaluate(
                 ):
                     return _reject("HTF_TREND_LIVE_WEAK_SLOPE")
 
+        # config.LTF_TREND_FILTER_ENABLED - the 1h sibling of
+        # AGAINST_HTF_BIAS above, placed here so both direction gates read
+        # together. UNIVERSAL on purpose: NOT read from applicable_gates /
+        # trigger_gate_profiles(), unlike AGAINST_HTF_BIAS. The real
+        # validation behind this flag applied it to EVERY trigger with no
+        # exemption, so scoping it per-trigger would invalidate the measured
+        # result - and 2 of the 6 worst real losses it catches
+        # (ZKPUSDT/CVD_DIVERGENCE, 1000BONKUSDT/LIQUIDATION_SWEEP_CONFIRMED)
+        # come from triggers that ARE exempt from AGAINST_HTF_BIAS. That
+        # exemption is justified for an 80h filter (reversal triggers exist
+        # to catch a turn before it is confirmed) but not for a 20h one,
+        # where a real turn should already have crossed. Same universal
+        # treatment as OI_RISING/NOT_IN_DISCOUNT/DEPTH_OPPOSING/
+        # HTF_TREND_SWING_AGE_REJECT_ENABLED. Fails open on a None reading
+        # (too little history, or price exactly on the EMA). Reason string
+        # carries no continuous value, same tally-friendly convention as the
+        # two gates above.
+        if config.LTF_TREND_FILTER_ENABLED and ltf_trend_live:
+            ltf_side = _BULLISH_TO_SIDE.get(ltf_trend_live)
+
+            if ltf_side and side != ltf_side:
+                return _reject("LTF_TREND_OPPOSED")
+
+        # config.EMA_TREND_MIXED_REJECT_ENABLED - the operator's "Mixed"
+        # gate. Counts how many of the two EMA50/200 regimes agree with this
+        # side; ONLY the 1-of-2 (MIXED) bucket rejects.
+        #
+        # BOTH_OPPOSED is deliberately let through: it measured +88.59 over
+        # 69 real trades and is 62% of all flow, so gating it would cost
+        # money and drop 51 winners. BOTH_AGREE passes for the obvious
+        # reason. Universal rather than profile-scoped for the same reason
+        # as LTF_TREND_OPPOSED above, except that here an exemption would
+        # point the wrong way - reversal triggers are the WORST cell inside
+        # MIXED (2 trades, 0% win, -127.30). See the config.py comment.
+        #
+        # Bucket is computed regardless of the flag so it can be journaled
+        # and the forward dataset builds either way. None whenever either
+        # regime is unreadable, which leaves the gate inert.
+        ema_trend_bucket = None
+
+        if ltf_ema_regime and htf_ema_regime:
+            want = "BULLISH" if side == "BUY" else "BEARISH"
+            agreeing = (ltf_ema_regime == want) + (htf_ema_regime == want)
+            ema_trend_bucket = {
+                2: "BOTH_AGREE", 1: "MIXED", 0: "BOTH_OPPOSED",
+            }[agreeing]
+
+        if config.EMA_TREND_MIXED_REJECT_ENABLED and ema_trend_bucket == "MIXED":
+            return _reject("EMA_TREND_MIXED")
+
         # Both checks below exist purely to catch a stale SWING-confirmed
         # bias. Once AGAINST_HTF_BIAS no longer uses that bias at all
         # (config.HTF_TREND_EMA_PRIMARY_ENABLED), checking its staleness
@@ -1250,6 +1367,17 @@ def evaluate(
             "htf_trend_live": htf_trend_live,
             "htf_trend_live_distance_pct": htf_trend_live_distance_pct,
             "htf_trend_live_slope_pct": htf_trend_live_slope_pct,
+            # config.LTF_TREND_FILTER_ENABLED - journaled unconditionally
+            # (even with the gate off) so the prospective 1h-vs-4h horizon
+            # comparison keeps building either way.
+            "ltf_trend_live": ltf_trend_live,
+            # config.EMA_TREND_MIXED_REJECT_ENABLED - also journaled
+            # unconditionally. The two raw regimes are kept alongside the
+            # bucket so the live 400-candle EMA200 can be checked against
+            # the 1000-candle backtest the flag's evidence came from.
+            "ltf_ema_regime": ltf_ema_regime,
+            "htf_ema_regime": htf_ema_regime,
+            "ema_trend_bucket": ema_trend_bucket,
             "htf_trend_swing_age_hours": htf_trend_swing_age_hours,
             # Placeholders - the candidate (not the direction) determines
             # these; the caller overlays the winning candidate's real

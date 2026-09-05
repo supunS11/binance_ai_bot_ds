@@ -2280,6 +2280,102 @@ class PositionManager:
         dca_price = position["dca_price"]
         return low <= dca_price if side == "BUY" else high >= dca_price
 
+    def _reject_dribble_dca_fill(self, position, order):
+        """config.DCA_MIN_RESTING_FILL_RATIO - a resting DCA order that
+        filled only a sliver of its placed size must NOT be treated as a
+        DCA. Returns True when the fill was rejected and flattened (the
+        caller then reports "nothing happened" and the position stays
+        DCA_PENDING); False to let the ordinary DCA proceed.
+
+        Real incident this closes (2026-09-05, MANAUSDT LIVE): 1,034 of
+        13,657 units filled (8%), and the position still transitioned to
+        DCA_ACTIVE with its stop re-anchored to the DCA FILL PRICE - risk
+        distance 0.000715 -> 0.001767 (2.47x), dollar risk ~$9.77 ->
+        ~$25.96 (2.66x), for a 0.068% improvement in the blended entry.
+        The asymmetry is structural: risk_manager.build_dca_plan derives
+        sl_price from compute_dca_sl_price(dca_fill_price, ...), so
+        dca_quantity moves only the blended entry while the stop jumps the
+        full distance regardless of how little actually filled. See
+        DCA_MIN_RESTING_FILL_RATIO's own config.py comment for the numbers
+        and for why 0.5 is the threshold.
+
+        Flattening (rather than deferring) is deliberate: DCA_PENDING
+        carries NO stop-loss at all (register_dca_pending sets
+        sl_order_id=None) and the 3R breaker can't cover it either -
+        _dca_max_adverse_loss_reached fails open without original_risk_
+        distance/original_quantity, which only _execute_dca ever sets, and
+        it is only called from the DCA_ACTIVE branch. Leaving a partial
+        fill in place would therefore mean extra size carried with no
+        protection AND tracked quantity drifting from the exchange.
+        Restoring the exact pre-fill state instead lets the existing
+        candle-range fallback (_dca_price_reached_in_range, already what
+        runs whenever dca_order_id is falsy) fire a proper full-size DCA
+        on the next touch - no new DCA mechanism is introduced.
+
+        Fails OPEN in every uncertain case (unusable orig_qty, or a
+        cancel/flatten that raises) - the position must never end a tick
+        holding real quantity with no route to a stop, so anything
+        unexpected falls through to the ordinary DCA, which does place
+        one. Same never-break-a-trade-over-bookkeeping convention every
+        gate in this codebase follows."""
+        ratio_floor = max(float(config.DCA_MIN_RESTING_FILL_RATIO), 0)
+
+        if ratio_floor <= 0:
+            return False
+
+        symbol = position["symbol"]
+        executed_qty = order["executed_qty"]
+
+        try:
+            orig_qty = float(order.get("orig_qty") or 0)
+        except (TypeError, ValueError):
+            orig_qty = 0
+
+        if orig_qty <= 0:
+            return False  # unusable - accept the fill exactly as before
+
+        if (executed_qty / orig_qty) >= ratio_floor:
+            return False
+
+        order_id = position["dca_order_id"]
+
+        try:
+            # Cancel FIRST, then re-read: a fill can race the cancel, and
+            # flattening a stale quantity would leave real dust behind.
+            # Same post-cancel-recheck discipline poll_retracement_pending
+            # already applies to its own resting limit.
+            exchange.cancel_order(symbol, order_id)
+            settled = exchange.get_order_status(symbol, order_id)
+
+            if settled["status"] != "UNKNOWN":
+                executed_qty = settled["executed_qty"]
+
+            if executed_qty <= 0:
+                position["dca_order_id"] = None
+                return True  # cancelled before anything really filled
+
+            if (executed_qty / orig_qty) >= ratio_floor:
+                return False  # the race filled it properly after all
+
+            exchange.close_position_market(symbol, position["side"], executed_qty)
+        except Exception as exc:
+            log_warning(
+                f"{symbol} could not unwind a {executed_qty}/{orig_qty} dribble DCA "
+                f"fill ({exc}) - falling through to the ordinary DCA so the "
+                f"position still ends this tick with a real SL"
+            )
+            return False
+
+        position["dca_order_id"] = None
+        log_info(
+            f"{symbol} resting DCA order filled only {executed_qty}/{orig_qty} "
+            f"({executed_qty / orig_qty:.0%} < {ratio_floor:.0%}) - remainder "
+            f"cancelled and the partial flattened rather than widening the stop "
+            f"for a sliver of size; staying DCA_PENDING for the candle-range "
+            f"fallback to fire a full-size DCA"
+        )
+        return True
+
     def _poll_dca_resting_order(
         self, position, candles=None, htf_candles=None, cvd_snapshot=None,
         current_price=None, crash_snapshot=None,
@@ -2293,12 +2389,14 @@ class PositionManager:
         partial fills via executed_qty.
 
         Returns (fired, outcome): `fired` is False when nothing has
-        changed yet (still resting, transient lookup failure, or the
-        order is gone with zero fill) - the caller must fall through to
-        the early-promotion checks exactly like the "not yet reached"
-        case on the candle-range path. `fired` is True the moment ANY
-        fill is detected, mirroring the candle-range path's own
-        unconditional `return self._execute_dca(...)` - `outcome` is
+        changed yet (still resting, transient lookup failure, the order
+        is gone with zero fill, or - see _reject_dribble_dca_fill and
+        config.DCA_MIN_RESTING_FILL_RATIO - a sliver fill was rejected
+        and flattened back out, leaving the position DCA_PENDING exactly
+        as it was) - the caller must fall through to the early-promotion
+        checks exactly like the "not yet reached" case on the
+        candle-range path. `fired` is True once a fill big enough to
+        count as a real DCA is detected - `outcome` is
         then whatever _execute_dca itself returned (None on success,
         since position["stage"] is DCA_ACTIVE by then and must not be
         treated by TP1_PENDING/DCA_PENDING-shaped checks further down
@@ -2336,6 +2434,9 @@ class PositionManager:
                 )
                 position["dca_order_id"] = None
 
+            return False, None
+
+        if self._reject_dribble_dca_fill(position, order):
             return False, None
 
         outcome = self._execute_dca(

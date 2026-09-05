@@ -39,6 +39,13 @@ class _FakeFeed:
     def __init__(self, ltf_candles=None, htf_candles=None, volumes=None, funding_rates=None):
         self.candles = _FakeCandleSource(ltf_candles)
         self.htf_candles = _FakeCandleSource(htf_candles)
+        # config.EMA_TREND_MIXED_REJECT_ENABLED - the deeper EMA50/200
+        # buffers. Mirroring the same candles is fine here: signal_engine
+        # falls back to the structure buffers when these are empty, and
+        # _ema_regime returns None either way in these fixtures, so the gate
+        # stays inert exactly as it does with the flag off.
+        self.trend_candles = _FakeCandleSource(ltf_candles)
+        self.htf_trend_candles = _FakeCandleSource(htf_candles)
         self.cvd = _FakeSnapshotSource()
         self.depth = _FakeSnapshotSource()
         self.open_interest = _FakeSnapshotSource()

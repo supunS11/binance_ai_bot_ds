@@ -242,6 +242,61 @@ class RealtimeMarketDataMessageHandlingTests(unittest.TestCase):
 
         self.assertEqual(feed.cvd.cvd_history("BTCUSDT"), [])
 
+    # config.EMA_TREND_MIXED_REJECT_ENABLED - the deeper trend-only buffers.
+    # They exist because EMA200 cannot be computed from a 200-deep store,
+    # and because DEEPENING the existing stores would silently change
+    # market_structure's unbounded swing/order-block/FVG scans and with them
+    # stops, TP resolution and dca_price. See EMA_TREND_HISTORY_LIMIT.
+
+    def test_handle_kline_also_updates_the_ltf_trend_store(self):
+        feed = self._feed()
+        feed._handle_kline({
+            "s": "BTCUSDT",
+            "k": {"t": 1000, "o": "1", "h": "2", "l": "0.5", "c": "1.8", "v": "10", "x": False},
+        })
+
+        latest = feed.trend_candles.latest("BTCUSDT")
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["close"], 1.8)
+
+    def test_handle_kline_also_updates_the_htf_trend_store(self):
+        feed = self._feed()
+
+        with patch.object(config, "HTF_KLINE_INTERVAL", "1h"), \
+             patch.object(config, "WS_KLINE_INTERVAL", "5m"):
+            feed._handle_kline({
+                "s": "BTCUSDT",
+                "k": {"t": 1000, "o": "1", "h": "2", "l": "0.5", "c": "1.8",
+                      "v": "10", "x": True, "i": "1h"},
+            })
+
+        self.assertEqual(feed.htf_trend_candles.latest("BTCUSDT")["close"], 1.8)
+        # ...and the HTF stream must NOT leak into the LTF trend store
+        self.assertIsNone(feed.trend_candles.latest("BTCUSDT"))
+
+    def test_deeper_seed_does_not_deepen_the_structure_buffers(self):
+        # THE behaviour-preservation guard. _seed_history now fetches the
+        # deeper payload once and seeds both stores from it; CandleStore.seed
+        # builds its own deque(maxlen=...), so the structure buffers must
+        # still hold exactly WS_KLINE_HISTORY_LIMIT rows and therefore feed
+        # market_structure precisely what they did before this change.
+        feed = self._feed()
+        rows = [
+            {"time": i, "open": 1.0, "high": 2.0, "low": 0.5,
+             "close": 1.5, "volume": 10.0}
+            for i in range(400)
+        ]
+        df = pd.DataFrame(rows)
+
+        feed.candles.seed("BTCUSDT", df)
+        feed.trend_candles.seed("BTCUSDT", df)
+
+        self.assertEqual(len(feed.candles.get("BTCUSDT")), config.WS_KLINE_HISTORY_LIMIT)
+        self.assertEqual(len(feed.trend_candles.get("BTCUSDT")), config.EMA_TREND_HISTORY_LIMIT)
+        # the structure buffer keeps the MOST RECENT rows, not the oldest
+        self.assertEqual(feed.candles.get("BTCUSDT")[-1]["open_time"], 399)
+
     def test_handle_agg_trade_feeds_cvd_engine(self):
         feed = self._feed()
         feed._handle_agg_trade({"s": "BTCUSDT", "p": "100", "q": "1", "m": False, "T": 1000000})
@@ -436,14 +491,19 @@ class SeedHistoryTests(unittest.TestCase):
         with patch("ws_client.get_klines", return_value=ltf_sentinel) as klines_mock, \
              patch.object(feed.candles, "seed"), \
              patch.object(feed.htf_candles, "seed"), \
+             patch.object(feed.trend_candles, "seed"), \
+             patch.object(feed.htf_trend_candles, "seed"), \
              patch.object(feed.cvd, "seed_from_klines") as cvd_seed_mock, \
              patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True), \
              patch.object(config, "OI_DIVERGENCE_TRIGGER_ENABLED", False):
             feed._seed_history()
 
         cvd_seed_mock.assert_called_once_with("BTCUSDT", ltf_sentinel)
-        # Only the existing 2 calls (LTF + HTF candles) - CVD reuses the
-        # LTF one rather than triggering a 3rd get_klines call of its own.
+        # Still only 2 calls (LTF + HTF) - CVD reuses the LTF one rather
+        # than triggering a 3rd, and config.EMA_TREND_MIXED_REJECT_ENABLED's
+        # trend_candles/htf_trend_candles stores reuse the very same two
+        # dataframes rather than fetching their own. This assertion is the
+        # guard that the deeper buffers cost no extra REST budget.
         self.assertEqual(klines_mock.call_count, 2)
 
     def test_cvd_seeding_is_skipped_when_the_trigger_is_disabled(self):
