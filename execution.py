@@ -63,10 +63,17 @@ def place_protection_orders(symbol, side, plan):
     _finalize_retracement_entry, resolving a fill that already happened -
     real limit fill, or its market fallback) can place the exact same
     protection without a second entry order. Returns (sl_order, tp1_order,
-    tp2_order, error) - error is None on success; on SL failure the
-    position has already been closed at market and (for a stale-order
+    tp2_order, tp_order, error) - error is None on success; on SL failure
+    the position has already been closed at market and (for a stale-order
     -4130) all open orders cancelled, and callers must NOT register a
-    position at all."""
+    position at all.
+
+    config.TP2_ENABLED=False - exactly one of (tp_order) or (tp1_order,
+    tp2_order) is ever non-None, decided by plan["single_tp"], the other
+    pair stays None. Same shape place_dca_protection_orders already uses;
+    this is its non-DCA sibling, needed because build_trade_plan sets
+    tp1_quantity/tp2_quantity to None on a single_tp plan, so the TP1+TP2
+    pair below cannot be placed for one."""
     try:
         sl_order = exchange.place_stop_loss(symbol, side, plan["sl_price"])
     except Exception as exc:
@@ -90,7 +97,21 @@ def place_protection_orders(symbol, side, plan):
             # every future attempt.
             exchange.cancel_all_open_orders(symbol)
 
-        return None, None, None, f"SL placement failed: {exc}"
+        return None, None, None, None, f"SL placement failed: {exc}"
+
+    # config.TP2_ENABLED=False - one full-position TP instead of the
+    # TP1(partial)+TP2(remainder) pair. Mirrors place_dca_protection_
+    # orders' own single_tp branch; best-effort exactly like the pair
+    # below, because the SL above is already active either way.
+    if plan.get("single_tp"):
+        tp_order = None
+
+        try:
+            tp_order = exchange.place_take_profit_full(symbol, side, plan["tp_price"])
+        except Exception as exc:
+            log_warning(f"{symbol} TP placement failed (SL is active): {exc}")
+
+        return sl_order, None, None, tp_order, None
 
     tp1_order = None
     tp2_order = None
@@ -107,7 +128,7 @@ def place_protection_orders(symbol, side, plan):
     except Exception as exc:
         log_warning(f"{symbol} TP2 placement failed (SL is active): {exc}")
 
-    return sl_order, tp1_order, tp2_order, None
+    return sl_order, tp1_order, tp2_order, None, None
 
 
 def _place_dca_resting_order(symbol, side, plan):
@@ -274,15 +295,23 @@ def enter_trade(plan):
 
     real_entry_price = exchange.resolve_market_fill_price(symbol, entry_order, plan["entry_price"])
 
-    sl_order, tp1_order, tp2_order, error = place_protection_orders(symbol, side, plan)
+    sl_order, tp1_order, tp2_order, tp_order, error = place_protection_orders(
+        symbol, side, plan
+    )
 
     if error:
         return {"ok": False, "shadow": False, "error": error}
 
-    log_info(
-        f"{symbol} entered {side} qty={plan['quantity']} | "
-        f"SL={plan['sl_price']} TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
-    )
+    if plan.get("single_tp"):
+        log_info(
+            f"{symbol} entered {side} qty={plan['quantity']} | "
+            f"SL={plan['sl_price']} TP={plan['tp_price']}"
+        )
+    else:
+        log_info(
+            f"{symbol} entered {side} qty={plan['quantity']} | "
+            f"SL={plan['sl_price']} TP1={plan['tp1_price']} TP2={plan['tp2_price']}"
+        )
 
     return {
         "ok": True,
@@ -291,6 +320,7 @@ def enter_trade(plan):
         "sl_order": sl_order,
         "tp1_order": tp1_order,
         "tp2_order": tp2_order,
+        "tp_order": tp_order,
         "real_entry_price": real_entry_price,
     }
 

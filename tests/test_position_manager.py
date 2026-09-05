@@ -826,13 +826,59 @@ class ReconcileOnStartupTests(unittest.TestCase):
         orders = self._dca_active_open_orders()
         orders[0].pop("clientAlgoId")  # no tag at all - real orders predating this fix
 
-        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+        # config.TP2_ENABLED pinned True: "closePosition TP, no partial
+        # TP1" only means "TP1 filled, already promoted" while TP2 is the
+        # normal shape. With TP2_ENABLED=False the identical order layout
+        # is a fresh single-TP position instead - covered separately by
+        # test_single_tp_shape_recovers_as_tp1_pending below.
+        with patch.object(config, "TP2_ENABLED", True), \
+             patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
              patch.object(exchange, "get_open_algo_orders", return_value=orders):
             manager.reconcile_on_startup()
 
         position = manager.positions["BTCUSDT"]
         self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
         self.assertNotIn("dca_applied", position)
+
+    def test_single_tp_shape_recovers_as_tp1_pending(self):
+        # config.TP2_ENABLED=False + config.DCA_ENABLED=False - a real SL
+        # plus ONE closePosition TP is a live single-TP position, not a
+        # promoted one. Distinguished by the stop still being risk-bearing
+        # (0.038 is below the 0.0404 entry on a BUY); a genuinely promoted
+        # stop sits on the profit side of entry.
+        manager = PositionManager()
+        orders = self._dca_active_open_orders()
+        orders[0].pop("clientAlgoId")
+
+        with patch.object(config, "TP2_ENABLED", False), \
+             patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], TP1_PENDING)
+        self.assertTrue(position["single_tp"])
+        self.assertEqual(position["tp_price"], 0.043)
+        self.assertEqual(position["sl_price"], 0.038)
+        self.assertEqual(position["tp_order_id"], "tp_real")
+
+    def test_promoted_stop_still_recovers_as_breakeven_even_with_tp2_off(self):
+        # The legacy-position guard: a position promoted BEFORE
+        # TP2_ENABLED was turned off has its stop on the profit side, so
+        # it must NOT be mistaken for a fresh single-TP one.
+        manager = PositionManager()
+        orders = self._dca_active_open_orders()
+        orders[0].pop("clientAlgoId")
+        orders[0]["triggerPrice"] = "0.0410"  # above the 0.0404 entry
+
+        with patch.object(config, "TP2_ENABLED", False), \
+             patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+             patch.object(exchange, "get_open_algo_orders", return_value=orders):
+            manager.reconcile_on_startup()
+
+        position = manager.positions["BTCUSDT"]
+        self.assertEqual(position["stage"], BREAKEVEN_ACTIVE)
+        self.assertFalse(position["single_tp"])
 
     def test_a_different_clientalgoid_is_not_treated_as_dca_active(self):
         # Only this codebase's own dcaSL-prefixed tag counts - an
@@ -841,7 +887,10 @@ class ReconcileOnStartupTests(unittest.TestCase):
         manager = PositionManager()
         orders = self._dca_active_open_orders(sl_tag="x-Cb7ytekJ7f08390857d3692432277d")
 
-        with patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
+        # config.TP2_ENABLED pinned True - see the sibling test above for
+        # why this layout is only "already promoted" while TP2 is on.
+        with patch.object(config, "TP2_ENABLED", True), \
+             patch.object(exchange, "get_all_open_positions", return_value=[self._live_position(entry=0.0404)]), \
              patch.object(exchange, "get_open_algo_orders", return_value=orders):
             manager.reconcile_on_startup()
 
@@ -1197,6 +1246,53 @@ class ReentryCooldownTests(unittest.TestCase):
             self.assertFalse(manager.is_in_cooldown("STGUSDT"))
             manager.mark_entry_failure("STGUSDT")
             self.assertTrue(manager.is_in_cooldown("STGUSDT"))
+
+
+class RegisterSingleTpTests(unittest.TestCase):
+    """config.TP2_ENABLED=False + config.DCA_ENABLED=False (2026-09-06) -
+    the ordinary (non-DCA) single-TP position: a real SL placed atomically
+    at entry plus ONE full-position TP. register() has to carry tp_price/
+    single_tp/tp_order_id for it exactly as register_dca_pending already
+    does for the DCA_PENDING stage."""
+
+    def _single_tp_plan(self):
+        return dict(_plan(), single_tp=True, tp_price=104,
+                    tp1_price=None, tp2_price=None,
+                    tp1_quantity=None, tp2_quantity=None)
+
+    def test_carries_the_single_tp_fields(self):
+        manager = PositionManager()
+        position = manager.register(
+            self._single_tp_plan(),
+            {"shadow": False, "sl_order": {"algoId": 2}, "tp_order": {"algoId": 5}},
+        )
+
+        self.assertTrue(position["single_tp"])
+        self.assertEqual(position["tp_price"], 104)
+        self.assertEqual(position["tp_order_id"], 5)
+        self.assertEqual(position["sl_order_id"], 2)
+        self.assertEqual(position["stage"], TP1_PENDING)
+
+    def test_ordinary_plan_leaves_the_single_tp_fields_inert(self):
+        manager = PositionManager()
+        position = manager.register(
+            _plan(),
+            {"shadow": False, "sl_order": {"algoId": 2},
+             "tp1_order": {"algoId": 3}, "tp2_order": {"algoId": 4}},
+        )
+
+        self.assertFalse(position["single_tp"])
+        self.assertIsNone(position["tp_price"])
+        self.assertEqual(position["tp1_order_id"], 3)
+
+    def test_shadow_single_tp_has_no_order_ids(self):
+        manager = PositionManager()
+        position = manager.register(self._single_tp_plan(), {"shadow": True})
+
+        self.assertTrue(position["single_tp"])
+        self.assertEqual(position["tp_price"], 104)
+        self.assertIsNone(position["tp_order_id"])
+        self.assertIsNone(position["sl_order_id"])
 
 
 class RegisterTests(unittest.TestCase):
@@ -3160,6 +3256,94 @@ class ProfitProtectionTp2LegPollShadowTests(PollShadowTests):
         self.assertIsNone(outcome)
         # New peak=103.0 (high, BUY side), retrace 50% of 3.0 = 1.5 -> 101.5.
         self.assertAlmostEqual(manager.positions["BTCUSDT"]["sl_price"], 101.5)
+
+
+class PollLiveSingleTpTests(unittest.TestCase):
+    """config.TP2_ENABLED=False + config.DCA_ENABLED=False - a non-DCA
+    single-TP position in TP1_PENDING. Unlike the DCA_PENDING sibling
+    (PollLiveDcaPendingTests) this stage DOES have a real resting SL, so
+    poll_live has to watch both legs."""
+
+    def setUp(self):
+        for name, value in (
+            ("EARLY_BREAKEVEN_ENABLED", False),
+            ("MAE_TRACKING_ENABLED", False),
+            ("PROFIT_PROTECTION_ENABLED", False),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _manager(self):
+        manager = PositionManager()
+        plan = dict(_plan(), single_tp=True, tp_price=104,
+                    tp1_price=None, tp2_price=None,
+                    tp1_quantity=None, tp2_quantity=None)
+        manager.register(plan, {
+            "shadow": False,
+            "sl_order": {"algoId": "sl1"},
+            "tp_order": {"algoId": "tp_solo"},
+        })
+        return manager
+
+    def test_tp_fill_closes_the_whole_position(self):
+        manager = self._manager()
+
+        with patch.object(manager, "_status_or_missing", return_value="FINISHED"), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "STATIC_TP_HIT")
+        cancel.assert_called_once_with("BTCUSDT")
+        self.assertNotIn("BTCUSDT", manager.positions)
+
+    def test_sl_fill_closes_the_whole_position(self):
+        # the deliberate difference from the DCA_PENDING sibling: this
+        # stage has a real stop, and a hit must be seen.
+        manager = self._manager()
+
+        def _status(symbol, order_id):
+            return "FINISHED" if order_id == "sl1" else "NEW"
+
+        with patch.object(manager, "_status_or_missing", side_effect=_status), \
+             patch.object(exchange, "cancel_all_open_orders") as cancel:
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertEqual(outcome, "SL_HIT")
+        cancel.assert_called_once_with("BTCUSDT")
+
+    def test_neither_filled_is_a_noop(self):
+        manager = self._manager()
+
+        with patch.object(manager, "_status_or_missing", return_value="NEW"):
+            outcome = manager.poll_live("BTCUSDT")
+
+        self.assertIsNone(outcome)
+        self.assertIn("BTCUSDT", manager.positions)
+
+    def test_shadow_single_tp_touch_closes_the_whole_position(self):
+        manager = PositionManager()
+        plan = dict(_plan(), single_tp=True, tp_price=104,
+                    tp1_price=None, tp2_price=None,
+                    tp1_quantity=None, tp2_quantity=None)
+        manager.register(plan, {"shadow": True})
+
+        outcome = manager.poll_shadow("BTCUSDT", _candle(high=105, low=99))
+
+        self.assertEqual(outcome, "SHADOW_STATIC_TP_HIT")
+
+    def test_shadow_single_tp_sl_touch_still_wins_the_race(self):
+        # poll_shadow checks the adverse touch first by design - the
+        # single-TP branch must not bypass that ordering.
+        manager = PositionManager()
+        plan = dict(_plan(), single_tp=True, tp_price=104,
+                    tp1_price=None, tp2_price=None,
+                    tp1_quantity=None, tp2_quantity=None)
+        manager.register(plan, {"shadow": True})
+
+        outcome = manager.poll_shadow("BTCUSDT", _candle(high=105, low=97))
+
+        self.assertEqual(outcome, "SHADOW_SL_HIT")
 
 
 class PollLiveTests(unittest.TestCase):
@@ -6410,12 +6594,17 @@ class PollShadowDcaPendingTests(unittest.TestCase):
         self.pp_patcher = patch.object(config, "PROFIT_PROTECTION_ENABLED", False)
         self.eb_patcher = patch.object(config, "EARLY_BREAKEVEN_ENABLED", False)
         self.pf_patcher = patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False)
+        # config.DCA_ENABLED - see DcaProtectiveEscalationTests.setUp:
+        # pinned on because this class tests the DCA machinery itself.
+        self.dca_patcher = patch.object(config, "DCA_ENABLED", True)
         self.pp_patcher.start()
         self.eb_patcher.start()
         self.pf_patcher.start()
+        self.dca_patcher.start()
         self.addCleanup(self.pp_patcher.stop)
         self.addCleanup(self.eb_patcher.stop)
         self.addCleanup(self.pf_patcher.stop)
+        self.addCleanup(self.dca_patcher.stop)
 
     def _manager_with_dca_pending(self):
         manager = PositionManager()
@@ -7025,6 +7214,9 @@ class PollLiveDcaPendingTests(unittest.TestCase):
             ("PROFIT_PROTECTION_ENABLED", False),
             ("EARLY_BREAKEVEN_ENABLED", False),
             ("DCA_PROTECTIVE_FIRST_ENABLED", False),
+            # config.DCA_ENABLED - see DcaProtectiveEscalationTests.setUp:
+            # pinned on because this class tests the DCA machinery itself.
+            ("DCA_ENABLED", True),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -7211,6 +7403,9 @@ class PollLiveDcaRestingOrderTests(unittest.TestCase):
             ("EARLY_BREAKEVEN_ENABLED", False),
             ("DCA_PRESSURE_CHECK_ENABLED", False),
             ("DCA_PROTECTIVE_FIRST_ENABLED", False),
+            # config.DCA_ENABLED - see DcaProtectiveEscalationTests.setUp:
+            # pinned on because this class tests the DCA machinery itself.
+            ("DCA_ENABLED", True),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -7796,6 +7991,9 @@ class PollLiveDcaProtectiveStopTests(unittest.TestCase):
             ("PROFIT_PROTECTION_ENABLED", False),
             ("EARLY_BREAKEVEN_ENABLED", False),
             ("DCA_PRESSURE_CHECK_ENABLED", False),
+            # config.DCA_ENABLED - see DcaProtectiveEscalationTests.setUp:
+            # pinned on because this class tests the DCA machinery itself.
+            ("DCA_ENABLED", True),
             ("DCA_PROTECTIVE_FIRST_ENABLED", True),
             ("DCA_PROTECTIVE_ESCALATION_ENABLED", False),
         ):
@@ -7874,6 +8072,11 @@ class DcaProtectiveEscalationTests(unittest.TestCase):
             ("MAE_TRACKING_ENABLED", False),
             ("PROFIT_PROTECTION_ENABLED", False),
             ("EARLY_BREAKEVEN_ENABLED", False),
+            # config.DCA_ENABLED is False in the live .env (2026-09-06,
+            # replaced by a real 1R stop + single 2R TP). This class tests
+            # the DCA machinery itself, so it pins it on rather than
+            # inheriting an .env value that makes every DCA path a no-op.
+            ("DCA_ENABLED", True),
             ("DCA_PROTECTIVE_FIRST_ENABLED", True),
             ("DCA_PROTECTIVE_ESCALATION_ENABLED", True),
         ):

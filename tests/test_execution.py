@@ -717,7 +717,7 @@ class PlaceProtectionOrdersTests(unittest.TestCase):
         with patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}) as sl, \
              patch.object(exchange, "place_take_profit_partial", return_value={"algoId": 3}) as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}) as tp2:
-            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+            sl_order, tp1_order, tp2_order, tp_order, error = execution.place_protection_orders(
                 "BTCUSDT", "BUY", _plan()
             )
 
@@ -728,6 +728,67 @@ class PlaceProtectionOrdersTests(unittest.TestCase):
         self.assertEqual(sl_order, {"algoId": 2})
         self.assertEqual(tp1_order, {"algoId": 3})
         self.assertEqual(tp2_order, {"algoId": 4})
+        self.assertIsNone(tp_order)
+
+    # config.TP2_ENABLED=False + config.DCA_ENABLED=False (2026-09-06) -
+    # the non-DCA single-TP shape. build_trade_plan sets tp1_quantity/
+    # tp2_quantity to None on a single_tp plan, so the TP1+TP2 pair above
+    # literally cannot be placed for one; this branch is what makes
+    # "real SL at 1R + one full-position TP at 2R" reachable without DCA.
+
+    def test_single_tp_plan_places_sl_then_one_full_tp(self):
+        plan = dict(_plan(), single_tp=True, tp_price=104,
+                    tp1_quantity=None, tp2_quantity=None)
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}) as sl, \
+             patch.object(exchange, "place_take_profit_partial") as tp1, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": 5}) as tp:
+            sl_order, tp1_order, tp2_order, tp_order, error = execution.place_protection_orders(
+                "BTCUSDT", "BUY", plan
+            )
+
+        self.assertIsNone(error)
+        sl.assert_called_once_with("BTCUSDT", "BUY", 98)
+        tp.assert_called_once_with("BTCUSDT", "BUY", 104)
+        tp1.assert_not_called()
+        self.assertEqual(sl_order, {"algoId": 2})
+        self.assertEqual(tp_order, {"algoId": 5})
+        self.assertIsNone(tp1_order)
+        self.assertIsNone(tp2_order)
+
+    def test_single_tp_sl_failure_still_closes_at_market(self):
+        # the SL half stays atomic in this shape too - a single-TP
+        # position must never be left open without a stop.
+        plan = dict(_plan(), single_tp=True, tp_price=104,
+                    tp1_quantity=None, tp2_quantity=None)
+
+        with patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
+             patch.object(exchange, "place_take_profit_full") as tp, \
+             patch.object(exchange, "close_position_market") as close_market:
+            sl_order, _, _, tp_order, error = execution.place_protection_orders(
+                "BTCUSDT", "BUY", plan
+            )
+
+        self.assertIsNone(sl_order)
+        self.assertIsNone(tp_order)
+        self.assertIn("rejected", error)
+        tp.assert_not_called()
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+
+    def test_single_tp_placement_failure_does_not_abort(self):
+        # best-effort, exactly like TP1/TP2 - the SL is already active.
+        plan = dict(_plan(), single_tp=True, tp_price=104,
+                    tp1_quantity=None, tp2_quantity=None)
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
+             patch.object(exchange, "place_take_profit_full", side_effect=RuntimeError("rejected")):
+            sl_order, _, _, tp_order, error = execution.place_protection_orders(
+                "BTCUSDT", "BUY", plan
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(sl_order, {"algoId": 2})
+        self.assertIsNone(tp_order)
 
     def test_uses_whatever_quantity_the_plan_carries_not_a_fixed_one(self):
         # The real motivation for extracting this at all: a retracement
@@ -746,7 +807,7 @@ class PlaceProtectionOrdersTests(unittest.TestCase):
     def test_sl_failure_closes_at_market_and_returns_an_error(self):
         with patch.object(exchange, "place_stop_loss", side_effect=RuntimeError("rejected")), \
              patch.object(exchange, "close_position_market") as close_market:
-            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+            sl_order, tp1_order, tp2_order, tp_order, error = execution.place_protection_orders(
                 "BTCUSDT", "BUY", _plan()
             )
 
@@ -760,7 +821,7 @@ class PlaceProtectionOrdersTests(unittest.TestCase):
         with patch.object(exchange, "place_stop_loss", return_value={"algoId": 2}), \
              patch.object(exchange, "place_take_profit_partial", side_effect=RuntimeError("rejected")), \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": 4}):
-            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+            sl_order, tp1_order, tp2_order, tp_order, error = execution.place_protection_orders(
                 "BTCUSDT", "BUY", _plan()
             )
 

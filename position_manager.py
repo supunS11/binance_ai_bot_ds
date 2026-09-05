@@ -372,6 +372,17 @@ class PositionManager:
                 exchange._accepted_order_id(execution_result.get("tp2_order"))
                 if not shadow else None
             ),
+            # config.TP2_ENABLED=False - a single-TP position carries
+            # tp_price/tp_order_id instead of the tp1/tp2 pair (both None
+            # in that plan shape), exactly as register_dca_pending already
+            # does for the DCA_PENDING stage. Every call site that reads
+            # these branches on single_tp.
+            "tp_price": plan.get("tp_price"),
+            "single_tp": bool(plan.get("single_tp")),
+            "tp_order_id": (
+                exchange._accepted_order_id(execution_result.get("tp_order"))
+                if not shadow else None
+            ),
             "stage": TP1_PENDING,
             "shadow": shadow,
             "opened_at": time.time(),
@@ -1555,11 +1566,40 @@ class PositionManager:
             (side == "BUY" and sl_price >= entry_price)
             or (side == "SELL" and sl_price <= entry_price)
         )
-        stage = (
-            BREAKEVEN_ACTIVE
-            if (sl_already_protects_profit or (tp2_order and not tp1_order))
-            else TP1_PENDING
+
+        # config.TP2_ENABLED=False - a single-TP position presents EXACTLY
+        # the shape (one closePosition TP, no partial TP1) that the rule
+        # below otherwise reads as "TP1 already filled, so promoted".
+        # Misclassifying it would restart a live position as
+        # BREAKEVEN_ACTIVE with a risk-bearing stop recorded as a
+        # breakeven one - the same class of bug the comment above
+        # describes, in the opposite direction.
+        #
+        # Two discriminators, both needed:
+        #   - config.TP2_ENABLED must actually be OFF, i.e. this bot is
+        #     currently producing single-TP positions at all. With it on,
+        #     the long-standing "closePosition TP + no partial TP1 means
+        #     already promoted" rule is preserved EXACTLY (see
+        #     ReconcileOnStartupTests, which pins that behaviour).
+        #   - the STOP must still be risk-bearing. A genuinely promoted
+        #     position's stop sits on the PROFIT side of entry
+        #     (compute_breakeven_price adds BREAKEVEN_BUFFER_PCT beyond
+        #     entry to cover round-trip fees), so this also keeps a legacy
+        #     promoted position correct if it is still open when
+        #     TP2_ENABLED flips off.
+        single_tp = bool(
+            not config.TP2_ENABLED
+            and tp2_order
+            and not tp1_order
+            and not sl_already_protects_profit
         )
+
+        if single_tp:
+            stage = TP1_PENDING
+        elif sl_already_protects_profit or (tp2_order and not tp1_order):
+            stage = BREAKEVEN_ACTIVE
+        else:
+            stage = TP1_PENDING
 
         position = {
             "symbol": symbol,
@@ -1576,6 +1616,16 @@ class PositionManager:
             "sl_order_id": exchange._accepted_order_id(sl_order) if sl_order else "",
             "tp1_order_id": exchange._accepted_order_id(tp1_order) if tp1_order else "",
             "tp2_order_id": exchange._accepted_order_id(tp2_order) if tp2_order else "",
+            # config.TP2_ENABLED=False - the single-TP fields. The one
+            # closePosition TP found on the exchange IS the target, so it
+            # is adopted as tp_order_id/tp_price rather than mistaken for a
+            # TP2 leftover. Both stay None/"" for the ordinary TP1+TP2
+            # shape, exactly as register() leaves them.
+            "single_tp": single_tp,
+            "tp_price": tp2_price if single_tp else None,
+            "tp_order_id": (
+                exchange._accepted_order_id(tp2_order) if single_tp and tp2_order else ""
+            ),
             "stage": stage,
             "shadow": False,
             "opened_at": time.time(),
@@ -3604,6 +3654,28 @@ class PositionManager:
             ):
                 return None
 
+            # config.TP2_ENABLED=False - one full-position TP instead of
+            # TP1(partial)+TP2(remainder): a fill closes the WHOLE position
+            # at once, no promotion, no tp2 to wait on. Same shape as the
+            # DCA_PENDING branch above, with one deliberate difference -
+            # this stage DOES have a real resting SL (config.DCA_ENABLED
+            # off, so protection was placed the moment the entry filled),
+            # so both legs are checked here rather than the TP alone.
+            if position.get("single_tp"):
+                tp_status = self._status_or_missing(symbol, position["tp_order_id"])
+
+                if tp_status == "FINISHED":
+                    exchange.cancel_all_open_orders(symbol)
+                    return self._close(symbol, "STATIC_TP_HIT")
+
+                sl_status = self._status_or_missing(symbol, position["sl_order_id"])
+
+                if sl_status == "FINISHED":
+                    exchange.cancel_all_open_orders(symbol)
+                    return self._close(symbol, "SL_HIT")
+
+                return None
+
             tp1_status = self._status_or_missing(symbol, position["tp1_order_id"])
 
             if tp1_status == "FINISHED":
@@ -3839,12 +3911,22 @@ class PositionManager:
                     except Exception as exc:
                         log_warning(f"{symbol} DCA protective stop recovery attempt failed: {exc}")
 
-        if position["stage"] == DCA_PENDING and position.get("single_tp"):
+        if position["stage"] in (TP1_PENDING, DCA_PENDING) and position.get("single_tp"):
             # config.TP_STATIC_ROI_ENABLED - same single-TP self-heal
-            # shape as DCA_ACTIVE above, just for the pre-DCA stage. No
-            # SL to self-heal here either (see this function's own
-            # docstring) - a DCA_PENDING position's SL doesn't exist yet
-            # by design, same as always.
+            # shape as DCA_ACTIVE above, for the pre-DCA stage AND (config.
+            # DCA_ENABLED=False) for the ordinary TP1_PENDING one, which
+            # has exactly the same one-TP shape.
+            #
+            # Still no SL self-heal on either: DCA_PENDING's SL doesn't
+            # exist yet by design, and TP1_PENDING's was placed atomically
+            # at entry (execution.place_protection_orders aborts the trade
+            # and closes at market if it can't be placed), so a missing one
+            # means the position was already unwound - the same reasoning
+            # this function's own docstring gives for never self-healing an
+            # SL anywhere in this file.
+            #
+            # Returns before the TP1 block below, which is correct - a
+            # single-TP position has no tp1_order_id to heal.
             if not position.get("tp_order_id"):
                 existing = self._find_open_order(symbol, "TAKE_PROFIT_MARKET", close_position=True)
 
@@ -4136,6 +4218,22 @@ class PositionManager:
                 return self._close(symbol, "SHADOW_SL_HIT")
 
             if self._try_early_promotions_shadow(position, latest_candle, candles):
+                return None
+
+            # config.TP2_ENABLED=False - one full-position TP, no promotion.
+            # The SL touch is already handled above this point (same
+            # conservative adverse-first ordering as the rest of poll_shadow),
+            # so only the target is left to check here.
+            if position.get("single_tp"):
+                hit_tp = (
+                    high >= position["tp_price"]
+                    if side == "BUY"
+                    else low <= position["tp_price"]
+                )
+
+                if hit_tp:
+                    return self._close(symbol, "SHADOW_STATIC_TP_HIT")
+
                 return None
 
             hit_tp1 = (
@@ -4901,7 +4999,7 @@ class PositionManager:
                 "real_entry_price": entry_price,
             }
         else:
-            sl_order, tp1_order, tp2_order, error = execution.place_protection_orders(
+            sl_order, tp1_order, tp2_order, tp_order, error = execution.place_protection_orders(
                 symbol, side, settled_plan
             )
 
@@ -4915,6 +5013,10 @@ class PositionManager:
             execution_result = {
                 "ok": True, "shadow": False, "entry_order": None,
                 "sl_order": sl_order, "tp1_order": tp1_order, "tp2_order": tp2_order,
+                # config.TP2_ENABLED=False - the single-TP sibling of the
+                # tp1/tp2 pair, exactly as the is_dca branch above already
+                # carries it. None whenever the plan isn't single_tp.
+                "tp_order": tp_order,
                 "real_entry_price": entry_price,
             }
 
