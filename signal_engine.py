@@ -226,6 +226,18 @@ def evaluate(
     ltf_ema_regime = _ema_regime(ltf_trend_candles or ltf_candles)
     htf_ema_regime = _ema_regime(htf_trend_candles or htf_candles)
 
+    # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - the raw recent range.
+    # Direction-INDEPENDENT, so it's computed once here; the 0..1 "how bad
+    # is this entry for THIS side" transform needs a side and lives in
+    # _evaluate_direction. See that flag's config.py comment for the real
+    # evidence, including the fact that it measured NEGATIVE.
+    entry_range_high = entry_range_low = None
+    range_window = ltf_candles[-max(int(config.ENTRY_RANGE_LOOKBACK_CANDLES), 1):]
+
+    if range_window:
+        entry_range_high = max(c["high"] for c in range_window)
+        entry_range_low = min(c["low"] for c in range_window)
+
     zone = market_structure.premium_discount_zone(htf_candles)
 
     if not zone.get("available"):
@@ -852,6 +864,37 @@ def evaluate(
         if config.EMA_TREND_MIXED_REJECT_ENABLED and ema_trend_bucket == "MIXED":
             return _reject("EMA_TREND_MIXED")
 
+        # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - "don't buy the top of
+        # the range, don't sell the bottom". 0.0 = the ideal end for this
+        # side, 1.0 = the worst end. latest_price is ltf_candles[-1] close,
+        # the same price used as entry_price below, so this measures exactly
+        # what gets filled.
+        #
+        # Universal rather than profile-scoped, same as the two gates above.
+        # Fails open on a degenerate range or too little history.
+        #
+        # READ config.py BEFORE RAISING THE STRICTNESS: every measurement
+        # available says this gate costs money (winners entered HIGHER in the
+        # range than losers, in both halves). It ships off, at the least
+        # destructive threshold, on the operator's explicit decision.
+        entry_range_position = None
+
+        if (
+            entry_range_high is not None
+            and entry_range_low is not None
+            and entry_range_high > entry_range_low
+        ):
+            span = entry_range_high - entry_range_low
+            pos = (latest_price - entry_range_low) / span
+            entry_range_position = pos if side == "BUY" else (1.0 - pos)
+
+        if (
+            config.ENTRY_RANGE_POSITION_REJECT_ENABLED
+            and entry_range_position is not None
+            and entry_range_position > config.ENTRY_RANGE_POSITION_MAX
+        ):
+            return _reject("ENTRY_RANGE_POSITION")
+
         # Both checks below exist purely to catch a stale SWING-confirmed
         # bias. Once AGAINST_HTF_BIAS no longer uses that bias at all
         # (config.HTF_TREND_EMA_PRIMARY_ENABLED), checking its staleness
@@ -1378,6 +1421,11 @@ def evaluate(
             "ltf_ema_regime": ltf_ema_regime,
             "htf_ema_regime": htf_ema_regime,
             "ema_trend_bucket": ema_trend_bucket,
+            # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - journaled
+            # unconditionally so the live distribution accumulates while the
+            # gate is off, and can be compared against the measured medians
+            # (winners 0.64 / losers 0.48).
+            "entry_range_position": entry_range_position,
             "htf_trend_swing_age_hours": htf_trend_swing_age_hours,
             # Placeholders - the candidate (not the direction) determines
             # these; the caller overlays the winning candidate's real

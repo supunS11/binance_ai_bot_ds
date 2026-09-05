@@ -1561,6 +1561,49 @@ MIN_STOP_DISTANCE_ATR_MULTIPLE = env_float("MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0
 # with each symbol's own volatility. Starting value is a reasonable
 # floor, not yet calibrated against real trade data. 0 disables it.
 MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
+# config.ENTRY_RANGE_POSITION_REJECT_ENABLED - 2026-09-05, operator's own
+# explicit and repeatedly-restated call: stop entering BUYs near the top of
+# the recent range and SELLs near the bottom.
+#
+# entry_range_position places the entry inside the prior
+# ENTRY_RANGE_LOOKBACK_CANDLES of 1h range, then flips it for direction:
+# 0.0 = the IDEAL end for this side (bottom for a BUY), 1.0 = the WORST end.
+#
+# THE OBSERVATION IS REAL AND LARGE. Entries in the BOTH_OPPOSED EMA bucket
+# sit at a median 0.74, against 0.42 for BOTH_AGREE - distributions that
+# barely overlap (OPPOSED p25 0.68 > AGREE p75 0.65).
+#
+# BUT EVERY MEASUREMENT SAYS GATING ON IT COSTS MONEY. 115 resolved LIVE
+# trades replayed on real 5m paths:
+#     chase band     n   win%      PnL
+#     0.00-0.25     11    45%    45.57   <- the "ideal" entries
+#     0.25-0.50     21    43%    -6.47
+#     0.50-0.75     43    60%   666.61
+#     0.75-1.01     40    55%   663.74   <- the "worst" entries
+# Winners entered at a median 0.64, losers at 0.48, and that separation held
+# in BOTH halves (+0.82 / +0.50). Two fields this bot already journals agree:
+# entry_extension_r >= median returned +545.70 vs +136.25, and PREMIUM-zone
+# entries beat DISCOUNT ones. Gating sweep: >0.90 -132.57, >0.80 -553.92,
+# >0.70 -862.18, >0.60 -1279.36, >0.50 -1330.35 - monotonically worse.
+#
+# The likely reason is that this system's edge is MOMENTUM, not mean
+# reversion: entering high in the range on a BUY means price is already
+# moving your way.
+#
+# Ships OFF, and 0.80 is the least destructive threshold offered. The
+# operator was shown all of the above and chose to proceed anyway for
+# risk-discipline reasons - that is a legitimate call on their own capital,
+# recorded here so the trade-off stays visible. If live
+# ENTRY_RANGE_POSITION rejects pile up alongside a falling win rate, that is
+# the expected signature and this should go back to False.
+ENTRY_RANGE_POSITION_REJECT_ENABLED = env_bool(
+    "ENTRY_RANGE_POSITION_REJECT_ENABLED", "False"
+)
+ENTRY_RANGE_POSITION_MAX = env_float("ENTRY_RANGE_POSITION_MAX", 0.80)
+# 24 x 1h = the 24-hour window the measurement above used; 12 and 48
+# separated winners from losers less well. Well inside the 200-candle
+# ltf_candles buffer, so this needs no new history.
+ENTRY_RANGE_LOOKBACK_CANDLES = env_int("ENTRY_RANGE_LOOKBACK_CANDLES", 24)
 # Rejects an entry whose stop, once LEVERAGE is applied, would lose more
 # than this % of the margin actually at risk if hit - independent of
 # position sizing mode, since quantity cancels out of the ratio

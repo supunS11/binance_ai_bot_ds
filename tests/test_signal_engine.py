@@ -10,10 +10,18 @@ import risk_manager
 import signal_engine
 
 
-def _ltf_candles(close):
+def _ltf_candles(close, range_high=None, range_low=None):
+    # range_high/range_low let a test place `close` anywhere inside the
+    # recent high-low band, which is all config.ENTRY_RANGE_POSITION_REJECT_
+    # ENABLED reads. Defaults reproduce the original fixture exactly, so the
+    # default entry_range_position is 0.67 for a BUY / 0.33 for a SELL -
+    # both inside ENTRY_RANGE_POSITION_MAX, leaving every existing test
+    # unaffected.
     return [{
-        "open_time": 0, "open": close - 0.5, "high": close + 0.5,
-        "low": close - 1.0, "close": close, "volume": 1.0, "closed": False,
+        "open_time": 0, "open": close - 0.5,
+        "high": close + 0.5 if range_high is None else range_high,
+        "low": close - 1.0 if range_low is None else range_low,
+        "close": close, "volume": 1.0, "closed": False,
     }]
 
 
@@ -108,6 +116,8 @@ class SignalEngineTests(unittest.TestCase):
         ltf_ema_slow=None,
         htf_ema_fast=None,
         htf_ema_slow=None,
+        ltf_range_high=None,
+        ltf_range_low=None,
         liquidation_snapshot_bybit=None,
         liquidation_snapshot_okx=None,
     ):
@@ -200,7 +210,7 @@ class SignalEngineTests(unittest.TestCase):
         # (the two lists are distinct objects), then on period within the
         # LTF ones. ltf_trend_ema defaults to None (gate is a no-op) so no
         # existing test is affected unless it explicitly opts in.
-        ltf_candle_list = _ltf_candles(ltf_close)
+        ltf_candle_list = _ltf_candles(ltf_close, ltf_range_high, ltf_range_low)
 
         # config.EMA_TREND_MIXED_REJECT_ENABLED adds two MORE callers per
         # timeframe (_ema_regime's EMA50 and EMA200 reads, on both lists).
@@ -866,6 +876,112 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(result["signal"], "SELL")
         self.assertEqual(result["ema_trend_bucket"], "BOTH_OPPOSED")
+
+    # config.ENTRY_RANGE_POSITION_REJECT_ENABLED (2026-09-05) - "don't buy
+    # the top of the range, don't sell the bottom". 0.0 = ideal end for the
+    # side, 1.0 = worst end. _run's default ltf_close is 93.0 with the
+    # fixture's own high/low, giving 0.67 for a BUY - deliberately below
+    # ENTRY_RANGE_POSITION_MAX so nothing else in this suite changes.
+    #
+    # See config.py: every measurement says this gate COSTS money (winners
+    # entered higher in the range than losers, in both halves). It exists on
+    # the operator's explicit decision and ships off.
+
+    def test_entry_range_position_rejects_a_buy_at_the_top_of_the_range(self):
+        # close 93 sits exactly at the range high -> position 1.0
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
+            result = self._run(ltf_range_low=83.0, ltf_range_high=93.0)
+
+        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
+
+    def test_entry_range_position_rejects_a_sell_at_the_bottom_of_the_range(self):
+        # standard SELL fixture (close 108) sitting at the range LOW, which
+        # for a SELL is the worst end -> position 1.0
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0, ltf_range_low=108.0, ltf_range_high=118.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0,
+            )
+
+        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
+
+    def test_entry_range_position_allows_a_buy_near_the_bottom(self):
+        # close 93 just above the low of an 83-113 range -> position 0.33
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
+            result = self._run(ltf_range_low=83.0, ltf_range_high=113.0)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertAlmostEqual(result["entry_range_position"], 1.0 / 3.0, places=4)
+
+    def test_entry_range_position_allows_a_sell_near_the_top(self):
+        # close 108 at the TOP of a 98-108 range is the IDEAL end for a SELL
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0, ltf_range_low=98.0, ltf_range_high=108.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+                sweep_direction="BEARISH", ema_value=115.0,
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertAlmostEqual(result["entry_range_position"], 0.0, places=4)
+
+    def test_entry_range_position_exactly_at_the_threshold_passes(self):
+        # strict > , so a position landing exactly on the max is allowed.
+        # low 83, high 95.5 -> (93-83)/12.5 = 0.80
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 0.80):
+            result = self._run(ltf_range_low=83.0, ltf_range_high=95.5)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertAlmostEqual(result["entry_range_position"], 0.80, places=6)
+
+    def test_entry_range_position_gate_off_never_rejects(self):
+        # the one-flag revert path - identical setup to the first test here
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", False):
+            result = self._run(ltf_range_low=83.0, ltf_range_high=93.0)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertAlmostEqual(result["entry_range_position"], 1.0, places=4)
+
+    def test_entry_range_position_degenerate_range_never_rejects(self):
+        # high == low: no range to place the entry in, so fail open rather
+        # than divide by zero or guess.
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
+            result = self._run(ltf_range_low=93.0, ltf_range_high=93.0)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertIsNone(result["entry_range_position"])
+
+    def test_entry_range_position_applies_to_reversal_triggers_too(self):
+        # universal, like LTF_TREND_OPPOSED and EMA_TREND_MIXED - never read
+        # from trigger_gate_profiles(). Same CVD_DIVERGENCE fixture that
+        # passes without this gate.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                divergence_direction="BULLISH", divergence_level=88,
+                divergence_open_time=555,
+                ltf_range_low=83.0, ltf_range_high=93.0,
+            )
+
+        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
+
+    def test_entry_range_position_is_journaled_with_the_gate_off(self):
+        # ships OFF but must still populate, so the live distribution can be
+        # compared against the measured medians (winners 0.64/losers 0.48).
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", False):
+            result = self._run()
+
+        self.assertIsNotNone(result["entry_range_position"])
 
     def test_htf_trend_live_strength_reject_disabled_lets_weak_reads_through(self):
         # Thresholds pinned explicitly - see comment on the first test in

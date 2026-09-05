@@ -254,6 +254,22 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["htf_ema_regime"], "")
         self.assertEqual(rows[0]["ema_trend_bucket"], "")
 
+    def test_append_signal_writes_entry_range_position(self):
+        # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - journaled whether or
+        # not that gate is on, so the live distribution accumulates and can
+        # be checked against the measured medians before it is enabled.
+        signal_journal.append_signal(_signal(entry_range_position=0.74), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["entry_range_position"], "0.74")
+
+    def test_append_signal_leaves_entry_range_position_blank_when_absent(self):
+        # None on a degenerate range (high == low) or too little history.
+        signal_journal.append_signal(_signal(), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["entry_range_position"], "")
+
     def test_append_signal_writes_depth_trend_and_whale_fields(self):
         # config.DEPTH_TREND_TRACKING_ENABLED/WHALE_TRADE_TRACKING_ENABLED -
         # real orderbook.py/order_flow.py/signal_engine.py logic covered in
