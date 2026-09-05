@@ -299,7 +299,15 @@ class StructureBasedTargetTests(unittest.TestCase):
         # floor must adapt to sit beyond that, not just the configured 2R.
         pools = [{"type": "BUY_SIDE", "price": 108}]  # 4R away
 
-        with patch.object(config, "TP1_R_MULTIPLE", 1.0), patch.object(config, "TP2_R_MULTIPLE", 2.0):
+        # TP1_MAX_R_MULTIPLE must be pinned too, exactly as the test above
+        # does: this test's whole premise is TP1 landing on a 4R pool, which
+        # only happens while the cap allows 4R. Left unpinned it inherited
+        # the live .env value and broke the moment that was tightened
+        # (5.0 -> 2.0 -> 3.0 on 2026-09-05) - the pool fell outside the cap
+        # and TP1 fell back to its 1R floor, asserting 102.0 != 108.
+        with patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0):
             tp1, tp2 = risk_manager.compute_targets(100, 98, "BUY", pools=pools)
 
         self.assertEqual(tp1, 108)

@@ -4796,7 +4796,13 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         manager = _retracement_manager(dca=True, single_tp=False)
         position = manager.positions["BTCUSDT"]
 
-        with patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as tp1, \
+        # config.DCA_PROTECTIVE_FIRST_ENABLED pinned off - the "no SL while
+        # DCA_PENDING" assertion below is exactly what protective-first
+        # exists to change (it rests a quantity-neutral protective stop at
+        # dca_price instead). This test covers the original shape;
+        # PollLiveDcaProtectiveStopTests covers the other one.
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}) as tp1, \
              patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}) as tp2, \
              patch.object(exchange, "place_stop_loss") as sl:
             outcome = manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
@@ -5640,9 +5646,16 @@ class RegisterDcaPendingTests(unittest.TestCase):
     # tp1_order_id/tp2_order_id/tp_order_id above.
 
     def test_live_registration_stores_dca_order_id_when_present(self):
+        # config.DCA_PROTECTIVE_FIRST_ENABLED pinned off: dca_order_id is
+        # the quantity-ADDING resting order's id, and register_dca_pending
+        # only stores it on that path - protective-first stores
+        # dca_protective_sl_order_id instead (covered by
+        # EnsureProtectionOrdersDcaProtectiveFirstTests).
         manager = PositionManager()
         execution_result = {"shadow": False, "dca_order": {"orderId": 555}}
-        position = manager.register_dca_pending(_dca_plan(), execution_result)
+
+        with patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False):
+            position = manager.register_dca_pending(_dca_plan(), execution_result)
 
         self.assertEqual(position["dca_order_id"], 555)
 
@@ -6390,12 +6403,19 @@ class PollShadowDcaPendingTests(unittest.TestCase):
         # isolated to the TP1-vs-DCA race itself, same discipline
         # PollLiveTests already uses. TryEarlyPromotionsShadowTests below
         # covers the promotion behavior directly.
+        # config.DCA_PROTECTIVE_FIRST_ENABLED - see
+        # PollLiveDcaRestingOrderTests.setUp: these exercise the ordinary
+        # quantity-adding DCA fire, which protective-first replaces, so
+        # they must pin it off rather than inherit the live .env value.
         self.pp_patcher = patch.object(config, "PROFIT_PROTECTION_ENABLED", False)
         self.eb_patcher = patch.object(config, "EARLY_BREAKEVEN_ENABLED", False)
+        self.pf_patcher = patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False)
         self.pp_patcher.start()
         self.eb_patcher.start()
+        self.pf_patcher.start()
         self.addCleanup(self.pp_patcher.stop)
         self.addCleanup(self.eb_patcher.stop)
+        self.addCleanup(self.pf_patcher.stop)
 
     def _manager_with_dca_pending(self):
         manager = PositionManager()
@@ -6997,10 +7017,14 @@ class PollLiveDcaPendingTests(unittest.TestCase):
     def setUp(self):
         # See PollShadowDcaPendingTests.setUp - same isolation, same
         # real gap it's guarding against.
+        # config.DCA_PROTECTIVE_FIRST_ENABLED - see
+        # PollLiveDcaRestingOrderTests.setUp: these exercise the ordinary
+        # quantity-adding DCA fire, which protective-first replaces.
         for name, value in (
             ("MAE_TRACKING_ENABLED", False),
             ("PROFIT_PROTECTION_ENABLED", False),
             ("EARLY_BREAKEVEN_ENABLED", False),
+            ("DCA_PROTECTIVE_FIRST_ENABLED", False),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -7174,11 +7198,19 @@ class PollLiveDcaRestingOrderTests(unittest.TestCase):
     partial fills via executed_qty) instead of watching candle ranges."""
 
     def setUp(self):
+        # config.DCA_PROTECTIVE_FIRST_ENABLED - this whole class tests the
+        # quantity-ADDING resting-order path, which protective-first
+        # SUPERSEDES (execution.place_dca_protection_orders and poll_live's
+        # DCA_PENDING branch both check it first). Pinned off so these keep
+        # testing the path they were written for instead of silently going
+        # no-op the moment that flag is turned on live - the same insulation
+        # reasoning as the flags already listed here.
         for name, value in (
             ("MAE_TRACKING_ENABLED", False),
             ("PROFIT_PROTECTION_ENABLED", False),
             ("EARLY_BREAKEVEN_ENABLED", False),
             ("DCA_PRESSURE_CHECK_ENABLED", False),
+            ("DCA_PROTECTIVE_FIRST_ENABLED", False),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -8066,6 +8098,17 @@ class EnsureProtectionOrdersSingleTpDcaPendingTests(unittest.TestCase):
     """config.TP_STATIC_ROI_ENABLED - self-heal for a single-TP DCA_PENDING
     position's missing tp_order_id, mirroring the existing TP1/TP2 self-
     heal tests' shape."""
+
+    def setUp(self):
+        # config.DCA_PROTECTIVE_FIRST_ENABLED pinned off - this class is
+        # about the TP self-heal alone. With the flag on,
+        # _ensure_protection_orders ALSO reconciles the resting protective
+        # stop, which reaches for get_open_algo_orders and breaks the
+        # "noop" assertions here. EnsureProtectionOrdersDcaProtectiveFirst
+        # Tests covers that half deliberately.
+        patcher = patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _manager_with_single_tp_dca_pending(self, tp_order_id=None):
         manager = PositionManager()

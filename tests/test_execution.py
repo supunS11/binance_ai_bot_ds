@@ -552,6 +552,15 @@ class EnterTradeDcaPendingShadowModeTests(unittest.TestCase):
 
 
 class EnterTradeDcaPendingLiveModeTests(unittest.TestCase):
+    def setUp(self):
+        # config.DCA_PROTECTIVE_FIRST_ENABLED pinned off - "never an SL"
+        # below is precisely what that flag changes (it rests a quantity-
+        # neutral protective stop at dca_price). PlaceDcaProtectiveStop
+        # Tests covers the flag-on shape.
+        patcher = patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_live_mode_places_entry_then_tp1_tp2_but_never_an_sl(self):
         with patch.object(config, "EXECUTION_MODE", "LIVE"), \
              patch.object(exchange, "setup_leverage", return_value=True), \
@@ -646,6 +655,14 @@ class EnterTradeDcaPendingShadowOnlyTriggerTests(unittest.TestCase):
 class EnterTradeDcaPendingSingleTpTests(unittest.TestCase):
     """config.TP_STATIC_ROI_ENABLED - plan["single_tp"] routes to ONE
     full-position TP order instead of TP1(partial)+TP2(remainder)."""
+
+    def setUp(self):
+        # config.DCA_PROTECTIVE_FIRST_ENABLED - see
+        # EnterTradeDcaPendingLiveModeTests.setUp, same "never an SL"
+        # assertion, same reason for pinning it off.
+        patcher = patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_shadow_mode_places_no_real_orders(self):
         with patch.object(config, "EXECUTION_MODE", "SHADOW"), \
@@ -802,6 +819,16 @@ class PlaceDcaRestingOrderTests(unittest.TestCase):
     TP), always sized at DCA_PRESSURE_SIZE_MULTIPLIER (the conservative
     branch), tagged for restart recovery. See config.py's own comment for
     the full evidence/rationale."""
+
+    def setUp(self):
+        # config.DCA_PROTECTIVE_FIRST_ENABLED SUPERSEDES the resting-order
+        # path this class tests - place_dca_protection_orders checks it
+        # first. Pinned off so these keep exercising the resting order
+        # itself; a test here that wants the flag on patches it locally,
+        # which still wins over this.
+        patcher = patch.object(config, "DCA_PROTECTIVE_FIRST_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_disabled_by_default_places_no_resting_order(self):
         with patch.object(config, "DCA_RESTING_ORDER_ENABLED", False), \
