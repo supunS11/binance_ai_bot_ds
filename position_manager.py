@@ -4849,11 +4849,73 @@ class PositionManager:
 
         return latest_candle["close"] <= trigger_price - offset
 
+    @staticmethod
+    def _retracement_rr_too_low(position, latest_candle):
+        """config.RETRACEMENT_MIN_SETTLED_RR - would a market fallback here
+        open a position below the minimum reward:risk?
+
+        _finalize_retracement_entry recomputes risk_distance from the real
+        fill but leaves sl_price/tp_price at the levels risk_manager
+        resolved from the SIGNAL price (they are meant to be structure
+        levels). That is a gift on a favorable fill - risk shrinks, reward
+        grows - and a double penalty on an adverse one, because risk grows
+        toward a fixed stop while reward shrinks toward a fixed target at
+        the same time. Measured live, every MARKET_FALLBACK under the 2:1
+        architecture landed below 2:1 and two thirds below 1:1; no direct
+        or limit fill ever did. See config.RETRACEMENT_MIN_SETTLED_RR for
+        the table and the arithmetic.
+
+        Deliberately NOT gated on used_deep_retracement, unlike
+        _retracement_runaway above - that gate is exactly why the shallow
+        path went unprotected. Candle CLOSE for the same reason that one
+        uses it: a false positive permanently gives up a trade, so this
+        should be less trigger-happy than the wick-sensitive invalidation
+        check. Fails OPEN (returns False) whenever the flag is off, the
+        candle is missing, or a level is unavailable - same convention as
+        every other guard here."""
+        if not latest_candle or config.RETRACEMENT_MIN_SETTLED_RR <= 0:
+            return False
+
+        plan = position["plan"]
+        side = position["side"]
+        sl_price = plan.get("sl_price")
+        tp_price = plan.get("tp_price") or plan.get("tp1_price")
+        price = latest_candle.get("close")
+
+        if not sl_price or not tp_price or not price:
+            return False
+
+        # Already at or through either level: there is no reward left to
+        # capture (or the stop is already breached), so a fallback here can
+        # never satisfy any positive floor.
+        if side == "BUY" and (price >= tp_price or price <= sl_price):
+            return True
+
+        if side == "SELL" and (price <= tp_price or price >= sl_price):
+            return True
+
+        risk = abs(price - sl_price)
+
+        if risk <= 0:
+            return True
+
+        return (abs(tp_price - price) / risk) < config.RETRACEMENT_MIN_SETTLED_RR
+
     def _resolve_retracement_market_fallback(self, position, filled_quantity, filled_avg_price):
         """Places a market order for whatever quantity the resting
-        retracement limit did NOT fill (all of it, if none) - the
-        guarantee that config.RETRACEMENT_ENTRY_ENABLED never skips a
-        signal the way a plain limit-with-no-fallback would. A no-op
+        retracement limit did NOT fill (all of it, if none).
+
+        This used to be described as the guarantee that config.
+        RETRACEMENT_ENTRY_ENABLED never skips a signal the way a plain
+        limit-with-no-fallback would. That guarantee is NO LONGER
+        unconditional (2026-09-06): poll_retracement_pending now refuses to
+        reach this function at all when the fallback would open below
+        config.RETRACEMENT_MIN_SETTLED_RR. The old unconditional behaviour
+        was precisely what manufactured sub-2:1 entries - a resting limit
+        only fails to fill when price runs away from it, so every fallback
+        is an adverse fill by construction, and sl_price/tp_price stay
+        pinned to the signal-time levels while risk grows. See that config
+        flag for the measured evidence. A no-op
         (returns the fill exactly as given) when the limit already filled
         in full - remainder <= 0. Blends a genuine partial limit fill with
         the market fallback into one quantity-weighted entry price, the
@@ -5126,12 +5188,49 @@ class PositionManager:
                 position, filled_avg_price, filled_quantity, "PARTIAL_NO_CHASE", btc_price=btc_price
             )
 
+        # config.RETRACEMENT_MIN_SETTLED_RR (2026-09-06) - the fallback
+        # would fill at whatever price exists now, but sl_price/tp_price
+        # stay pinned to the signal-time levels, so an adverse fill grows
+        # the risk AND shrinks the reward at once. Refuse to open below the
+        # minimum R:R rather than force a trade the 2:1 design explicitly
+        # said should be rejected. Same gating as the runaway check above
+        # (`expired and not invalidated and not fully_filled`) and the same
+        # partial-fill handling - but with no used_deep_retracement gate,
+        # since that omission is precisely what left the shallow path
+        # unprotected.
+        if (
+            expired and not invalidated and not fully_filled
+            and self._retracement_rr_too_low(position, latest_candle)
+        ):
+            if filled_quantity <= 0:
+                return self._drop_unfilled_retracement_entry(
+                    position,
+                    outcome="RETRACEMENT_REJECTED_LOW_RR",
+                    reason=(
+                        "expired unfilled - a market fallback here would open below "
+                        f"the minimum {config.RETRACEMENT_MIN_SETTLED_RR}:1 R:R, not chasing"
+                    ),
+                )
+
+            # The partial filled at the LIMIT price, so its own R:R is
+            # intact - only the un-chased remainder is refused.
+            log_info(
+                f"{symbol} retracement expired with a partial fill and the remainder "
+                f"would open below the minimum {config.RETRACEMENT_MIN_SETTLED_RR}:1 "
+                f"R:R - keeping the partial, not chasing"
+            )
+            return self._finalize_retracement_entry(
+                position, filled_avg_price, filled_quantity, "PARTIAL_NO_CHASE", btc_price=btc_price
+            )
+
         # Every other resolution (full fill, partial fill + invalidated,
         # partial/zero fill + expired) ends here: market-fallback for
         # whatever didn't fill (a no-op if it's already fully filled),
         # then finalize with the real (possibly blended) quantity/price -
         # guarantees this signal still becomes a position exactly like a
-        # direct entry would have.
+        # direct entry would have, EXCEPT where the R:R floor above refused
+        # it (see config.RETRACEMENT_MIN_SETTLED_RR - that guarantee is
+        # deliberately no longer unconditional).
         total_quantity, entry_price, used_fallback, error = self._resolve_retracement_market_fallback(
             position, filled_quantity, filled_avg_price
         )
@@ -5204,6 +5303,21 @@ class PositionManager:
                     position, shadow=True,
                     outcome="SHADOW_RETRACEMENT_EXPIRED_REJECTED_RUNAWAY",
                     reason="expired unfilled - price already ran favorably past the reject threshold, not chasing",
+                )
+
+            # config.RETRACEMENT_MIN_SETTLED_RR - the live twin of this
+            # check lives in poll_retracement_pending; mirrored here so
+            # shadow stays comparable to live rather than quietly counting
+            # entries live would now refuse. No partial-fill branch: shadow
+            # has no real partial to blend (see this method's docstring).
+            if self._retracement_rr_too_low(position, latest_candle):
+                return self._drop_unfilled_retracement_entry(
+                    position, shadow=True,
+                    outcome="SHADOW_RETRACEMENT_REJECTED_LOW_RR",
+                    reason=(
+                        "expired unfilled - a market fallback here would open below "
+                        f"the minimum {config.RETRACEMENT_MIN_SETTLED_RR}:1 R:R, not chasing"
+                    ),
                 )
 
             log_info(

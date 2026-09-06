@@ -2692,6 +2692,53 @@ RETRACEMENT_ENTRY_OFFSET_DEEP_R = env_float("RETRACEMENT_ENTRY_OFFSET_DEEP_R", 0
 # one. Only ever evaluated for used_deep_retracement positions, and only
 # once already expired - never checked while still resting.
 RETRACEMENT_REJECT_ON_RUNAWAY_R = env_float("RETRACEMENT_REJECT_ON_RUNAWAY_R", 0.5)
+# Minimum reward:risk the MARKET FALLBACK must still clear, measured at the
+# real price it would fill at, before it is allowed to open a position at
+# all. 0 disables - same "0 disables" convention as RETRACEMENT_REJECT_ON_
+# RUNAWAY_R above.
+#
+# 2026-09-06, real evidence. The 2:1 mechanism holds everywhere except this
+# one path. Segmenting the journal by era (tp1_r_multiple = 2.0, 26 trades):
+#
+#   fill type          n   min R:R   median   below 2:1   below 1:1
+#   MARKET (direct)   20     2.000    2.053          0%          0%
+#   LIMIT              3     2.226    2.288          0%          0%
+#   MARKET_FALLBACK    3     0.554    0.573        100%         67%
+#
+# 0GUSDT 0.554, EGLDUSDT 0.573, TRBUSDT 1.448 - every fallback breaks the
+# contract, no other path does.
+#
+# STRUCTURAL, not bad luck. A resting BUY limit only FAILS to fill when
+# price runs up away from it, so by the time the fallback fires the entry is
+# guaranteed worse. position_manager._finalize_retracement_entry then
+# recomputes risk_distance from the real fill but deliberately leaves
+# sl_price/tp_price pinned to the levels risk_manager resolved from the
+# SIGNAL price - so an adverse fill hurts twice at once, risk growing toward
+# a fixed stop while reward shrinks toward a fixed target:
+#
+#     settled R:R = (planned_R - a) / (1 + a)      a = adverse move, in R
+#
+# 0GUSDT filled 1.078 R adverse after resting 30 minutes: risk 1.31% ->
+# 2.68%, R:R 2.229 -> 0.554.
+#
+# WHY RETRACEMENT_REJECT_ON_RUNAWAY_R above did not catch it: that check is
+# gated on used_deep_retracement (see _retracement_runaway), so it only ever
+# guards deep-routed retracements - the ordinary shallow path, which is the
+# common one, had no protection at all. This check deliberately has NO such
+# gate.
+#
+# 2.0 is the operator's explicit choice: strict compliance with the original
+# "minimum 2:1, reject rather than force the TP or SL to fit" requirement.
+# Note what that implies - by the formula above, ANY adverse fill fails a
+# plan sitting at exactly 2.0, so only plans with real headroom (a 2.5-3 R
+# structure target) can still fall back at all. That is intended, not a side
+# effect. Historically MARKET_FALLBACK was 30% of all live trades, so expect
+# a visible drop in trade count.
+#
+# This is NOT a PnL optimisation and is not backed by one - there are only 3
+# current-era fallbacks, far too few to score. It is a spec violation being
+# closed.
+RETRACEMENT_MIN_SETTLED_RR = env_float("RETRACEMENT_MIN_SETTLED_RR", 0.0)
 
 # =========================
 # LOGGING / ALERTING

@@ -66,10 +66,18 @@ LOSS_OUTCOMES = {
 # falls through to classify()'s UNKNOWN rather than pollute WIN/LOSS/
 # BREAKEVEN stats. They still count in `resolved` (outcome is non-empty)
 # so fill-rate can be measured via the outcome breakdown even though
-# they're not a win/loss/breakeven. RETRACEMENT_ENTRY_ENABLED's own market
-# fallback means these can ONLY happen via a genuine pre-fill invalidation
-# (price already reached the stop before the limit ever touched) - never
-# a plain unfilled expiry, unlike the LIMIT_ENTRY_MODE_ENABLED pair.
+# they're not a win/loss/breakeven.
+#
+# RETRACEMENT_EXPIRED_REJECTED_RUNAWAY/SHADOW_ (config.RETRACEMENT_REJECT_ON_
+# RUNAWAY_R) and RETRACEMENT_REJECTED_LOW_RR/SHADOW_RETRACEMENT_REJECTED_LOW_RR
+# (config.RETRACEMENT_MIN_SETTLED_RR) get the same treatment for the same
+# reason - both are deliberate refusals to open, so there is no fill and no
+# P&L to classify. UPDATE 2026-09-06: an earlier version of this comment said
+# the retracement pair could ONLY arise from a genuine pre-fill invalidation
+# and "never a plain unfilled expiry", because the market fallback used to be
+# unconditional. RETRACEMENT_MIN_SETTLED_RR ended that - a plain unfilled
+# expiry whose fallback would open below the minimum R:R is now refused
+# outright, so an expiry-without-fill is once again reachable here.
 # CLOSED_EXTERNALLY (position_manager.PositionManager.
 # reconcile_closed_positions) is also deliberately absent from all three
 # sets below - a manual close/ADL/liquidation off-bot has no tracked fill
