@@ -4074,6 +4074,54 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result_b["signal_trigger"], "STRUCTURE_BREAK")
 
 
+class RejectDiagnosticsTests(unittest.TestCase):
+    """config.REJECT_JOURNAL_ENABLED - _evaluate_direction's _reject wrapper
+    merges a _diag() snapshot into every reject so main.py can journal a
+    blocked candidate with enough context to replay it offline."""
+
+    def _run(self, **kwargs):
+        return SignalEngineTests._run(self, **kwargs)
+
+    def test_zone_direction_reject_carries_the_full_snapshot(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["diag_side"], "BUY")
+        self.assertEqual(result["diag_zone_direction"], "BEARISH")
+        self.assertEqual(result["diag_premium_discount_zone"], "DISCOUNT")
+        self.assertIsNotNone(result["diag_entry_price"])
+
+    def test_an_early_reject_does_not_raise_on_unset_fields(self):
+        # THE REGRESSION THIS GUARDS: price_zone is assigned at the
+        # NOT_IN_DISCOUNT gate, but EMA_TREND_MIXED and ENTRY_RANGE_POSITION
+        # reject BEFORE it. Reading it from _diag() without the early init
+        # raises UnboundLocalError - which would kill the scan loop for that
+        # symbol, not merely lose a journal row.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
+            result = self._run(ltf_ema_fast=110.0, ltf_ema_slow=90.0,
+                               htf_ema_fast=90.0, htf_ema_slow=110.0)
+
+        self.assertIsNone(result["signal"])
+        self.assertTrue(result["reason"].startswith("EMA_TREND_MIXED"))
+        self.assertIsNone(result["diag_premium_discount_zone"])
+        self.assertEqual(result["diag_side"], "BUY")
+
+    def test_reason_and_triggers_are_unchanged_by_the_snapshot(self):
+        # Purely additive - main.py's reject tally keys off these two.
+        with patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False):
+            result = self._run(htf_structure=HTF_BEARISH)
+
+        self.assertTrue(result["reason"].startswith("AGAINST_HTF_BIAS"))
+        self.assertEqual(result["triggers"], ["STRUCTURE_BREAK"])
+
+    def test_a_successful_signal_is_not_polluted_with_diag_keys(self):
+        result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertFalse([k for k in result if k.startswith("diag_")])
+
+
 class ZoneDirectionGateTests(unittest.TestCase):
     """config.ZONE_DIRECTION_REJECT_ENABLED - requires the HTF range to be
     DRIFTING the trade's way on top of the existing NOT_IN_DISCOUNT/

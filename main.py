@@ -75,6 +75,43 @@ def _tally_reject(reject_counts, reject_symbols, symbol, reason):
         sample.append(symbol)
 
 
+# config.REJECT_JOURNAL_ENABLED - last ltf candle a (symbol, reason) pair was
+# journaled for. MODULE level on purpose: the reject_counts/reject_symbols
+# dicts above are rebuilt every heartbeat, and reusing them would re-write a
+# row per heartbeat instead of per candle. Bounded by watchlist size x the
+# allowlist (~400 x 5).
+_reject_journal_seen = {}
+
+
+def _journal_reject(symbol, reason, result, ltf_candles):
+    """One row per (symbol, reason, ltf candle) for an allowlisted reject.
+
+    Both volume controls live here, not in signal_journal: without them this
+    fires at tick frequency for hundreds of symbols, which is exactly why
+    rejects were left out of the journal originally (see signal_journal's
+    module docstring). Matching is on the reason's LEADING TOKEN because
+    several reasons carry detail after it ("NOT_IN_DISCOUNT
+    price_zone=PREMIUM")."""
+    if not config.REJECT_JOURNAL_ENABLED or not ltf_candles:
+        return
+
+    token = (reason or "").split()[0] if (reason or "").strip() else ""
+
+    if token not in config.REJECT_JOURNAL_REASONS:
+        return
+
+    candle_open_time = ltf_candles[-1].get("open_time")
+    key = (symbol, token)
+
+    if _reject_journal_seen.get(key) == candle_open_time:
+        return
+
+    _reject_journal_seen[key] = candle_open_time
+    signal_journal.append_rejected_signal(
+        symbol, reason, result, candle_open_time=candle_open_time
+    )
+
+
 class SignalStabilityTracker:
     """Requires a signal to keep qualifying for config.SIGNAL_CONFIRM_TICKS
     consecutive evaluations - not just the single instant it first appears
@@ -213,6 +250,9 @@ def _evaluate_symbol(
 
         reason = result.get("reason") or "UNKNOWN"
         _tally_reject(reject_counts, reject_symbols, symbol, reason)
+        # config.REJECT_JOURNAL_ENABLED - purely additive; the tally above
+        # is untouched so the heartbeat line and its counts are unchanged.
+        _journal_reject(symbol, reason, result, ltf_candles)
 
         triggers = result.get("triggers")
 

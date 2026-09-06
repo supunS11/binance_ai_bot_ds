@@ -742,8 +742,49 @@ def evaluate(
             if candidate["direction"] == direction
         })
 
+        # config.REJECT_JOURNAL_ENABLED - every one of these is assigned
+        # further down, at the gate that computes it (ema_trend_bucket at
+        # the EMA_TREND_MIXED gate, entry_range_position at ENTRY_RANGE_
+        # POSITION, price_zone at NOT_IN_DISCOUNT/NOT_IN_PREMIUM). But
+        # _diag() below can be called from ANY reject, including the very
+        # first one a few lines down, so without these inits those paths
+        # would raise UnboundLocalError the moment a reject is journaled.
+        # None is also the correct value to record: it means evaluation
+        # rejected before ever computing that field.
+        price_zone = None
+        ema_trend_bucket = None
+        entry_range_position = None
+
+        def _diag():
+            """Snapshot of the diagnostics known at THIS point, merged into
+            every reject dict so main.py can journal a blocked candidate
+            with enough context to replay it offline (config.
+            REJECT_JOURNAL_ENABLED). Everything read here is either
+            hoisted in evaluate() before this function runs, or initialised
+            to None above - so it is safe at any reject site. Values that
+            are None simply mean the pipeline rejected before computing
+            them, which is itself the useful signal."""
+            return {
+                "diag_side": side,
+                "diag_entry_price": latest_price,
+                "diag_atr": ltf_analysis.get("atr"),
+                "diag_efficiency_ratio": ltf_analysis.get("efficiency_ratio"),
+                "diag_premium_discount_zone": price_zone,
+                "diag_zone_direction": zone_direction,
+                "diag_entry_range_position": entry_range_position,
+                "diag_ltf_ema_regime": ltf_ema_regime,
+                "diag_htf_ema_regime": htf_ema_regime,
+                "diag_ema_trend_bucket": ema_trend_bucket,
+                "diag_htf_trend_live": htf_trend_live,
+                "diag_ltf_trend_live": ltf_trend_live,
+            }
+
         def _reject(reason, **extra):
-            return _reject_plain(reason, triggers=_triggers_for_direction, **extra)
+            # `reason` and `triggers` are deliberately untouched - main.py's
+            # existing reject tally keys off them, so this stays additive.
+            return _reject_plain(
+                reason, triggers=_triggers_for_direction, **_diag(), **extra
+            )
 
         side = _BULLISH_TO_SIDE.get(direction)
 

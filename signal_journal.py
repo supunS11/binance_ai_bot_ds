@@ -49,6 +49,27 @@ FIELDNAMES = [
 ]
 
 
+REJECT_JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_rejects.csv"
+
+# config.REJECT_JOURNAL_ENABLED - candidates a gate turned away. A SEPARATE
+# file from the trade journal above, deliberately: no trade_id, no outcome
+# row, no join, and a completely different lifecycle - folding it into
+# FIELDNAMES would break journal_analysis.load_trades' every assumption.
+#
+# Enough here to replay a blocked candidate offline with the same 1R/2R
+# method used on real trades: entry_price plus atr reconstructs the stop via
+# the same max(MIN_STOP_DISTANCE_PCT x price, MIN_STOP_DISTANCE_ATR_MULTIPLE
+# x atr) floor that binds on 97% of real trades, and candle_open_time
+# anchors the 5m path lookup.
+REJECT_FIELDNAMES = [
+    "timestamp", "candle_open_time", "symbol", "side", "reject_reason",
+    "signal_trigger", "entry_price", "atr", "efficiency_ratio",
+    "premium_discount_zone", "zone_direction", "entry_range_position",
+    "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket",
+    "htf_trend_live", "ltf_trend_live",
+]
+
+
 def _existing_header(path):
     try:
         with open(path, newline="") as handle:
@@ -96,6 +117,71 @@ def _append_row(row):
 
     with open(JOURNAL_PATH, "a", newline="") as handle:
         csv.DictWriter(handle, fieldnames=FIELDNAMES).writerow(row)
+
+
+def _ensure_reject_header():
+    """Same backup-on-mismatch discipline as _ensure_header above - a stale
+    header over new-shaped rows silently mis-keys every csv.DictReader."""
+    REJECT_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not REJECT_JOURNAL_PATH.exists():
+        with open(REJECT_JOURNAL_PATH, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=REJECT_FIELDNAMES).writeheader()
+        return
+
+    existing = _existing_header(REJECT_JOURNAL_PATH)
+
+    if existing is not None and existing != REJECT_FIELDNAMES:
+        backup_path = REJECT_JOURNAL_PATH.with_name(
+            f"signal_rejects.bak_{int(time.time())}.csv"
+        )
+        REJECT_JOURNAL_PATH.rename(backup_path)
+        log_warning(
+            f"signal_rejects.csv header didn't match the current schema - "
+            f"backed up to {backup_path.name} and started a fresh file"
+        )
+
+        with open(REJECT_JOURNAL_PATH, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=REJECT_FIELDNAMES).writeheader()
+
+
+def append_rejected_signal(symbol, reason, result, candle_open_time=None):
+    """config.REJECT_JOURNAL_ENABLED - one row for a candidate a gate turned
+    away, so the gate's own counterfactual stops being discarded.
+
+    `result` is signal_engine.evaluate()'s reject dict; its diag_* keys are
+    merged in by the _reject wrapper inside _evaluate_direction (see
+    _diag() there). Reads them defensively - a reject raised OUTSIDE
+    _evaluate_direction (ZONE_UNAVAILABLE, NO_CANDLE_DATA, ...) carries no
+    diag_* keys at all, and those simply write as empty rather than being a
+    special case here.
+
+    The caller owns BOTH volume controls (allowlist and per-candle dedupe -
+    see main.py); this function writes whatever it is handed. Never raises
+    into the scan loop: a journalling failure must not cost a trade."""
+    row = {field: "" for field in REJECT_FIELDNAMES}
+    row["timestamp"] = time.time()
+    row["candle_open_time"] = candle_open_time if candle_open_time is not None else ""
+    row["symbol"] = symbol
+    row["reject_reason"] = reason
+    row["side"] = result.get("diag_side") or ""
+    row["signal_trigger"] = ",".join(result.get("triggers") or [])
+
+    for field in (
+        "entry_price", "atr", "efficiency_ratio", "premium_discount_zone",
+        "zone_direction", "entry_range_position", "ltf_ema_regime",
+        "htf_ema_regime", "ema_trend_bucket", "htf_trend_live", "ltf_trend_live",
+    ):
+        value = result.get(f"diag_{field}")
+        row[field] = "" if value is None else value
+
+    try:
+        _ensure_reject_header()
+
+        with open(REJECT_JOURNAL_PATH, "a", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=REJECT_FIELDNAMES).writerow(row)
+    except OSError as exc:
+        log_warning(f"could not append to signal_rejects.csv (continuing): {exc}")
 
 
 def _make_trade_id(symbol):

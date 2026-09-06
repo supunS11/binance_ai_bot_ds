@@ -39,6 +39,118 @@ def _plan(**overrides):
     return base
 
 
+def _reject_result(**overrides):
+    """The shape signal_engine._evaluate_direction's _reject wrapper
+    produces - reason/triggers plus the diag_* snapshot."""
+    base = {
+        "signal": None,
+        "reason": "ZONE_DIRECTION_OPPOSED zone_direction=BULLISH",
+        "triggers": ["CVD_DIVERGENCE", "STRUCTURE_BREAK"],
+        "diag_side": "SELL",
+        "diag_entry_price": 100.5,
+        "diag_atr": 1.25,
+        "diag_efficiency_ratio": 0.42,
+        "diag_premium_discount_zone": "PREMIUM",
+        "diag_zone_direction": "BULLISH",
+        "diag_entry_range_position": 0.61,
+        "diag_ltf_ema_regime": "BULLISH",
+        "diag_htf_ema_regime": "BEARISH",
+        "diag_ema_trend_bucket": "MIXED",
+        "diag_htf_trend_live": "BULLISH",
+        "diag_ltf_trend_live": "BEARISH",
+    }
+    base.update(overrides)
+    return base
+
+
+class RejectJournalTests(unittest.TestCase):
+    """config.REJECT_JOURNAL_ENABLED - a SEPARATE file from the trade
+    journal, so a gate that is ON stops discarding its own counterfactual."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmpdir.name) / "signal_rejects.csv"
+        self.patcher = patch.object(signal_journal, "REJECT_JOURNAL_PATH", self.path)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.tmpdir.cleanup()
+
+    def _rows(self):
+        with open(self.path, newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def test_writes_the_full_diagnostic_row(self):
+        signal_journal.append_rejected_signal(
+            "BTCUSDT", "ZONE_DIRECTION_OPPOSED zone_direction=BULLISH",
+            _reject_result(), candle_open_time=1788660000000,
+        )
+        row = self._rows()[0]
+
+        self.assertEqual(row["symbol"], "BTCUSDT")
+        self.assertEqual(row["side"], "SELL")
+        self.assertEqual(row["candle_open_time"], "1788660000000")
+        self.assertTrue(row["reject_reason"].startswith("ZONE_DIRECTION_OPPOSED"))
+        self.assertEqual(row["signal_trigger"], "CVD_DIVERGENCE,STRUCTURE_BREAK")
+        self.assertEqual(row["entry_price"], "100.5")
+        self.assertEqual(row["atr"], "1.25")
+        self.assertEqual(row["premium_discount_zone"], "PREMIUM")
+        self.assertEqual(row["zone_direction"], "BULLISH")
+        self.assertEqual(row["entry_range_position"], "0.61")
+        self.assertEqual(row["ema_trend_bucket"], "MIXED")
+
+    def test_creates_the_header_on_first_use(self):
+        self.assertFalse(self.path.exists())
+        signal_journal.append_rejected_signal("BTCUSDT", "EMA_TREND_MIXED", _reject_result())
+
+        with open(self.path, newline="") as handle:
+            self.assertEqual(next(csv.reader(handle)), signal_journal.REJECT_FIELDNAMES)
+
+    def test_none_diagnostics_write_as_empty_not_the_string_none(self):
+        # An early reject (EMA_TREND_MIXED fires before price_zone exists)
+        # legitimately has None for the later fields - that must not become
+        # the literal "None", which would silently poison every downstream
+        # comparison.
+        signal_journal.append_rejected_signal(
+            "BTCUSDT", "EMA_TREND_MIXED",
+            _reject_result(diag_premium_discount_zone=None, diag_entry_range_position=None),
+        )
+        row = self._rows()[0]
+
+        self.assertEqual(row["premium_discount_zone"], "")
+        self.assertEqual(row["entry_range_position"], "")
+
+    def test_a_reject_without_any_diag_keys_still_writes(self):
+        # Rejects raised OUTSIDE _evaluate_direction (ZONE_UNAVAILABLE,
+        # NO_CANDLE_DATA) carry no diag_* keys at all.
+        signal_journal.append_rejected_signal(
+            "BTCUSDT", "ZONE_UNAVAILABLE", {"signal": None, "reason": "ZONE_UNAVAILABLE"},
+        )
+        row = self._rows()[0]
+
+        self.assertEqual(row["symbol"], "BTCUSDT")
+        self.assertEqual(row["side"], "")
+        self.assertEqual(row["entry_price"], "")
+
+    def test_mismatched_header_is_backed_up_and_rewritten(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=["timestamp", "symbol"]).writeheader()
+
+        signal_journal.append_rejected_signal("BTCUSDT", "EMA_TREND_MIXED", _reject_result())
+
+        with open(self.path, newline="") as handle:
+            self.assertEqual(next(csv.reader(handle)), signal_journal.REJECT_FIELDNAMES)
+        self.assertTrue(any(p.name.startswith("signal_rejects.bak_")
+                            for p in self.path.parent.iterdir()))
+
+    def test_a_write_failure_never_raises_into_the_scan_loop(self):
+        with patch.object(signal_journal, "_ensure_reject_header",
+                          side_effect=OSError("disk full")):
+            signal_journal.append_rejected_signal("BTCUSDT", "EMA_TREND_MIXED", _reject_result())
+
+
 class SignalJournalTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()

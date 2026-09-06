@@ -14,6 +14,76 @@ import signal_engine
 import signal_journal
 
 
+class RejectJournalGatingTests(unittest.TestCase):
+    """config.REJECT_JOURNAL_ENABLED - main.py owns BOTH volume controls
+    (allowlist + per-candle dedupe). Without them this fires at tick
+    frequency across the whole watchlist, which is exactly why rejects were
+    left out of the journal in the first place."""
+
+    ALLOWED = ["ZONE_DIRECTION_OPPOSED", "ENTRY_RANGE_POSITION", "NOT_IN_DISCOUNT"]
+
+    def setUp(self):
+        main._reject_journal_seen.clear()
+
+    def tearDown(self):
+        main._reject_journal_seen.clear()
+
+    def _candles(self, open_time=1788660000000):
+        return [{"open_time": open_time, "close": 100.0}]
+
+    def _run(self, reason, candles=None, enabled=True):
+        with patch.object(config, "REJECT_JOURNAL_ENABLED", enabled), \
+             patch.object(config, "REJECT_JOURNAL_REASONS", self.ALLOWED), \
+             patch.object(signal_journal, "append_rejected_signal") as append:
+            main._journal_reject(
+                "BTCUSDT", reason, {"signal": None, "reason": reason},
+                candles if candles is not None else self._candles(),
+            )
+        return append
+
+    def test_allowlisted_reason_is_journaled(self):
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 1)
+
+    def test_reason_carrying_detail_matches_on_its_leading_token(self):
+        # "NOT_IN_DISCOUNT price_zone=PREMIUM" must still match.
+        self.assertEqual(self._run("NOT_IN_DISCOUNT price_zone=PREMIUM").call_count, 1)
+
+    def test_reason_outside_the_allowlist_is_not_journaled(self):
+        self.assertEqual(self._run("MARKET_CHOPPY").call_count, 0)
+
+    def test_disabled_flag_writes_nothing(self):
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION", enabled=False).call_count, 0)
+
+    def test_second_reject_on_the_same_candle_is_deduped(self):
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 1)
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 0)
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 0)
+
+    def test_a_new_candle_writes_again(self):
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 1)
+        later = self._candles(open_time=1788663600000)
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION", candles=later).call_count, 1)
+
+    def test_dedupe_is_per_reason_not_per_symbol(self):
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 1)
+        self.assertEqual(self._run("ZONE_DIRECTION_OPPOSED").call_count, 1)
+
+    def test_dedupe_state_survives_a_heartbeat_reset(self):
+        # The reject_counts/reject_symbols dicts are rebuilt every heartbeat.
+        # If the dedupe map lived in them it would re-write a row per
+        # heartbeat instead of per candle - hence the module-level dict.
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 1)
+        reject_counts, reject_symbols = Counter(), {}
+        main._tally_reject(reject_counts, reject_symbols, "BTCUSDT", "ENTRY_RANGE_POSITION")
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION").call_count, 0)
+
+    def test_missing_candles_are_a_noop(self):
+        self.assertEqual(self._run("ENTRY_RANGE_POSITION", candles=[]).call_count, 0)
+
+    def test_blank_reason_is_a_noop(self):
+        self.assertEqual(self._run("").call_count, 0)
+
+
 class _FakeSnapshotSource:
     def snapshot(self, symbol):
         return {"available": False}

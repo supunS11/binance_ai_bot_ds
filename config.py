@@ -2509,6 +2509,42 @@ EXECUTION_MODE = os.getenv("EXECUTION_MODE", "SHADOW").strip().upper()
 # match signal_engine.py's signal_trigger values - case-insensitive, see
 # env_str_list above (comma-split, stripped, uppercased).
 SHADOW_ONLY_TRIGGERS = env_str_list("SHADOW_ONLY_TRIGGERS", [])
+# Write a row to data/signal_rejects.csv for candidates a gate turned away,
+# so a gate that is ON stops permanently discarding its own counterfactual.
+#
+# THE PROBLEM (2026-09-06). main.py's _tally_reject only increments a
+# counter and samples 5 symbol names for the heartbeat line - no price, no
+# side, no outcome. signal_journal's own docstring records that rejects
+# were left out on purpose because writing every evaluation "would be
+# enormous at tick frequency". True, but the consequence is that with
+# ZONE_DIRECTION_REJECT_ENABLED, ENTRY_RANGE_POSITION_REJECT_ENABLED and
+# the zone gate live, the trades they block generate ZERO data forever.
+# At the observed post-gate rate (~3.3/day vs 12.1 before) it is ~15 days
+# to one usable cell and ~75 days to match the existing sample - and none
+# of that waiting can answer whether the gates themselves are right,
+# because only survivors are ever recorded.
+#
+# Volume is handled by two mechanisms, both required (see main.py):
+#   1. REJECT_JOURNAL_REASONS below - an allowlist, not everything.
+#   2. dedupe to ONE row per (symbol, reason, ltf candle) - not per tick.
+# Together roughly 4k rows/day (~1.2 MB/day) rather than millions.
+#
+# Purely additive: no trade is gated, sized or ordered differently by this.
+REJECT_JOURNAL_ENABLED = env_bool("REJECT_JOURNAL_ENABLED", "False")
+# Which reject reasons are worth the rows. Matched on the reason's LEADING
+# TOKEN, because several carry detail after it (e.g. the reason string
+# "NOT_IN_DISCOUNT price_zone=PREMIUM"). Default is the set that answers
+# the two open questions: are the two live gates right, and does the
+# premium/discount zone invert in a trending market (measured across six
+# 20-day regime windows: in every bear window the zone gate took ~45
+# counter-trend longs and only 1-5 shorts).
+REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
+    "ZONE_DIRECTION_OPPOSED",
+    "ENTRY_RANGE_POSITION",
+    "NOT_IN_DISCOUNT",
+    "NOT_IN_PREMIUM",
+    "EMA_TREND_MIXED",
+])
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)
 # A signal must keep qualifying for this many consecutive eval ticks
