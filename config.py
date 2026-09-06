@@ -1685,10 +1685,34 @@ ENTRY_RANGE_POSITION_REJECT_ENABLED = env_bool(
     "ENTRY_RANGE_POSITION_REJECT_ENABLED", "False"
 )
 ENTRY_RANGE_POSITION_MAX = env_float("ENTRY_RANGE_POSITION_MAX", 0.80)
-# 24 x 1h = the 24-hour window the measurement above used; 12 and 48
-# separated winners from losers less well. Well inside the 200-candle
-# ltf_candles buffer, so this needs no new history.
-ENTRY_RANGE_LOOKBACK_CANDLES = env_int("ENTRY_RANGE_LOOKBACK_CANDLES", 24)
+# 24 -> 12 (2026-09-06, real evidence). SUPERSEDES the earlier note here,
+# which said 12 "separated winners from losers less well" and was measured
+# on winner/loser SEPARATION only - the same mistake that made this whole
+# gate look attractive in the first place. Re-measured on money, BUY-only
+# (this sample's shorts lose for regime reasons), at ENTRY_RANGE_POSITION_
+# MAX=0.70, real 5m paths, stop 1R / TP 2R:
+#
+#   lookback           n        PnL   perTrade      H1      H2
+#    6 x 1h (0.25d)  102   +1196.59     +11.73   +639    +557
+#   12 x 1h (0.50d)   90   +1172.99     +13.03   +770    +403
+#   18 x 1h (0.75d)   82    +934.58     +11.40   +524    +411
+#   24 x 1h (1.00d)   77    +657.84      +8.54   +390    +268   <- was
+#   (no gate at all) 126   +1335.16     +10.60   +731    +604
+#
+# 24 -> 12 recovers +515.15 while still running the gate, raises per-trade
+# expectancy +8.54 -> +13.03, improves BOTH halves, and keeps MORE flow
+# (90 vs 77) rather than less. A 1-day range is simply too wide for a
+# system whose trades resolve in hours - at 24 candles almost any entry
+# scores high in the range, so the measure stops discriminating.
+#
+# READ THIS BEFORE RE-TIGHTENING: at 12 the gate still costs -162.17
+# against not running it at all. This makes an operator-chosen gate much
+# cheaper, it does not make it profitable. See ENTRY_RANGE_POSITION_
+# REJECT_ENABLED above for that decision and its rationale.
+#
+# Well inside the 200-candle ltf_candles buffer, so this needs no new
+# history.
+ENTRY_RANGE_LOOKBACK_CANDLES = env_int("ENTRY_RANGE_LOOKBACK_CANDLES", 12)
 # Rejects an entry whose stop, once LEVERAGE is applied, would lose more
 # than this % of the margin actually at risk if hit - independent of
 # position sizing mode, since quantity cancels out of the ratio
