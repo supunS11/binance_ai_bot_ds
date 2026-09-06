@@ -439,9 +439,94 @@ SWING_RIGHT = env_int("SWING_RIGHT", 2)
 STRUCTURE_LOOKBACK_CANDLES = env_int("STRUCTURE_LOOKBACK_CANDLES", 150)
 FVG_LOOKBACK_CANDLES = env_int("FVG_LOOKBACK_CANDLES", 50)
 LIQUIDITY_POOL_TOLERANCE_PCT = env_float("LIQUIDITY_POOL_TOLERANCE_PCT", 0.001)
+# 100 -> 60 (2026-09-06, real evidence). At 100 x HTF_KLINE_INTERVAL=4h
+# this window was 400 real hours (~16.7 days) - 5x longer than the live
+# trend it sits beside (HTF_TREND_EMA_PERIOD=20 on 4h is ~3.3 days). The
+# two were measured to point the same way only 16% of the time, so the
+# zone was routinely calling "discount" on a 16.7-day range while the
+# live trend read the opposite: exactly the operator's long-standing
+# "buys enter at the top of the move" complaint.
+#
+# Swept against real 5m price paths (236 resolved LIVE trades, stop 1R /
+# TP 2R / full close / 24h cap). Shown BUY-ONLY, because the same sample
+# has shorts losing for regime reasons (BTC +25.7% over its 20 days) and
+# an all-trades sweep would just be measuring that:
+#
+#   window          n   win%        PnL   perTrade      H1      H2
+#   N=24  (4.0d)   42    38%    +203.95     +4.86    +144     +60
+#   N=36  (6.0d)   61    46%    +771.72    +12.65    +628    +144
+#   N=48  (8.0d)   85    49%   +1402.66    +16.50    +866    +537
+#   N=60 (10.0d)   96    50%   +1569.10    +16.34    +900    +669
+#   N=80 (13.3d)  114    48%   +1680.01    +14.74   +1059    +621
+#   N=100(16.7d)  126    45%   +1335.16    +10.60    +731    +604   <- was
+#
+# Unimodal with a broad 8-13d plateau, both halves improving across the
+# whole plateau - the shape of a real parameter rather than the single
+# spiky optimum that killed the other candidates tested that session. 60
+# is the CENTRE of the plateau, deliberately not the N=80 peak: the
+# sample is 20 days and the centre is robust to the true optimum sitting
+# elsewhere in the band.
+#
+# NOT aligned all the way to the 3.3-day live-trend window, which was the
+# operator's first instinct: N=20-24 measures at the BOTTOM of the curve
+# (+203.95). A 3-4 day high/low range is too short for a midpoint to
+# separate premium from discount at all.
+#
+# KNOWN COUPLING, deliberately accepted: premium_discount_zone() derives
+# bullish_ote_zone/bearish_ote_zone from this same high/low, so shrinking
+# the window also narrows the OTE retracement bands and changes which OTE
+# triggers fire. The sweep above filters trades that already existed at
+# N=100 and therefore CANNOT see trades a different OTE band would newly
+# generate - that part is genuinely unmeasured. Watch the OTE trigger's
+# fire rate and win rate after this lands.
 PREMIUM_DISCOUNT_LOOKBACK_CANDLES = env_int(
-    "PREMIUM_DISCOUNT_LOOKBACK_CANDLES", 100
+    "PREMIUM_DISCOUNT_LOOKBACK_CANDLES", 60
 )
+# 2026-09-06, real evidence, operator-proposed. The NOT_IN_DISCOUNT/
+# NOT_IN_PREMIUM gate (signal_engine._evaluate_direction) asks only WHERE
+# price sits in the HTF range. It cannot tell "cheap inside a rising or
+# sideways range" (a real dip) from "cheap because the whole range is
+# sliding down" (a falling knife). market_structure.zone_direction adds
+# that missing axis; this flag makes it gate.
+#
+# THREE variants were measured, BUY-ONLY (the sample's shorts lose for
+# regime reasons - BTC +25.7% over its 20 days - so an all-trades read
+# just remeasures that). Baseline: 126 BUY trades, +1335.16. Real 5m
+# paths, stop 1R / TP 2R / full close / 24h cap:
+#
+#   rule                                n     PnL   perTrade      H1      H2
+#   A  zone only, N=60      [was live] 96 +1569.10    +16.34  +900.1  +669.0
+#   B  direction INSTEAD of zone, N=18 91 +1365.82    +15.01  +749.6  +616.3
+#   C  zone OR direction,   N=18      121 +1321.05    +10.92  +844.2  +476.9
+#   D  zone AND direction,  N=12       62 +1373.72    +22.16  +859.7  +514.0
+#   D  zone AND direction,  N=18       66 +1613.87    +24.45  +805.5  +808.3
+#   D  zone AND direction,  N=24       59 +1284.17    +21.77  +746.9  +537.2
+#   D  zone AND direction,  N=30       54 +1014.77    +18.79  +616.6  +398.2
+#   D  zone AND direction,  N=36       45  +309.09     +6.87  +158.2  +150.9
+#   D  zone AND direction,  N=60       26  +114.63     +4.41   +89.5   +25.1
+#
+# REPLACING the zone (B) and RELAXING it (C) both LOSE to the zone alone.
+# Only ADDING the check (D) wins, and only with a SHORT direction window:
+# N=18 x 4h = 3 days, which is ~HTF_TREND_EMA_PERIOD=20 on 4h (~3.3d), the
+# live trend horizon. So the two windows should NOT match - the zone wants
+# a long range (10d) and the direction wants a short one (3d). Matching
+# them, which was the first instinct, is measurably worse (N=60: +114.63).
+#
+# HONEST LIMITS. Against variant A the TOTAL gain is only +44.77, which is
+# noise on a 20-day sample - the defensible wins are per-trade expectancy
+# (+16.34 -> +24.45, ~50%) and half-to-half balance (+805.5/+808.3 vs A's
+# +900.1/+669.0, the most even split measured in this project). It costs
+# 31% of long flow. D is also the ONLY variant that is fully measurable:
+# it purely TIGHTENS an existing gate, so every trade it would reject is
+# in the journal. B and C would ADMIT trades the old zone rejected, and
+# rejected signals are only counted in main.py's tally, never journaled
+# with a price - so their true effect is partly unobservable.
+ZONE_DIRECTION_REJECT_ENABLED = env_bool("ZONE_DIRECTION_REJECT_ENABLED", "False")
+# In HTF_KLINE_INTERVAL candles. 18 x 4h = 3 days - see the table above;
+# the 2-4 day band (N=12..24) is a plateau at +21.77..+24.45 per trade and
+# 18 is its peak and its most balanced point. Deliberately NOT equal to
+# PREMIUM_DISCOUNT_LOOKBACK_CANDLES.
+ZONE_DIRECTION_LOOKBACK_CANDLES = env_int("ZONE_DIRECTION_LOOKBACK_CANDLES", 18)
 # Raised from 0.618 -> 0.705 (2026-08-14, operator feedback): BUY signals
 # were seen firing in the discount zone while price kept falling anyway,
 # and SELL signals in premium while price kept rising - both consistent

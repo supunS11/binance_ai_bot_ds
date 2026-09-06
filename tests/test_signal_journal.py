@@ -348,6 +348,27 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["ema_value"], "101.0")
         self.assertEqual(rows[0]["ema_alignment_value"], "99.5")
 
+    def test_append_signal_writes_zone_direction(self):
+        # config.ZONE_DIRECTION_REJECT_ENABLED - the companion to
+        # premium_discount_zone: that one records WHERE in the range the
+        # entry sat, this one records which way the range was MOVING.
+        signal_journal.append_signal(
+            _signal(premium_discount_zone="DISCOUNT", zone_direction="BEARISH"), _plan()
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["premium_discount_zone"], "DISCOUNT")
+        self.assertEqual(rows[0]["zone_direction"], "BEARISH")
+
+    def test_append_signal_writes_zone_direction_when_unknown(self):
+        # None (too little history, or an exact tie) must still produce a
+        # column, so the gate's fail-open cases stay distinguishable from
+        # rows written before the field existed.
+        signal_journal.append_signal(_signal(zone_direction=None), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["zone_direction"], "")
+
     def test_append_signal_writes_entry_extension_r_from_the_plan(self):
         signal_journal.append_signal(_signal(), _plan(entry_extension_r=0.35))
         rows = self._read_rows()

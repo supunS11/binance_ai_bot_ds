@@ -65,6 +65,13 @@ class SignalEngineTests(unittest.TestCase):
         depth=None,
         htf_structure=None,
         zone=None,
+        # config.ZONE_DIRECTION_REJECT_ENABLED - mocked here for the same
+        # reason premium_discount_zone is: this helper's htf_candles are
+        # minimal fixtures (several tests build them with only open_time),
+        # so the real high/low scan cannot run against them. None is the
+        # fail-open value, which keeps the gate inert for every existing
+        # test regardless of what the live .env sets the flag to.
+        zone_direction=None,
         ltf_analysis=None,
         order_block=None,
         sweep_direction="BULLISH",
@@ -265,6 +272,7 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(config, "HTF_TREND_EMA_PRIMARY_ENABLED", htf_trend_ema_primary_enabled), \
              patch.object(market_structure, "structure_state", return_value=htf_structure), \
              patch.object(market_structure, "premium_discount_zone", return_value=zone), \
+             patch.object(market_structure, "zone_direction", return_value=zone_direction), \
              patch.object(market_structure, "analyze", return_value=ltf_analysis), \
              patch.object(market_structure, "find_order_block", return_value=order_block), \
              patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
@@ -4064,6 +4072,86 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(result_a["signal_trigger"], "STRUCTURE_BREAK")
         self.assertEqual(result_b["signal_trigger"], "STRUCTURE_BREAK")
+
+
+class ZoneDirectionGateTests(unittest.TestCase):
+    """config.ZONE_DIRECTION_REJECT_ENABLED - requires the HTF range to be
+    DRIFTING the trade's way on top of the existing NOT_IN_DISCOUNT/
+    NOT_IN_PREMIUM check. Strictly additive: it can only ever reject a
+    trade the zone check already passed, never admit one it rejected.
+    Delegates to SignalEngineTests._run rather than subclassing it, same
+    reason as RejectTriggerTaggingTests below."""
+
+    def _run(self, **kwargs):
+        return SignalEngineTests._run(self, **kwargs)
+
+    def _sell(self, **kwargs):
+        return self._run(
+            ltf_close=108.0,
+            cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH,
+            ltf_analysis=LTF_BEARISH_BREAK,
+            sweep_direction="BEARISH",
+            ema_value=115.0,
+            **kwargs,
+        )
+
+    def test_opposed_range_still_passes_while_the_gate_is_off(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", False):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_opposed_range_rejects_a_buy_once_enabled(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertIsNone(result["signal"])
+        self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
+
+    def test_agreeing_range_passes_a_buy_once_enabled(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._run(zone_direction="BULLISH")
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_opposed_range_rejects_a_sell_once_enabled(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._sell(zone_direction="BULLISH")
+
+        self.assertIsNone(result["signal"])
+        self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
+
+    def test_agreeing_range_passes_a_sell_once_enabled(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._sell(zone_direction="BEARISH")
+
+        self.assertEqual(result["signal"], "SELL")
+
+    def test_unknown_direction_fails_open(self):
+        # zone_direction returns None on too little history or an exact
+        # tie. The gate must not guess - same convention as htf_trend_live
+        # and the EMA regime reads.
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._run(zone_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_direction_is_journaled_even_while_the_gate_is_off(self):
+        # Written unconditionally so the live distribution keeps building
+        # whether or not the flag is on - same as ltf_trend_live and
+        # entry_range_position.
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", False):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertEqual(result["zone_direction"], "BEARISH")
+
+    def test_reject_reason_names_the_direction_that_blocked_it(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertIn("zone_direction=BEARISH", result["reason"])
 
 
 class RejectTriggerTaggingTests(unittest.TestCase):

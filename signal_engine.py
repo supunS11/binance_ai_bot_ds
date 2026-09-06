@@ -243,6 +243,16 @@ def evaluate(
     if not zone.get("available"):
         return _reject("ZONE_UNAVAILABLE")
 
+    # config.ZONE_DIRECTION_REJECT_ENABLED - which way the HTF range is
+    # MOVING, to pair with zone_for_price's "where in the range am I".
+    # Direction-INDEPENDENT, so computed once here; the side comparison
+    # needs a direction and lives in _evaluate_direction below (which
+    # closes over this). Reads a deliberately SHORTER window than the zone
+    # itself - see config.ZONE_DIRECTION_LOOKBACK_CANDLES for the measured
+    # reason. None (too little history, or an exact tie) leaves the gate
+    # inert rather than guessing.
+    zone_direction = market_structure.zone_direction(htf_candles)
+
     ltf_analysis = market_structure.analyze(ltf_candles)
 
     if not ltf_analysis.get("available"):
@@ -958,6 +968,22 @@ def evaluate(
         if side == "SELL" and price_zone != "PREMIUM":
             return _reject(f"NOT_IN_PREMIUM price_zone={price_zone}")
 
+        # ZONE_DIRECTION_OPPOSED - the companion to the two rejects above.
+        # Being in discount says price is cheap against the HTF range; it
+        # does NOT say the range is going anywhere but down. This requires
+        # the range to also be drifting the trade's way before a BUY in
+        # discount (or a SELL in premium) is allowed through. Strictly
+        # ADDITIVE to the zone check, never a replacement - measured, both
+        # replacing it and relaxing it to an OR are worse than the zone
+        # alone (see config.ZONE_DIRECTION_REJECT_ENABLED for the table).
+        # Fails open on a None direction, matching every other trend read.
+        if (
+            config.ZONE_DIRECTION_REJECT_ENABLED
+            and zone_direction is not None
+            and zone_direction != direction
+        ):
+            return _reject(f"ZONE_DIRECTION_OPPOSED zone_direction={zone_direction}")
+
         # NOT_IN_OTE checks whether CURRENT PRICE sits within a Fibonacci
         # retracement band of the OVERALL HTF range - the classic "break,
         # then retrace to OTE" setup, a real fit for STRUCTURE_BREAK
@@ -1442,6 +1468,12 @@ def evaluate(
             "depth_imbalance": depth_imbalance,
             "atr": ltf_analysis.get("atr"),
             "premium_discount_zone": price_zone,
+            # config.ZONE_DIRECTION_REJECT_ENABLED - journaled
+            # unconditionally, like every other trend read, so the live
+            # distribution keeps accumulating whether or not the gate is
+            # on, and the 3-day window can be re-tested against fresh data
+            # without another backfill.
+            "zone_direction": zone_direction,
             "zone_retracement_pct": zone_retracement_pct,
             "liquidity_pools": pools,
             # config.RETRACEMENT_STRUCTURE_TARGET_ENABLED - already computed

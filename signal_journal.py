@@ -27,6 +27,7 @@ FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
     "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "ltf_trend_live", "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket", "entry_range_position", "htf_trend_swing_age_hours", "premium_discount_zone",
+    "zone_direction",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising",
@@ -193,6 +194,10 @@ def append_signal(signal, plan, execution_result=None):
         "entry_range_position": signal.get("entry_range_position"),
         "htf_trend_swing_age_hours": signal.get("htf_trend_swing_age_hours"),
         "premium_discount_zone": signal.get("premium_discount_zone"),
+        # config.ZONE_DIRECTION_REJECT_ENABLED - which way the HTF range
+        # was drifting, the companion to premium_discount_zone's "where in
+        # the range". Written whether or not that gate is on.
+        "zone_direction": signal.get("zone_direction"),
         "zone_retracement_pct": signal.get("zone_retracement_pct"),
         "order_block_present": bool(signal.get("order_block")),
         "fvg_present": bool(signal.get("fvg")),

@@ -626,6 +626,48 @@ def zone_for_price(zone, price):
     return "DISCOUNT" if price < zone["midpoint"] else "PREMIUM"
 
 
+def zone_direction(candles, lookback=None):
+    """Which way the range itself is MOVING, as opposed to where price sits
+    inside it (zone_for_price above).
+
+    premium_discount_zone answers "is this cheap relative to the last N
+    candles" - but it has no idea whether that whole range is sliding down.
+    Cheap inside a falling market is not cheap, it is just the newest price
+    on the way down, which is the mechanism behind the long-standing "buys
+    keep entering at the top of the move" complaint. This measures the
+    missing axis: the midpoint of the recent half of the window against the
+    midpoint of the older half.
+
+    Deliberately reads a SHORTER window than the zone it accompanies (see
+    config.ZONE_DIRECTION_LOOKBACK_CANDLES for the measured reason) - the
+    pairing that works is a long range for "where am I" and a short one for
+    "where is it going". Returns None on too little history or an exact
+    tie, so every caller fails open - same shape as htf_trend_live and
+    signal_engine._ema_regime."""
+    lookback = int(
+        config.ZONE_DIRECTION_LOOKBACK_CANDLES if lookback is None else lookback
+    )
+    window = candles[-lookback:] if len(candles) > lookback else candles
+    half = len(window) // 2
+
+    if half < 2:
+        return None
+
+    def _midpoint(part):
+        return (max(c["high"] for c in part) + min(c["low"] for c in part)) / 2
+
+    older = _midpoint(window[:half])
+    recent = _midpoint(window[half:])
+
+    if recent > older:
+        return "BULLISH"
+
+    if recent < older:
+        return "BEARISH"
+
+    return None
+
+
 def in_ote(zone, price, direction):
     if not zone.get("available"):
         return False

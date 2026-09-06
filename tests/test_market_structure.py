@@ -896,6 +896,84 @@ class PremiumDiscountZoneTests(unittest.TestCase):
             self.assertFalse(ms.in_ote(zone, 105, "BULLISH"))
 
 
+class ZoneDirectionTests(unittest.TestCase):
+    """config.ZONE_DIRECTION_REJECT_ENABLED - which way the range is MOVING,
+    the companion to zone_for_price's "where in the range am I". Compares
+    the midpoint of the recent half of the window against the older half."""
+
+    def test_rising_range_is_bullish(self):
+        candles = [
+            _candle(0, high=110, low=90), _candle(1, high=110, low=90),
+            _candle(2, high=120, low=100), _candle(3, high=120, low=100),
+        ]
+        # older half midpoint 100, recent half midpoint 110
+        self.assertEqual(ms.zone_direction(candles, lookback=4), "BULLISH")
+
+    def test_falling_range_is_bearish(self):
+        candles = [
+            _candle(0, high=120, low=100), _candle(1, high=120, low=100),
+            _candle(2, high=110, low=90), _candle(3, high=110, low=90),
+        ]
+        self.assertEqual(ms.zone_direction(candles, lookback=4), "BEARISH")
+
+    def test_flat_range_is_none_so_the_gate_fails_open(self):
+        candles = [_candle(i, high=110, low=90) for i in range(4)]
+        self.assertIsNone(ms.zone_direction(candles, lookback=4))
+
+    def test_too_little_history_is_none(self):
+        candles = [_candle(i, high=110, low=90) for i in range(3)]
+        self.assertIsNone(ms.zone_direction(candles, lookback=10))
+
+    def test_empty_candles_are_none(self):
+        self.assertIsNone(ms.zone_direction([], lookback=10))
+
+    def test_lookback_slices_to_the_most_recent_window(self):
+        # Over all 8 candles the range is FALLING (mid 190 -> 105); over
+        # just the last 4 it is RISING (mid 95 -> 115). The lookback must
+        # decide which one is measured - this is the whole reason the
+        # direction window is configured separately from the zone window.
+        candles = (
+            [_candle(i, high=200, low=180) for i in range(4)]
+            + [_candle(i, high=100, low=90) for i in range(4, 6)]
+            + [_candle(i, high=120, low=110) for i in range(6, 8)]
+        )
+        self.assertEqual(ms.zone_direction(candles, lookback=8), "BEARISH")
+        self.assertEqual(ms.zone_direction(candles, lookback=4), "BULLISH")
+
+    def test_lookback_defaults_to_the_configured_value(self):
+        candles = (
+            [_candle(i, high=200, low=180) for i in range(4)]
+            + [_candle(i, high=100, low=90) for i in range(4, 6)]
+            + [_candle(i, high=120, low=110) for i in range(6, 8)]
+        )
+        with patch.object(config, "ZONE_DIRECTION_LOOKBACK_CANDLES", 4):
+            self.assertEqual(ms.zone_direction(candles), "BULLISH")
+
+        with patch.object(config, "ZONE_DIRECTION_LOOKBACK_CANDLES", 8):
+            self.assertEqual(ms.zone_direction(candles), "BEARISH")
+
+    def test_direction_is_independent_of_where_price_sits_in_the_range(self):
+        # The point of the measure: two windows with the SAME high/low
+        # bounds overall can still be drifting opposite ways. zone_for_price
+        # cannot tell these apart; zone_direction can.
+        rising = [
+            _candle(0, high=105, low=90), _candle(1, high=105, low=90),
+            _candle(2, high=110, low=95), _candle(3, high=110, low=95),
+        ]
+        falling = [
+            _candle(0, high=110, low=95), _candle(1, high=110, low=95),
+            _candle(2, high=105, low=90), _candle(3, high=105, low=90),
+        ]
+        zone_r = ms.premium_discount_zone(rising, lookback=4)
+        zone_f = ms.premium_discount_zone(falling, lookback=4)
+
+        self.assertEqual(zone_r["range_high"], zone_f["range_high"])
+        self.assertEqual(zone_r["range_low"], zone_f["range_low"])
+        self.assertEqual(ms.zone_for_price(zone_r, 99), ms.zone_for_price(zone_f, 99))
+        self.assertEqual(ms.zone_direction(rising, lookback=4), "BULLISH")
+        self.assertEqual(ms.zone_direction(falling, lookback=4), "BEARISH")
+
+
 class AverageTrueRangeTests(unittest.TestCase):
     def test_atr_is_positive_for_moving_candles(self):
         candles = [_candle(i, high=100 + i, low=95 + i, close=97 + i) for i in range(20)]
