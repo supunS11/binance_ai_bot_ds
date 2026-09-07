@@ -226,6 +226,101 @@ class StructureBasedTargetTests(unittest.TestCase):
     enough room, matching v7's structure-based TP - the R-multiple is
     only the minimum-room floor / fallback, not the primary target."""
 
+    def test_target_sits_in_front_of_the_pool_when_a_buffer_is_set(self):
+        # config.STRUCTURE_TARGET_ATR_BUFFER - entry 100, sl 98 (risk 2),
+        # pool at 110 = 5R. With a 0.25 x ATR(2.0) = 0.5 buffer the order
+        # rests at 109.5, i.e. 4.75R - still well clear of the 1R floor.
+        pools = [{"type": "BUY_SIDE", "price": 110}]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            tp1, _ = risk_manager.compute_targets(100, 98, "BUY", pools=pools, atr=2.0)
+
+        self.assertAlmostEqual(tp1, 109.5)
+
+    def test_sell_buffer_sits_above_the_pool(self):
+        pools = [{"type": "SELL_SIDE", "price": 90}]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            tp1, _ = risk_manager.compute_targets(100, 102, "SELL", pools=pools, atr=2.0)
+
+        self.assertAlmostEqual(tp1, 90.5)
+
+    def test_zero_buffer_still_lands_exactly_on_the_pool(self):
+        pools = [{"type": "BUY_SIDE", "price": 110}]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.0):
+            tp1, _ = risk_manager.compute_targets(100, 98, "BUY", pools=pools, atr=2.0)
+
+        self.assertEqual(tp1, 110)
+
+    def test_missing_atr_disables_the_buffer(self):
+        pools = [{"type": "BUY_SIDE", "price": 110}]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            tp1, _ = risk_manager.compute_targets(100, 98, "BUY", pools=pools, atr=None)
+
+        self.assertEqual(tp1, 110)
+
+    def test_buffer_never_pulls_a_target_under_the_r_floor(self):
+        # THE GUARANTEE. Pool at 104 is exactly 2R on a 2-wide risk. A 0.5
+        # buffer would put the order at 103.5 = 1.75R, under the 2R floor.
+        # It must NOT do that - the pool stops qualifying and the fixed-R
+        # fallback (104) is used instead, so 2:1 still holds.
+        pools = [{"type": "BUY_SIDE", "price": 104}]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 3.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            tp1, _ = risk_manager.compute_targets(100, 98, "BUY", pools=pools, atr=2.0)
+
+        self.assertEqual(tp1, 104)
+        self.assertGreaterEqual(abs(tp1 - 100) / 2.0, 2.0)
+
+    def test_buffer_can_promote_the_next_pool_out(self):
+        # Near pool at 104 (exactly 2R) no longer qualifies once buffered,
+        # but 106 does - buffered to 105.5 = 2.75R, inside the 3R cap.
+        pools = [
+            {"type": "BUY_SIDE", "price": 104},
+            {"type": "BUY_SIDE", "price": 106},
+        ]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 3.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            tp1, _ = risk_manager.compute_targets(100, 98, "BUY", pools=pools, atr=2.0)
+
+        self.assertAlmostEqual(tp1, 105.5)
+
+    def test_buffer_respects_the_max_r_cap_against_the_buffered_price(self):
+        # Pool at 107 is 3.5R - over the 3R cap even before buffering, so
+        # it must not qualify just because the buffer brings it to 3.25R.
+        pools = [{"type": "BUY_SIDE", "price": 107}]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 3.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            tp1, _ = risk_manager.compute_targets(100, 98, "BUY", pools=pools, atr=2.0)
+
+        self.assertEqual(tp1, 104)  # fixed-R fallback at exactly 2R
+
+    def test_nearest_favorable_structure_r_reports_the_unbuffered_level(self):
+        # This one is a DIAGNOSTIC of where a level actually is - buffering
+        # it would misreport the market.
+        pools = [{"type": "BUY_SIDE", "price": 110}]
+
+        with patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            r = risk_manager.nearest_favorable_structure_r(pools, 100, "BUY", 2.0)
+
+        self.assertAlmostEqual(r, 5.0)
+
     def test_buy_targets_the_nearest_qualifying_buy_side_pool(self):
         pools = [
             {"type": "BUY_SIDE", "price": 103},  # 1.5R - clears the 1R floor

@@ -1605,6 +1605,31 @@ RISK_BASED_POSITION_SIZING_ENABLED = env_bool(
 POSITION_RISK_PCT = env_float("POSITION_RISK_PCT", 1.0)
 POSITION_RISK_MAX_USDT = env_float("POSITION_RISK_MAX_USDT", 0)
 STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
+# Target-side twin of STRUCTURE_STOP_ATR_BUFFER above. _find_structure_target
+# draws TP1/TP2 to a real liquidity-pool price EXACTLY - the same level the
+# resting stops it is aiming at sit on. This pulls the target back toward
+# entry by this many ATR so the order sits just IN FRONT of the pool rather
+# than on it, on the reasoning that price can reach for a pool and turn
+# without trading through it. 0 disables (the exact-on-pool behaviour that
+# shipped originally).
+#
+# 2026-09-07, operator's explicit call as a safety measure. Stated plainly
+# because the record should be accurate: the near-miss pattern this targets
+# was NOT found in the journal - of 77 pool-targeted trades that missed TP,
+# the median got only 32% of the way and just 2 came within 90%, and small
+# buffers (2%/5%) measured WORSE than none. The operator asked for it anyway
+# as a safe-side preference, which is their call on their own capital.
+#
+# THE ONE THING THIS MUST NOT DO is quietly break the 2:1 floor. The buffer
+# is applied BEFORE the min_r_multiple test in _find_structure_target, so a
+# pool that only just clears TP1_R_MULTIPLE stops qualifying once buffered
+# rather than yielding a sub-2R target. The visible effect is that slightly
+# fewer pools qualify and slightly more targets come from the fixed-R
+# fallback - not that targets get closer than the floor allows.
+#
+# Deliberately smaller than the 0.5 used on stops: a stop wants clearance
+# from the level, a target only wants to be in front of the queue at it.
+STRUCTURE_TARGET_ATR_BUFFER = env_float("STRUCTURE_TARGET_ATR_BUFFER", 0.0)
 # Hard floor: SL is never allowed closer to entry than this % of entry
 # price, regardless of how close the structure level happened to land -
 # prevents a pathologically tight stop (and the oversized position that

@@ -19,7 +19,9 @@ import config
 from risk_management import calculate_position_size, get_position_risk_budget
 
 
-def _find_structure_target(pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance):
+def _find_structure_target(
+    pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance, atr=None
+):
     """Nearest real liquidity-pool price in the trade's favorable
     direction that clears `min_r_multiple` R of room *and* stays within
     `max_r_multiple` R, or None if no pool qualifies. The max bound
@@ -30,10 +32,23 @@ def _find_structure_target(pools, entry_price, side, min_r_multiple, max_r_multi
     BUY_SIDE pools (resistance above entry - where breakout-buy stops
     sit); SELL targets SELL_SIDE pools (support below entry - where long
     stops sit) - the same pools liquidity_sweep.py already uses, just on
-    the opposite side of price from where a sweep would be found."""
+    the opposite side of price from where a sweep would be found.
+
+    config.STRUCTURE_TARGET_ATR_BUFFER (`atr` given, buffer > 0) returns a
+    price that many ATR IN FRONT of the pool instead of on it. The buffer
+    is subtracted BEFORE the min/max R tests deliberately: those bounds
+    must hold against the price actually returned, so a pool that only
+    just clears min_r_multiple stops qualifying once buffered rather than
+    silently producing a sub-min_r target. That is what keeps the 2:1
+    floor honest - see that config flag's own comment.
+
+    `atr=None` or a 0 buffer reproduces the original exact-on-pool
+    behaviour byte for byte, which is why nearest_favorable_structure_r
+    (which reports where a level actually IS) simply doesn't pass one."""
     if risk_distance <= 0:
         return None
 
+    buffer = float(atr or 0) * max(float(config.STRUCTURE_TARGET_ATR_BUFFER), 0)
     min_distance = min_r_multiple * risk_distance
     max_distance = max_r_multiple * risk_distance if max_r_multiple else None
     pool_type = "BUY_SIDE" if side == "BUY" else "SELL_SIDE"
@@ -46,14 +61,18 @@ def _find_structure_target(pools, entry_price, side, min_r_multiple, max_r_multi
             continue
 
         distance = (price - entry_price) if side == "BUY" else (entry_price - price)
+        # Where the order would actually rest, which is what the R bounds
+        # below have to be judged against.
+        effective_distance = distance - buffer
 
-        if distance < min_distance:
+        if effective_distance <= 0 or effective_distance < min_distance:
             continue
 
-        if max_distance is not None and distance > max_distance:
+        if max_distance is not None and effective_distance > max_distance:
             continue
 
-        candidates.append((distance, price))
+        target = price - buffer if side == "BUY" else price + buffer
+        candidates.append((effective_distance, target))
 
     if not candidates:
         return None
@@ -62,14 +81,18 @@ def _find_structure_target(pools, entry_price, side, min_r_multiple, max_r_multi
     return candidates[0][1]
 
 
-def _resolve_target(pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance):
+def _resolve_target(
+    pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance, atr=None
+):
     structure_price = _find_structure_target(
-        pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance
+        pools, entry_price, side, min_r_multiple, max_r_multiple, risk_distance, atr=atr
     )
 
     if structure_price is not None:
         return structure_price
 
+    # No pool qualified - the fixed-R fallback is NOT buffered: there is no
+    # pool sitting in front of it to get in front of.
     distance = min_r_multiple * risk_distance
     return entry_price + distance if side == "BUY" else entry_price - distance
 
@@ -304,9 +327,11 @@ def price_at_roi_pct(entry_price, side, roi_pct):
     return entry_price + distance if side == "BUY" else entry_price - distance
 
 
-def compute_dca_target(new_entry_price, sl_price, side, pools):
+def compute_dca_target(new_entry_price, sl_price, side, pools, atr=None):
     """The single post-DCA take-profit target that replaces TP1+TP2 once
-    a DCA has fired.
+    a DCA has fired. `atr` only feeds config.STRUCTURE_TARGET_ATR_BUFFER,
+    so the post-DCA target sits in front of its pool on the same terms
+    TP1/TP2 do rather than being the one target still drawn onto it.
 
     config.DCA_TP_STATIC_ROI_ENABLED - operator-requested alternative
     (2026-08-19, no evidence yet either way - default False, same "new
@@ -331,7 +356,9 @@ def compute_dca_target(new_entry_price, sl_price, side, pools):
 
     tp_min = max(float(config.DCA_TP_R_MULTIPLE), 0)
     tp_max = max(float(config.DCA_TP_MAX_R_MULTIPLE), tp_min)
-    return _resolve_target(pools, new_entry_price, side, tp_min, tp_max, risk_distance)
+    return _resolve_target(
+        pools, new_entry_price, side, tp_min, tp_max, risk_distance, atr=atr
+    )
 
 
 def build_dca_plan(
@@ -370,7 +397,7 @@ def build_dca_plan(
     if side == "SELL" and sl_price <= new_entry_price:
         return None
 
-    tp_price = compute_dca_target(new_entry_price, sl_price, side, pools)
+    tp_price = compute_dca_target(new_entry_price, sl_price, side, pools, atr=atr)
 
     if tp_price is None:
         return None
@@ -430,7 +457,7 @@ def compute_stop_loss(signal, side):
     return _apply_min_stop_distance(sl_price, signal.get("entry_price"), side, atr=atr)
 
 
-def compute_targets(entry_price, sl_price, side, pools=None):
+def compute_targets(entry_price, sl_price, side, pools=None, atr=None):
     risk_distance = abs(entry_price - sl_price)
 
     if risk_distance <= 0:
@@ -441,13 +468,17 @@ def compute_targets(entry_price, sl_price, side, pools=None):
     tp1_max = max(float(config.TP1_MAX_R_MULTIPLE), tp1_min)
     tp2_max = max(float(config.TP2_MAX_R_MULTIPLE), tp2_min)
 
-    tp1_price = _resolve_target(pools, entry_price, side, tp1_min, tp1_max, risk_distance)
-    tp2_price = _resolve_tp2_given_tp1(entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools)
+    tp1_price = _resolve_target(pools, entry_price, side, tp1_min, tp1_max, risk_distance, atr=atr)
+    tp2_price = _resolve_tp2_given_tp1(
+        entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools, atr=atr
+    )
 
     return tp1_price, tp2_price
 
 
-def _resolve_tp2_given_tp1(entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools=None):
+def _resolve_tp2_given_tp1(
+    entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools=None, atr=None
+):
     """TP2's own real-liquidity-first resolution, given a TP1 price that's
     already been decided by whatever means (compute_targets' own
     structure-resolved TP1, or config.TP_STATIC_ROI_ENABLED's fixed-ROI%
@@ -462,10 +493,12 @@ def _resolve_tp2_given_tp1(entry_price, tp1_price, sl_price, side, tp2_min, tp2_
 
     tp1_actual_multiple = abs(tp1_price - entry_price) / risk_distance
     tp2_min_multiple = min(max(tp2_min, tp1_actual_multiple + 1.0), tp2_max)
-    return _resolve_target(pools, entry_price, side, tp2_min_multiple, tp2_max, risk_distance)
+    return _resolve_target(
+        pools, entry_price, side, tp2_min_multiple, tp2_max, risk_distance, atr=atr
+    )
 
 
-def compute_static_tp1_structure_tp2(entry_price, sl_price, side, roi_pct, pools=None):
+def compute_static_tp1_structure_tp2(entry_price, sl_price, side, roi_pct, pools=None, atr=None):
     """config.TP_STATIC_ROI_ENABLED - TP1 is a fixed ROI% target
     (price_at_roi_pct, same math DCA_TP_STATIC_ROI_ENABLED's post-DCA
     target already uses), TP2 is the EXISTING real-liquidity-first
@@ -487,7 +520,9 @@ def compute_static_tp1_structure_tp2(entry_price, sl_price, side, roi_pct, pools
 
     tp2_min = max(float(config.TP2_R_MULTIPLE), 0)
     tp2_max = max(float(config.TP2_MAX_R_MULTIPLE), tp2_min)
-    tp2_price = _resolve_tp2_given_tp1(entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools)
+    tp2_price = _resolve_tp2_given_tp1(
+        entry_price, tp1_price, sl_price, side, tp2_min, tp2_max, pools, atr=atr
+    )
 
     return tp1_price, tp2_price
 
@@ -742,13 +777,17 @@ def build_trade_plan(signal, balance):
     # it was computed from turns out not to be the real one.
     tp1_static_roi_pct = config.TP_TARGET_ROI_PCT if config.TP_STATIC_ROI_ENABLED else None
 
+    # config.STRUCTURE_TARGET_ATR_BUFFER - `atr` is only consumed to offset
+    # the target off the pool it resolves to; a 0 buffer ignores it entirely.
     if config.TP_STATIC_ROI_ENABLED:
         tp1_price, tp2_price = compute_static_tp1_structure_tp2(
-            entry_price, sl_price, side, config.TP_TARGET_ROI_PCT, pools=signal.get("liquidity_pools")
+            entry_price, sl_price, side, config.TP_TARGET_ROI_PCT,
+            pools=signal.get("liquidity_pools"), atr=signal.get("atr"),
         )
     else:
         tp1_price, tp2_price = compute_targets(
-            entry_price, sl_price, side, pools=signal.get("liquidity_pools")
+            entry_price, sl_price, side,
+            pools=signal.get("liquidity_pools"), atr=signal.get("atr"),
         )
 
     if tp1_price is None or tp2_price is None:
