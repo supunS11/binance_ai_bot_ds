@@ -637,10 +637,35 @@ class RealtimeMarketData:
             if generation == self.generation:
                 self.depth_threads = threads
 
+    # Binance futures partial-book depth accepts ONLY these speeds, and its
+    # default (250ms) is expressed by OMITTING the suffix entirely - there is
+    # no "@250ms" form. Getting this wrong is silent and total: the combined
+    # /stream? endpoint happily accepts any stream name, the socket connects
+    # and stays open, and not one message ever arrives.
+    #
+    # Real incident (2026-09-04 -> 2026-09-07): WS_DEPTH_SPEED_MS was set to
+    # "250ms" to cut message volume. depth_imbalance availability went 100%
+    # -> 4% -> 0% and stayed there for three days. Nothing surfaced it,
+    # because every depth consumer fails open on a missing snapshot - so
+    # DEPTH_OPPOSING and DEPTH_TREND_UNSTABLE, both live reject gates, were
+    # silently inert the whole time and no error was ever logged.
+    _VALID_DEPTH_SPEEDS = ("", "100ms", "500ms")
+
     def _depth_stream_names(self, symbols):
         levels = config.WS_DEPTH_LEVELS
-        speed = config.WS_DEPTH_SPEED_MS
-        return [f"{symbol.lower()}@depth{levels}@{speed}" for symbol in symbols]
+        speed = str(config.WS_DEPTH_SPEED_MS or "").strip()
+
+        if speed not in self._VALID_DEPTH_SPEEDS:
+            log_warning(
+                f"WS_DEPTH_SPEED_MS={speed!r} is not a valid Binance depth "
+                f"speed - the stream would connect and then receive NOTHING. "
+                f"Falling back to the default (250ms, no suffix). Valid "
+                f"values: empty (250ms), 100ms, 500ms."
+            )
+            speed = ""
+
+        suffix = f"@{speed}" if speed else ""
+        return [f"{symbol.lower()}@depth{levels}{suffix}" for symbol in symbols]
 
     def _depth_stream_loop(self, symbols, generation):
         from websockets.sync.client import connect

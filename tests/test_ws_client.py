@@ -8,6 +8,52 @@ import config
 from ws_client import CandleStore, RealtimeMarketData
 
 
+class DepthStreamNameTests(unittest.TestCase):
+    """Real incident (2026-09-04 -> 09-07): WS_DEPTH_SPEED_MS was set to
+    "250ms", which is NOT a valid Binance futures partial-depth suffix -
+    250ms is the default and is expressed by OMITTING the speed. The socket
+    connected and stayed open, received nothing for three days, and nothing
+    surfaced it because every depth consumer fails open. depth_imbalance
+    availability went 100% -> 0% and two live reject gates (DEPTH_OPPOSING,
+    DEPTH_TREND_UNSTABLE) were silently inert throughout."""
+
+    def _names(self, speed, levels=20):
+        feed = RealtimeMarketData(["BTCUSDT"])
+        with patch.object(config, "WS_DEPTH_SPEED_MS", speed), \
+             patch.object(config, "WS_DEPTH_LEVELS", levels):
+            return feed._depth_stream_names(["BTCUSDT", "ETHUSDT"])
+
+    def test_valid_suffix_is_used_verbatim(self):
+        self.assertEqual(
+            self._names("100ms"), ["btcusdt@depth20@100ms", "ethusdt@depth20@100ms"])
+        self.assertEqual(
+            self._names("500ms"), ["btcusdt@depth20@500ms", "ethusdt@depth20@500ms"])
+
+    def test_empty_speed_omits_the_suffix_entirely(self):
+        # This is how Binance's own 250ms default is requested.
+        self.assertEqual(self._names(""), ["btcusdt@depth20", "ethusdt@depth20"])
+        self.assertEqual(self._names(None), ["btcusdt@depth20", "ethusdt@depth20"])
+
+    def test_the_250ms_that_broke_it_falls_back_instead_of_going_silent(self):
+        with patch("ws_client.log_warning") as warn:
+            names = self._names("250ms")
+
+        self.assertEqual(names, ["btcusdt@depth20", "ethusdt@depth20"])
+        self.assertTrue(warn.called)
+        self.assertIn("250ms", warn.call_args.args[0])
+
+    def test_any_other_garbage_also_falls_back_loudly(self):
+        with patch("ws_client.log_warning") as warn:
+            names = self._names("1s")
+
+        self.assertEqual(names, ["btcusdt@depth20", "ethusdt@depth20"])
+        self.assertTrue(warn.called)
+
+    def test_levels_still_come_from_config(self):
+        self.assertEqual(
+            self._names("100ms", levels=5), ["btcusdt@depth5@100ms", "ethusdt@depth5@100ms"])
+
+
 class CandleStoreTests(unittest.TestCase):
     def test_seed_loads_history_as_closed_candles(self):
         store = CandleStore(maxlen=50)
