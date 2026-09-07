@@ -296,6 +296,43 @@ def _evaluate_symbol(
             )
             return
 
+    # config.MIN_CONFIRMATION_FIELDS_AVAILABLE / MIN_CONFIRMATION_AGREEMENT_
+    # RATIO - the confluence floor. Placed HERE deliberately, for two
+    # reasons: long_short_favorable is one of the counted fields and only
+    # exists after the block above, and this sits BEFORE the OB_FVG price
+    # check below, whose on-demand 1m kline fetch is wasted on a candidate
+    # this is about to reject anyway.
+    #
+    # Coverage is checked before agreement so a thin-data signal reports the
+    # more specific reason - "we never had enough readings" is a different
+    # problem from "the readings disagreed", and they measured as entirely
+    # separate cohorts (zero overlap). See config.py for the evidence.
+    confirmation_available, confirmation_favourable = signal_engine.confirmation_confluence(result)
+    result["confirmation_available"] = confirmation_available
+    result["confirmation_favourable"] = confirmation_favourable
+
+    if (
+        config.MIN_CONFIRMATION_FIELDS_AVAILABLE > 0
+        and confirmation_available < config.MIN_CONFIRMATION_FIELDS_AVAILABLE
+    ):
+        _tally_reject(reject_counts, reject_symbols, symbol, "INSUFFICIENT_CONFIRMATION_DATA")
+        _tally_reject(
+            reject_trigger_counts, reject_trigger_symbols, symbol,
+            f"INSUFFICIENT_CONFIRMATION_DATA | triggers={result.get('signal_trigger')}",
+        )
+        return
+
+    if config.MIN_CONFIRMATION_AGREEMENT_RATIO > 0 and confirmation_available > 0:
+        agreement_ratio = confirmation_favourable / confirmation_available
+
+        if agreement_ratio < config.MIN_CONFIRMATION_AGREEMENT_RATIO:
+            _tally_reject(reject_counts, reject_symbols, symbol, "WEAK_CONFLUENCE")
+            _tally_reject(
+                reject_trigger_counts, reject_trigger_symbols, symbol,
+                f"WEAK_CONFLUENCE | triggers={result.get('signal_trigger')}",
+            )
+            return
+
     # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
     # evidence (see that flag's own config.py comment). Scoped to
     # OB_FVG_RETEST only - checked identically against CHOCH_RETEST and

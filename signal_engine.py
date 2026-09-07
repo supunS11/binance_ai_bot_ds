@@ -69,6 +69,80 @@ def taker_flow_agrees(side, taker_ratio):
     return taker_ratio > 1 if side == "BUY" else taker_ratio < 1
 
 
+# config.MIN_CONFIRMATION_AGREEMENT_RATIO / MIN_CONFIRMATION_FIELDS_AVAILABLE
+# - the confirmation fields counted toward confluence, and how each is read.
+#
+# This list mirrors signal_journal's own columns EXACTLY, because the
+# thresholds were measured off the journal. Changing it silently invalidates
+# those numbers - see the config flags' own comments for the evidence.
+#
+# `order_block`/`fvg` are deliberately in ALWAYS_PRESENT_FIELDS: signal_journal
+# writes them as bool(signal.get(...)), so the journal never has a blank there
+# and they always counted toward `available` in the measurement. Every other
+# field counted only when it was not None.
+_CONFLUENCE_BOOL_FIELDS = (
+    "ema_aligned", "btc_aligned", "sweep_confluence", "oi_rising",
+    "cross_exchange_oi_agree", "liquidation_aligned", "liquidation_cluster",
+    "absorption_aligned", "depth_trend_aligned", "whale_aligned",
+    "efficiency_favorable", "funding_favorable", "long_short_favorable",
+)
+_CONFLUENCE_ALWAYS_PRESENT_FIELDS = ("order_block", "fvg")
+_CONFLUENCE_SIGNED_FIELDS = ("cvd_score", "depth_imbalance")
+
+
+def confirmation_confluence(result):
+    """(available, favourable) across every confirmation reading on a
+    candidate - how many had ANY value at all, and how many actually agreed
+    with the trade's own side.
+
+    The two counts answer different questions and measured as two
+    INDEPENDENT effects (zero overlapping trades):
+      available  - data coverage. Every gate in this engine fails open, so a
+                   signal on a thin-data symbol skips gates a well-covered
+                   one has to clear. 9-10 fields measured -2.61/trade,
+                   negative in both halves.
+      favourable - genuine confluence. Under 60% agreement measured
+                   -5.37/trade, also negative in both halves.
+
+    Lives here (not main.py) so the field list sits with the engine that
+    produces those fields, but it is CALLED from main.py - one of the fields,
+    long_short_favorable, is only resolved there after an on-demand fetch
+    (see config.LONG_SHORT_RATIO_ENABLED). Reading it any earlier would
+    silently drop it from the count and change the measured basis.
+
+    Returns (0, 0) rather than dividing by zero on an empty/None result."""
+    if not result:
+        return 0, 0
+
+    side = result.get("signal")
+    available = favourable = 0
+
+    for field in _CONFLUENCE_BOOL_FIELDS:
+        value = result.get(field)
+
+        if value is None:
+            continue
+
+        available += 1
+        favourable += 1 if value else 0
+
+    for field in _CONFLUENCE_ALWAYS_PRESENT_FIELDS:
+        available += 1
+        favourable += 1 if result.get(field) else 0
+
+    for field in _CONFLUENCE_SIGNED_FIELDS:
+        value = result.get(field)
+
+        if value is None:
+            continue
+
+        available += 1
+        signed = value if side == "BUY" else -value
+        favourable += 1 if signed > 0 else 0
+
+    return available, favourable
+
+
 def _ema_regime(candles):
     """config.EMA_TREND_MIXED_REJECT_ENABLED - the classic EMA50-vs-EMA200
     trend read: BULLISH while the fast EMA sits above the slow one, BEARISH

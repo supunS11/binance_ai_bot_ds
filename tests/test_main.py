@@ -198,10 +198,18 @@ class EvaluateSymbolRejectCountsTests(unittest.TestCase):
         # real CVD_DIVERGENCE signal_trigger and falls through past
         # build_trade_plan - not what that test is about, and these
         # gates' on-demand exchange calls aren't mocked there.
+        # MIN_CONFIRMATION_FIELDS_AVAILABLE/MIN_CONFIRMATION_AGREEMENT_RATIO
+        # pinned off: these tests use minimal result fixtures like
+        # {"signal": "BUY"} that carry almost no confirmation fields, so the
+        # live confluence floor would reject every one of them before the
+        # behaviour under test is ever reached. See ConfluenceFloorTests for
+        # the gate's own coverage.
         for name, value in (
             ("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False),
             ("CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False),
             ("CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False),
+            ("MIN_CONFIRMATION_FIELDS_AVAILABLE", 0),
+            ("MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -640,11 +648,18 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
         # found while implementing an unrelated later feature - both
         # default True and were added after this class's setUp already
         # existed, so this class was never updated for them).
+        # MIN_CONFIRMATION_* pinned off for the same reason as
+        # EvaluateSymbolRejectCountsTests.setUp - minimal result fixtures
+        # carry almost no confirmation fields. The confluence tests in this
+        # class re-patch them inside their own `with` blocks, which takes
+        # precedence over this.
         for name, value in (
             ("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False),
             ("MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED", False),
             ("CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED", False),
             ("CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED", False),
+            ("MIN_CONFIRMATION_FIELDS_AVAILABLE", 0),
+            ("MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0),
         ):
             patcher = patch.object(config, name, value)
             patcher.start()
@@ -827,6 +842,139 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
             main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
 
         plan_mock.assert_called_once()
+
+    # config.MIN_CONFIRMATION_AGREEMENT_RATIO / MIN_CONFIRMATION_FIELDS_
+    # AVAILABLE - 2026-09-07, the confluence floor. Closes the fail-open
+    # exposure: every gate in signal_engine skips itself on missing data, so
+    # a thin-data signal clears fewer real checks than a well-covered one.
+
+    def _confluence_result(self, available=12, favourable=10):
+        """A result dict whose confirmation_confluence() lands on exactly
+        (available, favourable). order_block/fvg always count as available,
+        so build the rest out of plain booleans on top of them."""
+        result = {"signal": "BUY", "symbol": "BTCUSDT", "signal_trigger": "EMA_PULLBACK",
+                  "order_block": {"i": 1}, "fvg": {"i": 1}}
+        remaining_avail = available - 2
+        remaining_fav = favourable - 2
+        for i, field in enumerate(signal_engine._CONFLUENCE_BOOL_FIELDS[:remaining_avail]):
+            result[field] = i < remaining_fav
+        return result
+
+    def test_confluence_helper_fixture_lands_where_expected(self):
+        # Guards the fixture itself - if this drifts the gate tests below
+        # would be asserting against the wrong ratio.
+        self.assertEqual(
+            signal_engine.confirmation_confluence(self._confluence_result(12, 10)), (12, 10))
+
+    def test_weak_confluence_rejects_before_building_a_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts, reject_symbols = Counter(), {}
+        reject_trigger_counts, reject_trigger_symbols = Counter(), {}
+        result = self._confluence_result(available=12, favourable=6)  # 0.50
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 11), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.60), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(reject_counts["WEAK_CONFLUENCE"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["WEAK_CONFLUENCE"])
+        self.assertEqual(reject_trigger_counts["WEAK_CONFLUENCE | triggers=EMA_PULLBACK"], 1)
+
+    def test_thin_data_reports_the_more_specific_reason(self):
+        # Coverage is checked BEFORE agreement on purpose - "we never had
+        # enough readings" is a different failure from "they disagreed", and
+        # the two measured as entirely separate cohorts.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts, reject_symbols = Counter(), {}
+        result = self._confluence_result(available=9, favourable=3)  # fails both
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 11), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.60), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                Counter(), {},
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(reject_counts["INSUFFICIENT_CONFIRMATION_DATA"], 1)
+        self.assertEqual(reject_counts["WEAK_CONFLUENCE"], 0)
+
+    def test_sufficient_confluence_proceeds(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = self._confluence_result(available=12, favourable=10)  # 0.833
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 11), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.60), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan",
+                          return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_both_flags_at_zero_is_a_complete_noop(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = self._confluence_result(available=9, favourable=1)  # awful
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 0), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan",
+                          return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_counts_are_attached_to_the_result_for_journalling(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = self._confluence_result(available=12, favourable=10)
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 0), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(None, "SL_TOO_TIGHT")):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000)
+
+        self.assertEqual(result["confirmation_available"], 12)
+        self.assertEqual(result["confirmation_favourable"], 10)
+
+    def test_rejects_before_the_ob_fvg_kline_fetch(self):
+        # The OB_FVG price check below does an on-demand 1m kline fetch -
+        # wasted on a candidate this is about to turn away.
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        result = self._confluence_result(available=12, favourable=6)
+        result["signal_trigger"] = "OB_FVG_RETEST"
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED", True), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 11), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.60), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(exchange, "get_klines") as klines_mock, \
+             patch.object(risk_manager, "build_trade_plan"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, None,
+                                  Counter(), {})
+
+        klines_mock.assert_not_called()
 
     # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
     # evidence (see config.py's own comment). Scoped to OB_FVG_RETEST
@@ -1408,7 +1556,13 @@ class EvaluateSymbolLimitEntryModeTests(unittest.TestCase):
     against."""
 
     def setUp(self):
-        for name, value in (("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False)):
+        # MIN_CONFIRMATION_* pinned off - minimal result fixtures, same
+        # reason as EvaluateSymbolRejectCountsTests.setUp.
+        for name, value in (
+            ("DCA_ENABLED", False), ("RETRACEMENT_ENTRY_ENABLED", False),
+            ("MIN_CONFIRMATION_FIELDS_AVAILABLE", 0),
+            ("MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0),
+        ):
             patcher = patch.object(config, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1748,9 +1902,16 @@ class EvaluateSymbolDcaRoutingTests(unittest.TestCase):
         # plan["side"]) into enter_trade_retracement instead of the DCA/
         # limit paths this class is actually testing. Pinned off, same
         # isolation reason as every other routing test class here.
-        patcher = patch.object(config, "RETRACEMENT_ENTRY_ENABLED", False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # MIN_CONFIRMATION_* pinned off - minimal result fixtures, same
+        # reason as EvaluateSymbolRejectCountsTests.setUp.
+        for name, value in (
+            ("RETRACEMENT_ENTRY_ENABLED", False),
+            ("MIN_CONFIRMATION_FIELDS_AVAILABLE", 0),
+            ("MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _plan(self, entry_extension_r=0.5):
         return {
@@ -1803,6 +1964,19 @@ class EvaluateSymbolRetracementRoutingTests(unittest.TestCase):
     regardless of entry_extension_r, and hands off into DCA_PENDING/
     TP1_PENDING itself once resolved (position_manager.
     _finalize_retracement_entry), not at routing time."""
+
+    def setUp(self):
+        # MIN_CONFIRMATION_* pinned off - these fixtures are minimal result
+        # dicts carrying almost no confirmation fields, so the live
+        # confluence floor would reject them before routing is reached.
+        # Same isolation reason as every other routing test class here.
+        for name, value in (
+            ("MIN_CONFIRMATION_FIELDS_AVAILABLE", 0),
+            ("MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _plan(self, entry_extension_r=0.5, dca_price=96):
         return {

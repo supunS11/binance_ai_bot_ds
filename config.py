@@ -956,6 +956,49 @@ LONG_SHORT_RATIO_ENABLED = env_bool("LONG_SHORT_RATIO_ENABLED", "True")
 # not here in signal_engine, since long_short_ratio itself is only ever
 # fetched on-demand there (see this flag's own sibling above).
 LONG_SHORT_FAVORABLE_REJECT_ENABLED = env_bool("LONG_SHORT_FAVORABLE_REJECT_ENABLED", "True")
+# =========================
+# CONFLUENCE FLOOR (2026-09-07, operator-proposed)
+# =========================
+# Every gate in signal_engine.py fails OPEN - the phrase "None never blocks,
+# same fail-open convention as every gate here" appears throughout it. Missing
+# depth, missing OI, an unavailable whale print, no volume-profile snapshot:
+# each silently SKIPS its own gate. So a signal on a thin-data symbol clears
+# far fewer real checks than one on a well-covered symbol, and nothing
+# anywhere notices the difference.
+#
+# Measured on 246 resolved LIVE trades, scored on today's geometry (stop 1R /
+# TP 2R, real 5m paths). TWO effects, both negative in BOTH halves:
+#
+#   cohort                              n      PnL   perTrade     H1     H2
+#   9-10 confirmation fields available 45  -117.41      -2.61    -51    -66
+#   under 60% of available agreeing    36  -193.49      -5.37   -132    -62
+#
+# Their overlap is EXACTLY ZERO trades (37 rejected by ratio only, 45 by
+# coverage only, 0 by both), so these are two different failure modes and
+# both knobs earn their place rather than one being a proxy for the other.
+#
+# Combined (ratio >= 0.60 AND available >= 11):
+#   book +774.05 (246 trades) -> +1007.89 (164)   effect +233.84
+#   H1 +106.41    H2 +127.44    <- both halves improve
+#
+# The ratio is a PLATEAU, not a spike - every value from 0.55 to 0.70 is
+# positive in both halves (0.55 +187.88, 0.62 +220.26, 0.65 +414.07, 0.70
+# +275.79). 0.60 is a conservative point inside it, the same "centre of the
+# plateau, not the peak" reasoning as PREMIUM_DISCOUNT_LOOKBACK_CANDLES.
+#
+# HONEST LIMITS: several formulations were tried and this is the one that
+# held - the count-based version (favourable >= 8) has a bigger headline
+# (+207.34) but H2 is -43.77. 20-day sample, 36-45 trades in each rejected
+# cohort. And it CANNOT be checked against the six-window regime replay,
+# which is kline-only and has no CVD/depth/OI/whale data at all.
+#
+# Checked in main.py, not signal_engine, because long_short_favorable is one
+# of the counted fields and is only resolved there (see LONG_SHORT_RATIO_
+# ENABLED above). 0 disables either check independently.
+MIN_CONFIRMATION_AGREEMENT_RATIO = env_float("MIN_CONFIRMATION_AGREEMENT_RATIO", 0.0)
+# Coverage floor. Only one value is viable: 10 is a no-op (it is the observed
+# minimum across every real trade) and 12 measured -118.19 with H1 -281.47.
+MIN_CONFIRMATION_FIELDS_AVAILABLE = env_int("MIN_CONFIRMATION_FIELDS_AVAILABLE", 0)
 # Boolean "favorable" readings derived from efficiency_ratio/funding_rate/
 # long_short_ratio - journaled independently (the blended confluence_score
 # these used to deliberately stay out of was removed entirely 2026-08-31,

@@ -28,6 +28,7 @@ FIELDNAMES = [
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
     "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "ltf_trend_live", "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket", "entry_range_position", "htf_trend_swing_age_hours", "premium_discount_zone",
     "zone_direction",
+    "confirmation_available", "confirmation_favourable",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising",
@@ -284,6 +285,14 @@ def append_signal(signal, plan, execution_result=None):
         # was drifting, the companion to premium_discount_zone's "where in
         # the range". Written whether or not that gate is on.
         "zone_direction": signal.get("zone_direction"),
+        # config.MIN_CONFIRMATION_AGREEMENT_RATIO / MIN_CONFIRMATION_FIELDS_
+        # AVAILABLE - how many confirmation readings existed at all, and how
+        # many agreed with the trade's own side. Written unconditionally so
+        # the live distribution keeps building whether or not the gate is on,
+        # and so the thresholds can be re-checked against fresh data. Written
+        # even when 0 (not blank) - a genuine zero is a real reading.
+        "confirmation_available": signal.get("confirmation_available"),
+        "confirmation_favourable": signal.get("confirmation_favourable"),
         "zone_retracement_pct": signal.get("zone_retracement_pct"),
         "order_block_present": bool(signal.get("order_block")),
         "fvg_present": bool(signal.get("fvg")),

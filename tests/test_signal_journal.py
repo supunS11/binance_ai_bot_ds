@@ -460,6 +460,28 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["ema_value"], "101.0")
         self.assertEqual(rows[0]["ema_alignment_value"], "99.5")
 
+    def test_append_signal_writes_the_confluence_counts(self):
+        # config.MIN_CONFIRMATION_AGREEMENT_RATIO - written unconditionally so
+        # the live distribution keeps building whether or not the gate is on.
+        signal_journal.append_signal(
+            _signal(confirmation_available=12, confirmation_favourable=10), _plan()
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["confirmation_available"], "12")
+        self.assertEqual(rows[0]["confirmation_favourable"], "10")
+
+    def test_append_signal_writes_a_zero_confluence_count_not_blank(self):
+        # A genuine zero is a real reading, not missing data - blanking it
+        # would make "no confirmations agreed" indistinguishable from "this
+        # row predates the field".
+        signal_journal.append_signal(
+            _signal(confirmation_available=11, confirmation_favourable=0), _plan()
+        )
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["confirmation_favourable"], "0")
+
     def test_append_signal_writes_zone_direction(self):
         # config.ZONE_DIRECTION_REJECT_ENABLED - the companion to
         # premium_discount_zone: that one records WHERE in the range the

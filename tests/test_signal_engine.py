@@ -4074,6 +4074,63 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result_b["signal_trigger"], "STRUCTURE_BREAK")
 
 
+class ConfirmationConfluenceTests(unittest.TestCase):
+    """config.MIN_CONFIRMATION_AGREEMENT_RATIO / MIN_CONFIRMATION_FIELDS_
+    AVAILABLE - counts how many confirmation readings existed and how many
+    agreed. The field list and availability semantics mirror signal_journal's
+    columns EXACTLY, because the thresholds were measured off the journal;
+    these tests pin that correspondence."""
+
+    def test_empty_and_none_are_zero_not_a_crash(self):
+        self.assertEqual(signal_engine.confirmation_confluence({}), (0, 0))
+        self.assertEqual(signal_engine.confirmation_confluence(None), (0, 0))
+
+    def test_none_fields_are_unavailable_not_unfavourable(self):
+        # A missing reading must not be counted as disagreement - that is the
+        # whole distinction between the two knobs.
+        avail, fav = signal_engine.confirmation_confluence(
+            {"signal": "BUY", "ema_aligned": None, "btc_aligned": None}
+        )
+        self.assertEqual((avail, fav), (2, 0))  # only order_block/fvg
+
+    def test_order_block_and_fvg_always_count_as_available(self):
+        # signal_journal writes these as bool(...), so the journal never has a
+        # blank there and they always counted toward `available` when the
+        # thresholds were measured.
+        avail, fav = signal_engine.confirmation_confluence({"signal": "BUY"})
+        self.assertEqual((avail, fav), (2, 0))
+
+        avail, fav = signal_engine.confirmation_confluence(
+            {"signal": "BUY", "order_block": {"index": 1}, "fvg": {"type": "BULLISH"}}
+        )
+        self.assertEqual((avail, fav), (2, 2))
+
+    def test_signed_fields_are_read_per_side(self):
+        # A negative cvd_score is FAVOURABLE for a SELL and unfavourable for
+        # a BUY - the same signing every gate in this engine uses.
+        sell = signal_engine.confirmation_confluence({"signal": "SELL", "cvd_score": -0.5})
+        buy = signal_engine.confirmation_confluence({"signal": "BUY", "cvd_score": -0.5})
+
+        self.assertEqual(sell, (3, 1))
+        self.assertEqual(buy, (3, 0))
+
+    def test_false_boolean_is_available_but_not_favourable(self):
+        avail, fav = signal_engine.confirmation_confluence(
+            {"signal": "BUY", "ema_aligned": False, "btc_aligned": True}
+        )
+        self.assertEqual((avail, fav), (4, 1))  # 2 bools + order_block/fvg
+
+    def test_a_fully_confirmed_candidate_counts_every_field(self):
+        result = {"signal": "BUY", "order_block": {"i": 1}, "fvg": {"i": 1},
+                  "cvd_score": 0.4, "depth_imbalance": 0.2}
+        for field in signal_engine._CONFLUENCE_BOOL_FIELDS:
+            result[field] = True
+
+        avail, fav = signal_engine.confirmation_confluence(result)
+        expected = len(signal_engine._CONFLUENCE_BOOL_FIELDS) + 2 + 2
+        self.assertEqual((avail, fav), (expected, expected))
+
+
 class RejectDiagnosticsTests(unittest.TestCase):
     """config.REJECT_JOURNAL_ENABLED - _evaluate_direction's _reject wrapper
     merges a _diag() snapshot into every reject so main.py can journal a
