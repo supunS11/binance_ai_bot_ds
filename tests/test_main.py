@@ -1093,6 +1093,97 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
 
         self.assertEqual(append.call_count, 0)
 
+    # config.CONFLUENCE_SHADOW_PROBE_RATIO - a candidate BETWEEN the probe
+    # ratio and the live bar becomes a SHADOW trade instead of a reject, so
+    # the live bar can eventually be judged on real outcomes instead of the
+    # in-sample sweep that chose it.
+
+    def _run_probe(self, result, probe=0.53, live=0.65, exclude=("CVD_DIVERGENCE",)):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        plan = {"symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+                "tp1_price": 102, "tp2_price": 104}
+        rejects = Counter()
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 0), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", live), \
+             patch.object(config, "CONFLUENCE_SHADOW_PROBE_RATIO", probe), \
+             patch.object(config, "CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS", list(exclude)), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(plan, "OK")), \
+             patch.object(execution, "enter_trade",
+                          return_value={"ok": True, "shadow": True}) as enter_trade, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_1"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000,
+                                  rejects, {}, None, Counter(), {})
+        return enter_trade, rejects
+
+    def test_a_band_candidate_is_routed_to_shadow_not_rejected(self):
+        enter_trade, rejects = self._run_probe(
+            self._confluence_result(available=13, favourable=7))       # 0.538
+
+        self.assertEqual(rejects["WEAK_CONFLUENCE"], 0)
+        self.assertTrue(enter_trade.call_args.args[0]["force_shadow"])
+
+    def test_a_band_candidate_can_never_place_a_real_order(self):
+        # THE SAFETY PROPERTY. Even with the bot fully LIVE and no
+        # shadow-only triggers configured, this plan must still be shadow -
+        # otherwise the probe would be risking real capital on exactly the
+        # candidates the live bar was set to refuse.
+        enter_trade, _ = self._run_probe(
+            self._confluence_result(available=13, favourable=7))
+        plan = enter_trade.call_args.args[0]
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", []):
+            self.assertTrue(execution._is_shadow_mode(plan))
+
+    def test_a_candidate_above_the_live_bar_is_untouched_by_the_probe(self):
+        enter_trade, rejects = self._run_probe(
+            self._confluence_result(available=13, favourable=11))      # 0.846
+        plan = enter_trade.call_args.args[0]
+
+        self.assertEqual(rejects["WEAK_CONFLUENCE"], 0)
+        self.assertFalse(plan["force_shadow"])
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", []):
+            self.assertFalse(execution._is_shadow_mode(plan))
+
+    def test_an_excluded_trigger_is_still_rejected(self):
+        result = self._confluence_result(available=13, favourable=7)
+        result["signal_trigger"] = "CVD_DIVERGENCE"
+        enter_trade, rejects = self._run_probe(result)
+
+        self.assertEqual(rejects["WEAK_CONFLUENCE"], 1)
+        enter_trade.assert_not_called()
+
+    def test_below_the_probe_ratio_is_still_rejected(self):
+        enter_trade, rejects = self._run_probe(
+            self._confluence_result(available=13, favourable=5))       # 0.385
+
+        self.assertEqual(rejects["WEAK_CONFLUENCE"], 1)
+        enter_trade.assert_not_called()
+
+    def test_probe_at_zero_restores_plain_rejection(self):
+        enter_trade, rejects = self._run_probe(
+            self._confluence_result(available=13, favourable=7), probe=0.0)
+
+        self.assertEqual(rejects["WEAK_CONFLUENCE"], 1)
+        enter_trade.assert_not_called()
+
+    def test_the_probe_flag_reaches_the_result_for_journalling(self):
+        result = self._confluence_result(available=13, favourable=7)
+        self._run_probe(result)
+
+        self.assertTrue(result["confluence_probe"])
+
+    def test_a_normal_signal_records_the_flag_as_false_not_missing(self):
+        result = self._confluence_result(available=13, favourable=11)
+        self._run_probe(result)
+
+        self.assertIs(result["confluence_probe"], False)
+
     # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
     # evidence (see config.py's own comment). Scoped to OB_FVG_RETEST
     # only - same on-demand-after-signal shape as LONG_SHORT_RATIO_ENABLED

@@ -338,12 +338,39 @@ def _evaluate_symbol(
         _reject_after_signal("INSUFFICIENT_CONFIRMATION_DATA")
         return
 
+    # config.CONFLUENCE_SHADOW_PROBE_RATIO - a candidate under the live bar
+    # but at or above the probe ratio becomes a SHADOW trade instead of a
+    # reject, so the live bar can eventually be judged on real outcomes
+    # rather than on the in-sample sweep that chose it. Set on `result` here
+    # and copied onto `plan` below, because execution._is_shadow_mode reads
+    # the plan - same route config.SHADOW_ONLY_TRIGGERS already takes.
+    confluence_probe = False
+
     if config.MIN_CONFIRMATION_AGREEMENT_RATIO > 0 and confirmation_available > 0:
         agreement_ratio = confirmation_favourable / confirmation_available
 
         if agreement_ratio < config.MIN_CONFIRMATION_AGREEMENT_RATIO:
-            _reject_after_signal("WEAK_CONFLUENCE")
-            return
+            # Order matters: the probe is checked INSIDE the failure branch,
+            # so a candidate that clears the live bar can never reach it.
+            # This can only ever turn a reject into a shadow trade.
+            if (
+                config.CONFLUENCE_SHADOW_PROBE_RATIO > 0
+                and agreement_ratio >= config.CONFLUENCE_SHADOW_PROBE_RATIO
+                and result.get("signal_trigger")
+                not in config.CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS
+            ):
+                confluence_probe = True
+                log_info(
+                    f"{symbol} confluence {confirmation_favourable}/"
+                    f"{confirmation_available}={agreement_ratio:.3f} is under the live "
+                    f"{config.MIN_CONFIRMATION_AGREEMENT_RATIO} bar - routing to SHADOW "
+                    f"as a probe (trigger={result.get('signal_trigger')})"
+                )
+            else:
+                _reject_after_signal("WEAK_CONFLUENCE")
+                return
+
+    result["confluence_probe"] = confluence_probe
 
     # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
     # evidence (see that flag's own config.py comment). Scoped to
@@ -493,6 +520,10 @@ def _evaluate_symbol(
     # config.SHADOW_ONLY_TRIGGERS - execution._is_shadow_mode reads this
     # off plan, not result, to decide per-trigger shadow routing.
     plan["signal_trigger"] = result.get("signal_trigger")
+    # config.CONFLUENCE_SHADOW_PROBE_RATIO - same route, second reason a
+    # plan can be forced shadow. Always assigned (never left absent) so the
+    # flag is unambiguous rather than a missing-key default.
+    plan["force_shadow"] = confluence_probe
     # config.RETRACEMENT_DEPTH_AWARE_ENABLED - execution.enter_trade_
     # retracement reads this off plan, not result, to decide whether to
     # rest deeper/wait longer for a weak-depth_imbalance entry.

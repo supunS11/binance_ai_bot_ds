@@ -29,6 +29,11 @@ FIELDNAMES = [
     "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "ltf_trend_live", "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket", "entry_range_position", "htf_trend_swing_age_hours", "premium_discount_zone",
     "zone_direction",
     "confirmation_available", "confirmation_favourable",
+    # config.CONFLUENCE_SHADOW_PROBE_RATIO - True marks a trade that is in
+    # shadow ONLY because it fell inside the probe band. Without this the
+    # probe cohort is indistinguishable from ordinary SHADOW_ONLY_TRIGGERS
+    # shadows, and measuring it as its own population is the entire point.
+    "confluence_probe",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising",
@@ -326,6 +331,10 @@ def append_signal(signal, plan, execution_result=None):
         # even when 0 (not blank) - a genuine zero is a real reading.
         "confirmation_available": signal.get("confirmation_available"),
         "confirmation_favourable": signal.get("confirmation_favourable"),
+        # bool(), not the raw value: this must read as a clean True/False in
+        # the CSV for every row, including the ones written before the probe
+        # existed on the result dict.
+        "confluence_probe": bool(signal.get("confluence_probe")),
         "zone_retracement_pct": signal.get("zone_retracement_pct"),
         "order_block_present": bool(signal.get("order_block")),
         "fvg_present": bool(signal.get("fvg")),

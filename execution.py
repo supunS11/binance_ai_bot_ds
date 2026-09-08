@@ -19,15 +19,25 @@ from logger import log_error, log_info, log_warning
 
 
 def _is_shadow_mode(plan):
-    """True if this specific plan should not place a real order - either
-    the whole bot is in shadow mode, or its trigger is individually forced
-    into shadow via config.SHADOW_ONLY_TRIGGERS (evidence-gate philosophy
-    applied per-trigger instead of bot-wide - see that config's own
-    comment). One-directional: can only add shadow behavior on top of
-    LIVE, never force a trigger LIVE while EXECUTION_MODE is SHADOW."""
+    """True if this specific plan should not place a real order. Three
+    independent reasons, any of which is sufficient:
+
+      1. the whole bot is in shadow mode (config.EXECUTION_MODE)
+      2. its trigger is individually forced into shadow via
+         config.SHADOW_ONLY_TRIGGERS (evidence-gate philosophy applied
+         per-trigger instead of bot-wide - see that config's own comment)
+      3. `force_shadow` was set on the plan - currently only by
+         config.CONFLUENCE_SHADOW_PROBE_RATIO, for a candidate that fell
+         under the live confluence bar and is being tracked in shadow to
+         find out whether that bar is set correctly
+
+    One-directional in every case: these can only ADD shadow behavior on
+    top of LIVE, never force a plan LIVE while EXECUTION_MODE is SHADOW or
+    while one of the other two reasons applies."""
     return (
         config.EXECUTION_MODE != "LIVE"
         or plan.get("signal_trigger") in config.SHADOW_ONLY_TRIGGERS
+        or bool(plan.get("force_shadow"))
     )
 
 # config.DCA_RESTING_ORDER_ENABLED - tags the resting LIMIT order placed

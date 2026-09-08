@@ -999,6 +999,43 @@ MIN_CONFIRMATION_AGREEMENT_RATIO = env_float("MIN_CONFIRMATION_AGREEMENT_RATIO",
 # Coverage floor. Only one value is viable: 10 is a no-op (it is the observed
 # minimum across every real trade) and 12 measured -118.19 with H1 -281.47.
 MIN_CONFIRMATION_FIELDS_AVAILABLE = env_int("MIN_CONFIRMATION_FIELDS_AVAILABLE", 0)
+# --- the shadow probe band (2026-09-08, operator's design) ----------------
+# MIN_CONFIRMATION_AGREEMENT_RATIO was chosen by sweeping the journal
+# IN-SAMPLE, and it can never be re-tested from live data on its own: every
+# candidate it rejects simply disappears, so the live journal only ever
+# contains ratios ABOVE the bar. The reject journal records the SETUP of a
+# blocked candidate but not its OUTCOME - reconstructing that offline needs
+# an assumed stop and an assumed fill.
+#
+# This closes that hole directly: a candidate that lands BETWEEN this ratio
+# and MIN_CONFIRMATION_AGREEMENT_RATIO is not rejected, it is routed to
+# SHADOW. It then gets the real risk_manager plan, the real TP/SL, real
+# position_manager tracking and a real journaled outcome - while never
+# touching capital. After a few weeks the question "is 7-of-13 good enough
+# to trade live" is answered by measurement instead of by a sweep.
+#
+# The band is one-directional and cannot promote anything: it only ever
+# turns a REJECT into a SHADOW trade, never a shadow trade into a live one
+# (execution._is_shadow_mode is likewise one-directional). A candidate above
+# MIN_CONFIRMATION_AGREEMENT_RATIO is untouched by this and still trades
+# live exactly as before.
+#
+# Ratio, not a count, to stay symmetric with the live bar - but note the
+# measure is QUANTIZED, because `available` is almost always 13 and
+# `favourable` is an integer. At available=13 the live 0.65 bar means "at
+# least 9 of 13" (9/13 = 0.692; 8/13 = 0.615, nothing lands between). 0.53
+# here means "at least 7 of 13". 0 disables the band entirely, restoring the
+# original reject-everything-below-the-bar behaviour.
+CONFLUENCE_SHADOW_PROBE_RATIO = env_float("CONFLUENCE_SHADOW_PROBE_RATIO", 0.0)
+# Triggers excluded from the probe. CVD_DIVERGENCE by default because it is
+# already in SHADOW_ONLY_TRIGGERS - its candidates are shadow either way, so
+# admitting them would add nothing while swamping the sample: 11 of the 12
+# most recent WEAK_CONFLUENCE rejects were CVD_DIVERGENCE. Excluding it
+# keeps the probe population equal to "trades that would otherwise have been
+# REAL", which is the only population the question is about.
+CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS = env_str_list(
+    "CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS", ["CVD_DIVERGENCE"]
+)
 # Boolean "favorable" readings derived from efficiency_ratio/funding_rate/
 # long_short_ratio - journaled independently (the blended confluence_score
 # these used to deliberately stay out of was removed entirely 2026-08-31,
