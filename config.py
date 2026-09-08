@@ -1743,6 +1743,34 @@ MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
 # reversion: entering high in the range on a BUY means price is already
 # moving your way.
 #
+# 2026-09-08 UPDATE 1 - THE EVIDENCE ABOVE IS BULL-ONLY, AND IT DOES NOT
+# GENERALISE. Replayed across six independent 20-day regime windows (three
+# bears, two bulls, one flat), the chase-band gradient INVERTS by regime.
+# Per-trade PnL in the 0.00-0.25 "ideal" band: +6.03 / +7.36 / +4.20 in the
+# three bears (the best band in all three) against -12.18 in BULL-2. The
+# operator's original objection - that the negative result was a bull-market
+# artifact - was correct. On top of the deployed zone stack the gate is
+# still only 2/6 windows at 0.70 and 3/6 at 0.80, and every window's
+# baseline is deeply negative, so this is not an endorsement; it is a
+# retraction of the claim that the gate is unconditionally wrong.
+#
+# 2026-09-08 UPDATE 2 - IT IS NEARLY REDUNDANT WITH THE ZONE GATES. Same six
+# windows: premium/discount + ZONE_DIRECTION_OPPOSED already block 92% of
+# everything this gate blocks, leaving a unique contribution of 21
+# candidates out of 2393 (under 1%), worth -112 total. Both gates express
+# "don't buy the top, don't sell the bottom" - this one on a 12h 1h-range,
+# the zone gate on a ~10d 4h-range - and the longer one does the job. Note
+# the 92% is only modestly above the 87% you would get by chance, since the
+# zone gate blocks 87% of everything; the honest reading is that the zone
+# gate is aggressive enough to leave this one almost nothing to do.
+#
+# 2026-09-08 UPDATE 3 - the gate was MOVED to run after the zone gates (see
+# signal_engine._evaluate_direction). Running first made it look like the
+# dominant filter - 2256 of 3909 live reject rows, 58% - when it was mostly
+# claiming the zone gates' work, and it left premium_discount_zone blank on
+# every one of those rows. Ordering cannot change which candidates survive
+# (all pure predicates, all hard rejects), only which reason is recorded.
+#
 # Ships OFF, and 0.80 is the least destructive threshold offered. The
 # operator was shown all of the above and chose to proceed anyway for
 # risk-discipline reasons - that is a legitimate call on their own capital,

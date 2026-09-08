@@ -4150,11 +4150,12 @@ class RejectDiagnosticsTests(unittest.TestCase):
         self.assertIsNotNone(result["diag_entry_price"])
 
     def test_an_early_reject_does_not_raise_on_unset_fields(self):
-        # THE REGRESSION THIS GUARDS: price_zone is assigned at the
-        # NOT_IN_DISCOUNT gate, but EMA_TREND_MIXED and ENTRY_RANGE_POSITION
-        # reject BEFORE it. Reading it from _diag() without the early init
-        # raises UnboundLocalError - which would kill the scan loop for that
-        # symbol, not merely lose a journal row.
+        # THE REGRESSION THIS GUARDS: EMA_TREND_MIXED rejects before
+        # price_zone is computed. Reading it from _diag() without the early
+        # init raises UnboundLocalError - which would kill the scan loop for
+        # that symbol, not merely lose a journal row. (ENTRY_RANGE_POSITION
+        # used to be in the same position; since 2026-09-08 its gate runs
+        # after the zone gates, so it is covered by GateOrderingTests below.)
         with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
             result = self._run(ltf_ema_fast=110.0, ltf_ema_slow=90.0,
                                htf_ema_fast=90.0, htf_ema_slow=110.0)
@@ -4177,6 +4178,78 @@ class RejectDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(result["signal"], "BUY")
         self.assertFalse([k for k in result if k.startswith("diag_")])
+
+
+class GateOrderingTests(unittest.TestCase):
+    """2026-09-08 - entry_range_position is COMPUTED early but GATED after the
+    zone gates, and price_zone is computed early rather than at its own gate.
+
+    Why it matters: ENTRY_RANGE_POSITION used to run first, so 2256 of 3909
+    live reject rows (58%) recorded it as the reason with a BLANK
+    premium_discount_zone - the reject journal could not answer the question
+    it was built for. Measured across six regime windows, the zone gates
+    already block 92% of what this gate blocks, so running it first mostly
+    claimed their work.
+
+    Reordering CANNOT change which candidates survive: every gate involved is
+    a pure predicate over values hoisted before _evaluate_direction runs, and
+    all are hard rejects, so the surviving set is order-independent. These
+    tests pin both halves of that - the diagnostics improved, the outcome
+    did not move."""
+
+    def _run(self, **kwargs):
+        return SignalEngineTests._run(self, **kwargs)
+
+    def _force_entry_range_reject(self):
+        # MAX below 0 makes any real entry_range_position exceed it, without
+        # needing to hand-craft a range in the fixture candles.
+        return (patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True),
+                patch.object(config, "ENTRY_RANGE_POSITION_MAX", -1.0))
+
+    def test_entry_range_reject_now_carries_the_zone_diagnostics(self):
+        # THE ACTUAL FIX. Before the reorder this reject had
+        # diag_premium_discount_zone = None.
+        a, b = self._force_entry_range_reject()
+        with a, b:
+            result = self._run()
+
+        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
+        self.assertEqual(result["diag_premium_discount_zone"], "DISCOUNT")
+        self.assertIsNotNone(result["diag_entry_range_position"])
+
+    def test_when_both_fire_the_zone_gate_is_the_reported_reason(self):
+        # Attribution moves to the gate doing the real work.
+        a, b = self._force_entry_range_reject()
+        with a, b, patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
+
+    def test_a_zone_reject_still_carries_entry_range_position(self):
+        # The naive fix (moving the COMPUTATION too) would have traded one
+        # blank column for another. Both must be populated.
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
+        self.assertIsNotNone(result["diag_entry_range_position"])
+        self.assertEqual(result["diag_premium_discount_zone"], "DISCOUNT")
+
+    def test_entry_range_alone_still_rejects(self):
+        # Outcome unchanged: a candidate failing ONLY this gate is still
+        # turned away, exactly as before the reorder.
+        a, b = self._force_entry_range_reject()
+        with a, b:
+            result = self._run()
+
+        self.assertIsNone(result["signal"])
+
+    def test_a_passing_entry_range_still_signals(self):
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 2.0):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
 
 
 class ZoneDirectionGateTests(unittest.TestCase):

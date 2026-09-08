@@ -989,19 +989,25 @@ def evaluate(
         if config.EMA_TREND_MIXED_REJECT_ENABLED and ema_trend_bucket == "MIXED":
             return _reject("EMA_TREND_MIXED")
 
-        # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - "don't buy the top of
-        # the range, don't sell the bottom". 0.0 = the ideal end for this
-        # side, 1.0 = the worst end. latest_price is ltf_candles[-1] close,
-        # the same price used as entry_price below, so this measures exactly
-        # what gets filled.
+        # entry_range_position ("how bad is this entry for THIS side" - 0.0 =
+        # the ideal end of the recent range, 1.0 = the worst end) and
+        # price_zone (where price sits in the HTF range) are both COMPUTED
+        # here but GATED further down, next to ZONE_DIRECTION_OPPOSED.
         #
-        # Universal rather than profile-scoped, same as the two gates above.
-        # Fails open on a degenerate range or too little history.
+        # Computation and gating are deliberately split (2026-09-08). Both are
+        # pure functions of values hoisted before this function runs, so
+        # computing them early cannot change any result - but it means a
+        # reject row carries every cheap diagnostic that was KNOWABLE at that
+        # point, instead of only the ones the pipeline happened to reach
+        # before returning. Measured cost of NOT doing this: 2256 of 3909
+        # live reject rows (58%) died at ENTRY_RANGE_POSITION with a blank
+        # premium_discount_zone, because that gate used to run first - which
+        # left the reject journal unable to answer the question it was built
+        # for (config.REJECT_JOURNAL_REASONS).
         #
-        # READ config.py BEFORE RAISING THE STRICTNESS: every measurement
-        # available says this gate costs money (winners entered HIGHER in the
-        # range than losers, in both halves). It ships off, at the least
-        # destructive threshold, on the operator's explicit decision.
+        # latest_price is ltf_candles[-1] close, the same price used as
+        # entry_price below, so entry_range_position measures exactly what
+        # gets filled. Fails open on a degenerate range or too little history.
         entry_range_position = None
 
         if (
@@ -1013,12 +1019,7 @@ def evaluate(
             pos = (latest_price - entry_range_low) / span
             entry_range_position = pos if side == "BUY" else (1.0 - pos)
 
-        if (
-            config.ENTRY_RANGE_POSITION_REJECT_ENABLED
-            and entry_range_position is not None
-            and entry_range_position > config.ENTRY_RANGE_POSITION_MAX
-        ):
-            return _reject("ENTRY_RANGE_POSITION")
+        price_zone = market_structure.zone_for_price(zone, latest_price)
 
         # Both checks below exist purely to catch a stale SWING-confirmed
         # bias. Once AGAINST_HTF_BIAS no longer uses that bias at all
@@ -1074,9 +1075,8 @@ def evaluate(
         # reversal-at-extreme signal naturally already sits on the
         # matching side of this same HTF range, so this gate's geometry
         # agrees with reversal triggers rather than conflicting with them,
-        # unlike NOT_IN_OTE below.
-        price_zone = market_structure.zone_for_price(zone, latest_price)
-
+        # unlike NOT_IN_OTE below. price_zone itself is computed further up,
+        # so it is on the reject row even when an earlier gate fires.
         if side == "BUY" and price_zone != "DISCOUNT":
             return _reject(f"NOT_IN_DISCOUNT price_zone={price_zone}")
 
@@ -1098,6 +1098,40 @@ def evaluate(
             and zone_direction != direction
         ):
             return _reject(f"ZONE_DIRECTION_OPPOSED zone_direction={zone_direction}")
+
+        # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - "don't buy the top of
+        # the range, don't sell the bottom", on the 1h range
+        # (ENTRY_RANGE_LOOKBACK_CANDLES). Value computed further up; only the
+        # check lives here.
+        #
+        # ORDER MATTERS ONLY FOR ATTRIBUTION, NEVER FOR OUTCOME. Every gate
+        # between here and the entry_range_position computation is a pure
+        # predicate over values hoisted before _evaluate_direction runs, and
+        # all of them are hard rejects - so the set of candidates that
+        # survive is identical whatever the order. What order decides is
+        # which reason gets recorded, and that is why this now runs LAST of
+        # the three range-position gates rather than first.
+        #
+        # It is placed after the zone gates specifically because it is very
+        # nearly redundant with them: measured across six 20-day regime
+        # windows, the premium/discount + zone_direction pair already blocked
+        # 92% of everything this gate blocks, leaving it a unique
+        # contribution of 21 candidates out of 2393 (under 1%). Running it
+        # first made it look like the dominant filter (58% of live reject
+        # rows) when it was mostly claiming the zone gates' work.
+        #
+        # READ config.py BEFORE RAISING THE STRICTNESS. The live-journal
+        # evidence says this gate costs money (winners entered HIGHER in the
+        # range than losers, in both halves); the six-window regime replay
+        # disagrees and says it helps in bear markets. Those two measure
+        # different populations and both are recorded in config.py. It ships
+        # off; it is on at the operator's explicit and informed decision.
+        if (
+            config.ENTRY_RANGE_POSITION_REJECT_ENABLED
+            and entry_range_position is not None
+            and entry_range_position > config.ENTRY_RANGE_POSITION_MAX
+        ):
+            return _reject("ENTRY_RANGE_POSITION")
 
         # NOT_IN_OTE checks whether CURRENT PRICE sits within a Fibonacci
         # retracement band of the OVERALL HTF range - the classic "break,
