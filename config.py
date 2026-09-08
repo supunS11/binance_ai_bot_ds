@@ -2606,12 +2606,33 @@ REJECT_JOURNAL_ENABLED = env_bool("REJECT_JOURNAL_ENABLED", "False")
 # premium/discount zone invert in a trending market (measured across six
 # 20-day regime windows: in every bear window the zone gate took ~45
 # counter-trend longs and only 1-5 shorts).
+#
+# The last two are POST-signal gates (main.py's own, run after evaluate()
+# returns) rather than signal_engine gates, and they are here for a reason
+# the others are not. MIN_CONFIRMATION_AGREEMENT_RATIO is the single most
+# binding gate live - it turns away roughly a third of candidates that
+# passed everything else - and its threshold was picked by sweeping the
+# journal, i.e. IN-SAMPLE. Until these rows exist the live journal only
+# ever contains ratios ABOVE the bar, so the distribution is truncated and
+# 0.65 can be observed forever without ever being tested. These rows are
+# the only way that threshold is ever re-checkable against real forward
+# data. Volume is trivial (a couple of rows a day - a candidate has to
+# clear every other gate to reach one of them), unlike the pre-signal
+# reasons above which fire across the whole watchlist.
+#
+# The remaining post-signal gates (LONG_SHORT_UNFAVORABLE,
+# OB_FVG_RETEST_PRICE_WEAK, MARKET_CHOPPY_OI_CROWDED, CVD_DIVERGENCE_*)
+# are wired into the same journalling path and are one env edit from being
+# recorded too - left OFF by default only to keep the file focused on the
+# question actually open right now.
 REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
     "ZONE_DIRECTION_OPPOSED",
     "ENTRY_RANGE_POSITION",
     "NOT_IN_DISCOUNT",
     "NOT_IN_PREMIUM",
     "EMA_TREND_MIXED",
+    "WEAK_CONFLUENCE",
+    "INSUFFICIENT_CONFIRMATION_DATA",
 ])
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)

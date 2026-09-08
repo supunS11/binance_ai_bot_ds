@@ -68,6 +68,13 @@ REJECT_FIELDNAMES = [
     "premium_discount_zone", "zone_direction", "entry_range_position",
     "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket",
     "htf_trend_live", "ltf_trend_live",
+    # config.MIN_CONFIRMATION_AGREEMENT_RATIO - the raw confluence counts,
+    # so a WEAK_CONFLUENCE row records HOW FAR under the bar the candidate
+    # was, not merely that it was under. Without the two numbers the
+    # threshold can be observed but never re-swept, which is the whole
+    # reason these rows exist. Blank on a pre-signal reject: main.py only
+    # resolves them after evaluate() returns (see confirmation_confluence).
+    "confirmation_available", "confirmation_favourable",
 ]
 
 
@@ -150,12 +157,24 @@ def append_rejected_signal(symbol, reason, result, candle_open_time=None):
     """config.REJECT_JOURNAL_ENABLED - one row for a candidate a gate turned
     away, so the gate's own counterfactual stops being discarded.
 
-    `result` is signal_engine.evaluate()'s reject dict; its diag_* keys are
-    merged in by the _reject wrapper inside _evaluate_direction (see
-    _diag() there). Reads them defensively - a reject raised OUTSIDE
-    _evaluate_direction (ZONE_UNAVAILABLE, NO_CANDLE_DATA, ...) carries no
-    diag_* keys at all, and those simply write as empty rather than being a
-    special case here.
+    TWO dict shapes reach here, and both must produce the same columns:
+
+      PRE-signal  - signal_engine.evaluate()'s reject dict. Its diag_* keys
+                    are merged in by the _reject wrapper inside
+                    _evaluate_direction (see _diag() there), and `side`
+                    lives in diag_side because the dict's own "signal" is
+                    None by construction.
+      POST-signal - a full SUCCESS dict, rejected by one of main.py's own
+                    gates after evaluate() returned. It has no diag_* keys
+                    at all: it carries every one of the same values under
+                    its PLAIN name, its side under "signal", and its
+                    trigger under "signal_trigger" rather than "triggers".
+
+    So each field reads diag_* first and falls back to the plain name. That
+    keeps one writer for both callers instead of a second near-duplicate
+    function, and means a reject raised OUTSIDE _evaluate_direction
+    (ZONE_UNAVAILABLE, NO_CANDLE_DATA, ...) still writes cleanly - it simply
+    has neither form and lands as empty.
 
     The caller owns BOTH volume controls (allowlist and per-candle dedupe -
     see main.py); this function writes whatever it is handed. Never raises
@@ -165,8 +184,10 @@ def append_rejected_signal(symbol, reason, result, candle_open_time=None):
     row["candle_open_time"] = candle_open_time if candle_open_time is not None else ""
     row["symbol"] = symbol
     row["reject_reason"] = reason
-    row["side"] = result.get("diag_side") or ""
-    row["signal_trigger"] = ",".join(result.get("triggers") or [])
+    row["side"] = result.get("diag_side") or result.get("signal") or ""
+    row["signal_trigger"] = (
+        ",".join(result.get("triggers") or []) or result.get("signal_trigger") or ""
+    )
 
     for field in (
         "entry_price", "atr", "efficiency_ratio", "premium_discount_zone",
@@ -174,6 +195,18 @@ def append_rejected_signal(symbol, reason, result, candle_open_time=None):
         "htf_ema_regime", "ema_trend_bucket", "htf_trend_live", "ltf_trend_live",
     ):
         value = result.get(f"diag_{field}")
+
+        if value is None:
+            value = result.get(field)
+
+        row[field] = "" if value is None else value
+
+    # Post-signal rejects only - see REJECT_FIELDNAMES. A gate that fires
+    # BEFORE main.py resolves these (LONG_SHORT_UNFAVORABLE) leaves them
+    # blank, which is the honest record: the counts genuinely did not exist
+    # yet at the moment that candidate died.
+    for field in ("confirmation_available", "confirmation_favourable"):
+        value = result.get(field)
         row[field] = "" if value is None else value
 
     try:

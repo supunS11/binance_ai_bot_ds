@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from collections import Counter
 from unittest.mock import MagicMock, patch
@@ -975,6 +976,122 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
                                   Counter(), {})
 
         klines_mock.assert_not_called()
+
+    # config.REJECT_JOURNAL_ENABLED x the post-signal gates. Until
+    # _reject_after_signal existed, the reject journal could only see the
+    # `not result.get("signal")` branch, so every gate down here was
+    # invisible to it regardless of REJECT_JOURNAL_REASONS - which made the
+    # most binding gate live the one whose counterfactual was discarded.
+
+    def _run_journalled(self, result, reason_allowlist, **flag_overrides):
+        main._reject_journal_seen.clear()
+        self.addCleanup(main._reject_journal_seen.clear)
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        flags = {
+            "LONG_SHORT_RATIO_ENABLED": False,
+            "MIN_CONFIRMATION_FIELDS_AVAILABLE": 11,
+            "MIN_CONFIRMATION_AGREEMENT_RATIO": 0.60,
+            "REJECT_JOURNAL_ENABLED": True,
+            "REJECT_JOURNAL_REASONS": reason_allowlist,
+        }
+        flags.update(flag_overrides)
+
+        with contextlib.ExitStack() as stack:
+            for name, value in flags.items():
+                stack.enter_context(patch.object(config, name, value))
+            stack.enter_context(patch.object(signal_engine, "evaluate", return_value=result))
+            stack.enter_context(patch.object(risk_manager, "build_trade_plan",
+                                             return_value=(None, "SL_TOO_TIGHT")))
+            append = stack.enter_context(
+                patch.object(signal_journal, "append_rejected_signal")
+            )
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {}, None,
+                                  Counter(), {})
+        return append
+
+    def test_a_weak_confluence_reject_is_journaled(self):
+        append = self._run_journalled(
+            self._confluence_result(available=12, favourable=6), ["WEAK_CONFLUENCE"],
+        )
+        self.assertEqual(append.call_count, 1)
+        self.assertEqual(append.call_args.args[1], "WEAK_CONFLUENCE")
+
+    def test_the_journaled_row_carries_the_confluence_counts(self):
+        # The counts are what make the row re-sweepable offline - a row
+        # saying only "rejected" cannot re-test the threshold.
+        append = self._run_journalled(
+            self._confluence_result(available=12, favourable=6), ["WEAK_CONFLUENCE"],
+        )
+        journaled = append.call_args.args[2]
+
+        self.assertEqual(journaled["confirmation_available"], 12)
+        self.assertEqual(journaled["confirmation_favourable"], 6)
+
+    def test_insufficient_confirmation_data_is_journaled(self):
+        append = self._run_journalled(
+            self._confluence_result(available=9, favourable=3),
+            ["INSUFFICIENT_CONFIRMATION_DATA"],
+        )
+        self.assertEqual(append.call_count, 1)
+        self.assertEqual(append.call_args.args[1], "INSUFFICIENT_CONFIRMATION_DATA")
+
+    def test_a_post_signal_reason_outside_the_allowlist_is_not_journaled(self):
+        append = self._run_journalled(
+            self._confluence_result(available=12, favourable=6), ["ENTRY_RANGE_POSITION"],
+        )
+        self.assertEqual(append.call_count, 0)
+
+    def test_journalling_a_post_signal_reject_still_tallies_exactly_once(self):
+        # The helper replaced three inline calls at seven sites; the tally
+        # behaviour must be byte-identical to before.
+        main._reject_journal_seen.clear()
+        self.addCleanup(main._reject_journal_seen.clear)
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts, reject_symbols = Counter(), {}
+        reject_trigger_counts, reject_trigger_symbols = Counter(), {}
+        result = self._confluence_result(available=12, favourable=6)
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 11), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.60), \
+             patch.object(config, "REJECT_JOURNAL_ENABLED", True), \
+             patch.object(config, "REJECT_JOURNAL_REASONS", ["WEAK_CONFLUENCE"]), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(signal_journal, "append_rejected_signal"), \
+             patch.object(risk_manager, "build_trade_plan"):
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        self.assertEqual(reject_counts["WEAK_CONFLUENCE"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["WEAK_CONFLUENCE"])
+        self.assertEqual(reject_trigger_counts["WEAK_CONFLUENCE | triggers=EMA_PULLBACK"], 1)
+
+    def test_signal_not_yet_stable_is_never_journaled(self):
+        # A timing skip that re-fires every tick for the same candidate -
+        # deliberately routed around _reject_after_signal so it can't swamp
+        # the file even if someone allowlists it.
+        main._reject_journal_seen.clear()
+        self.addCleanup(main._reject_journal_seen.clear)
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        stability = main.SignalStabilityTracker()
+        result = self._confluence_result(available=12, favourable=10)
+
+        with patch.object(config, "SIGNAL_CONFIRM_TICKS", 5), \
+             patch.object(config, "EXTRA_CONFIRM_TICKS_FOR_NEW_TRIGGERS", 0), \
+             patch.object(config, "REJECT_JOURNAL_ENABLED", True), \
+             patch.object(config, "REJECT_JOURNAL_REASONS", ["SIGNAL_NOT_YET_STABLE"]), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(signal_journal, "append_rejected_signal") as append, \
+             patch.object(risk_manager, "build_trade_plan"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter(), {},
+                                  stability, Counter(), {})
+
+        self.assertEqual(append.call_count, 0)
 
     # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
     # evidence (see config.py's own comment). Scoped to OB_FVG_RETEST

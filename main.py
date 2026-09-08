@@ -270,6 +270,30 @@ def _evaluate_symbol(
         _tally_reject(reject_counts, reject_symbols, symbol, "SIGNAL_NOT_YET_STABLE")
         return
 
+    def _reject_after_signal(reason):
+        """The three things every gate BELOW this point does: tally, tally
+        by trigger, journal. Identical to what each of those sites already
+        did inline, plus the journal call - which is the whole point.
+
+        Until this existed, config.REJECT_JOURNAL_ENABLED could only ever
+        see rejects from the `not result.get("signal")` branch above, so
+        every gate down here was invisible to it no matter what
+        config.REJECT_JOURNAL_REASONS listed. That silently made
+        MIN_CONFIRMATION_AGREEMENT_RATIO - the most binding gate live -
+        the one gate whose own counterfactual was permanently discarded.
+
+        Deliberately NOT used for SIGNAL_NOT_YET_STABLE above: that is a
+        timing skip that re-fires every tick for the same candidate, not a
+        signal-quality rejection, and it would swamp the file. Same
+        reasoning that keeps has_open_position/cooldown/max_positions out
+        of the tally entirely (see this function's docstring)."""
+        _tally_reject(reject_counts, reject_symbols, symbol, reason)
+        _tally_reject(
+            reject_trigger_counts, reject_trigger_symbols, symbol,
+            f"{reason} | triggers={result.get('signal_trigger')}",
+        )
+        _journal_reject(symbol, reason, result, ltf_candles)
+
     # Long/short ratio: fetched on-demand here, not polled across the
     # whole watchlist like the fields above - see
     # config.LONG_SHORT_RATIO_ENABLED for why (no bulk endpoint exists for
@@ -289,11 +313,7 @@ def _evaluate_symbol(
         # explicit False; None (data unavailable) never blocks, same
         # fail-open convention as every gate in signal_engine.py.
         if config.LONG_SHORT_FAVORABLE_REJECT_ENABLED and result["long_short_favorable"] is False:
-            _tally_reject(reject_counts, reject_symbols, symbol, "LONG_SHORT_UNFAVORABLE")
-            _tally_reject(
-                reject_trigger_counts, reject_trigger_symbols, symbol,
-                f"LONG_SHORT_UNFAVORABLE | triggers={result.get('signal_trigger')}",
-            )
+            _reject_after_signal("LONG_SHORT_UNFAVORABLE")
             return
 
     # config.MIN_CONFIRMATION_FIELDS_AVAILABLE / MIN_CONFIRMATION_AGREEMENT_
@@ -315,22 +335,14 @@ def _evaluate_symbol(
         config.MIN_CONFIRMATION_FIELDS_AVAILABLE > 0
         and confirmation_available < config.MIN_CONFIRMATION_FIELDS_AVAILABLE
     ):
-        _tally_reject(reject_counts, reject_symbols, symbol, "INSUFFICIENT_CONFIRMATION_DATA")
-        _tally_reject(
-            reject_trigger_counts, reject_trigger_symbols, symbol,
-            f"INSUFFICIENT_CONFIRMATION_DATA | triggers={result.get('signal_trigger')}",
-        )
+        _reject_after_signal("INSUFFICIENT_CONFIRMATION_DATA")
         return
 
     if config.MIN_CONFIRMATION_AGREEMENT_RATIO > 0 and confirmation_available > 0:
         agreement_ratio = confirmation_favourable / confirmation_available
 
         if agreement_ratio < config.MIN_CONFIRMATION_AGREEMENT_RATIO:
-            _tally_reject(reject_counts, reject_symbols, symbol, "WEAK_CONFLUENCE")
-            _tally_reject(
-                reject_trigger_counts, reject_trigger_symbols, symbol,
-                f"WEAK_CONFLUENCE | triggers={result.get('signal_trigger')}",
-            )
+            _reject_after_signal("WEAK_CONFLUENCE")
             return
 
     # config.OB_FVG_RETEST_PRICE_WEAK_REJECT_ENABLED - 2026-09-02, real
@@ -369,11 +381,7 @@ def _evaluate_symbol(
             price_hold_consistency is not None
             and price_hold_consistency < config.OB_FVG_RETEST_MIN_PRICE_HOLD_PCT
         ):
-            _tally_reject(reject_counts, reject_symbols, symbol, "OB_FVG_RETEST_PRICE_WEAK")
-            _tally_reject(
-                reject_trigger_counts, reject_trigger_symbols, symbol,
-                f"OB_FVG_RETEST_PRICE_WEAK | triggers={result.get('signal_trigger')}",
-            )
+            _reject_after_signal("OB_FVG_RETEST_PRICE_WEAK")
             return
 
     # config.MARKET_CHOPPY_OI_REGIME_REJECT_ENABLED - 2026-09-02, real
@@ -398,11 +406,7 @@ def _evaluate_symbol(
             oi_percentile is not None
             and oi_percentile >= config.MARKET_CHOPPY_OI_REGIME_MAX_PERCENTILE
         ):
-            _tally_reject(reject_counts, reject_symbols, symbol, "MARKET_CHOPPY_OI_CROWDED")
-            _tally_reject(
-                reject_trigger_counts, reject_trigger_symbols, symbol,
-                f"MARKET_CHOPPY_OI_CROWDED | triggers={result.get('signal_trigger')}",
-            )
+            _reject_after_signal("MARKET_CHOPPY_OI_CROWDED")
             return
 
     # config.CVD_DIVERGENCE_TAKER_FLOW_REJECT_ENABLED - 2026-09-02, real
@@ -418,11 +422,7 @@ def _evaluate_symbol(
         taker_agrees = signal_engine.taker_flow_agrees(result["signal"], taker_ratio)
 
         if taker_agrees is False:
-            _tally_reject(reject_counts, reject_symbols, symbol, "CVD_DIVERGENCE_TAKER_FLOW_DISAGREE")
-            _tally_reject(
-                reject_trigger_counts, reject_trigger_symbols, symbol,
-                f"CVD_DIVERGENCE_TAKER_FLOW_DISAGREE | triggers={result.get('signal_trigger')}",
-            )
+            _reject_after_signal("CVD_DIVERGENCE_TAKER_FLOW_DISAGREE")
             return
 
     # config.CVD_DIVERGENCE_PRICE_HOLD_WEAK_REJECT_ENABLED - 2026-09-02,
@@ -454,11 +454,7 @@ def _evaluate_symbol(
             price_hold_consistency is not None
             and price_hold_consistency < config.CVD_DIVERGENCE_MIN_PRICE_HOLD_PCT
         ):
-            _tally_reject(reject_counts, reject_symbols, symbol, "CVD_DIVERGENCE_PRICE_HOLD_WEAK")
-            _tally_reject(
-                reject_trigger_counts, reject_trigger_symbols, symbol,
-                f"CVD_DIVERGENCE_PRICE_HOLD_WEAK | triggers={result.get('signal_trigger')}",
-            )
+            _reject_after_signal("CVD_DIVERGENCE_PRICE_HOLD_WEAK")
             return
 
     plan, status = risk_manager.build_trade_plan(result, balance)

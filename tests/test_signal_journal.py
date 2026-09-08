@@ -150,6 +150,88 @@ class RejectJournalTests(unittest.TestCase):
                           side_effect=OSError("disk full")):
             signal_journal.append_rejected_signal("BTCUSDT", "EMA_TREND_MIXED", _reject_result())
 
+    # --- the POST-signal shape (main.py's own gates) -------------------
+    # These carry a full SUCCESS dict: no diag_* keys at all, every value
+    # under its plain name, side under "signal", trigger under
+    # "signal_trigger". Same columns must come out.
+
+    def _post_signal_result(self, **overrides):
+        base = {
+            "signal": "BUY",
+            "signal_trigger": "OB_FVG_RETEST",
+            "entry_price": 42.75,
+            "atr": 0.9,
+            "efficiency_ratio": 0.31,
+            "premium_discount_zone": "DISCOUNT",
+            "zone_direction": "BULLISH",
+            "entry_range_position": 0.44,
+            "ltf_ema_regime": "BULLISH",
+            "htf_ema_regime": "BULLISH",
+            "ema_trend_bucket": "BOTH_AGREE",
+            "htf_trend_live": "BULLISH",
+            "ltf_trend_live": "BULLISH",
+            "confirmation_available": 13,
+            "confirmation_favourable": 7,
+        }
+        base.update(overrides)
+        return base
+
+    def test_a_post_signal_reject_writes_the_same_columns_from_plain_names(self):
+        signal_journal.append_rejected_signal(
+            "ETHUSDT", "WEAK_CONFLUENCE", self._post_signal_result(),
+            candle_open_time=1788660000000,
+        )
+        row = self._rows()[0]
+
+        self.assertEqual(row["symbol"], "ETHUSDT")
+        self.assertEqual(row["side"], "BUY")
+        self.assertEqual(row["signal_trigger"], "OB_FVG_RETEST")
+        self.assertEqual(row["entry_price"], "42.75")
+        self.assertEqual(row["premium_discount_zone"], "DISCOUNT")
+        self.assertEqual(row["zone_direction"], "BULLISH")
+        self.assertEqual(row["ema_trend_bucket"], "BOTH_AGREE")
+
+    def test_a_post_signal_reject_records_the_confluence_counts(self):
+        # The whole point of F2: without these the row says the gate fired
+        # but not by how much, so the threshold could never be re-swept.
+        signal_journal.append_rejected_signal(
+            "ETHUSDT", "WEAK_CONFLUENCE", self._post_signal_result(),
+        )
+        row = self._rows()[0]
+
+        self.assertEqual(row["confirmation_available"], "13")
+        self.assertEqual(row["confirmation_favourable"], "7")
+
+    def test_a_zero_confluence_count_is_written_not_left_blank(self):
+        signal_journal.append_rejected_signal(
+            "ETHUSDT", "WEAK_CONFLUENCE",
+            self._post_signal_result(confirmation_favourable=0),
+        )
+        self.assertEqual(self._rows()[0]["confirmation_favourable"], "0")
+
+    def test_a_pre_signal_reject_leaves_the_confluence_counts_blank(self):
+        # main.py only resolves them after evaluate() returns, so a
+        # pre-signal reject genuinely never had them.
+        signal_journal.append_rejected_signal(
+            "BTCUSDT", "ENTRY_RANGE_POSITION", _reject_result(),
+        )
+        row = self._rows()[0]
+
+        self.assertEqual(row["confirmation_available"], "")
+        self.assertEqual(row["confirmation_favourable"], "")
+
+    def test_diag_keys_still_win_over_plain_names_when_both_exist(self):
+        # A reject dict carries "signal": None alongside diag_side - the
+        # diag_* value must be the one that lands, never the None.
+        signal_journal.append_rejected_signal(
+            "BTCUSDT", "ENTRY_RANGE_POSITION",
+            _reject_result(signal=None, premium_discount_zone="DISCOUNT"),
+        )
+        row = self._rows()[0]
+
+        self.assertEqual(row["side"], "SELL")
+        self.assertEqual(row["premium_discount_zone"], "PREMIUM")
+
 
 class SignalJournalTests(unittest.TestCase):
     def setUp(self):
