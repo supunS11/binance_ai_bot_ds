@@ -2675,6 +2675,15 @@ EXECUTION_MODE = os.getenv("EXECUTION_MODE", "SHADOW").strip().upper()
 # easier target than today's 2R. Any future promotion decision must re-score
 # on current geometry rather than trust historic journalled outcomes, because
 # the config those outcomes were produced under has moved underneath them.
+#
+# 2026-09-09 (same day) - REVERTED to shadow-only by the operator after 2 live
+# signals (one SL_HIT, one that never filled). That is far short of the ~30 the
+# revert criterion asked for, so it is a discretionary risk call rather than a
+# measured refutation: the promotion evidence is neither confirmed nor
+# contradicted by two data points. Do not cite this revert as evidence the
+# analysis above was wrong - it is evidence only that the operator chose not to
+# carry the uncertainty. The shadow journal keeps filling either way, so the
+# question stays open and answerable on a real sample later.
 SHADOW_ONLY_TRIGGERS = env_str_list("SHADOW_ONLY_TRIGGERS", [])
 # Write a row to data/signal_rejects.csv for candidates a gate turned away,
 # so a gate that is ON stops permanently discarding its own counterfactual.
