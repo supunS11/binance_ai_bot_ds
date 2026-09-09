@@ -1027,14 +1027,29 @@ MIN_CONFIRMATION_FIELDS_AVAILABLE = env_int("MIN_CONFIRMATION_FIELDS_AVAILABLE",
 # here means "at least 7 of 13". 0 disables the band entirely, restoring the
 # original reject-everything-below-the-bar behaviour.
 CONFLUENCE_SHADOW_PROBE_RATIO = env_float("CONFLUENCE_SHADOW_PROBE_RATIO", 0.0)
-# Triggers excluded from the probe. CVD_DIVERGENCE by default because it is
-# already in SHADOW_ONLY_TRIGGERS - its candidates are shadow either way, so
-# admitting them would add nothing while swamping the sample: 11 of the 12
-# most recent WEAK_CONFLUENCE rejects were CVD_DIVERGENCE. Excluding it
-# keeps the probe population equal to "trades that would otherwise have been
-# REAL", which is the only population the question is about.
+# Triggers excluded from the probe. The rule this list exists to enforce is
+# "keep the probe population equal to trades that would otherwise have been
+# REAL" - that is the only population the question is about.
+#
+# Shipped 2026-09-08 as ["CVD_DIVERGENCE"], correctly at the time: that
+# trigger was in SHADOW_ONLY_TRIGGERS, so its band candidates were shadow
+# either way and admitting them would have added nothing while swamping the
+# sample (11 of the 12 most recent WEAK_CONFLUENCE rejects were
+# CVD_DIVERGENCE).
+#
+# Emptied 2026-09-09 when CVD_DIVERGENCE was PROMOTED to live. Its band
+# candidates are now exactly "trades that would otherwise have been real",
+# so the same rule that once excluded them now REQUIRES them. Leaving the
+# exclusion in place would have starved the probe: 46 of 46 WEAK_CONFLUENCE
+# rejects in the window after promotion carried that trigger, and the probe
+# recorded zero candidates in 8 hours.
+#
+# NOTE FOR WHOEVER EDITS THIS NEXT: env_str_list falls back to the DEFAULT
+# on an empty env value, so an empty list cannot be expressed from .env
+# alone - it has to be the default here too. That is why this is [] rather
+# than a blank line in .env doing the work.
 CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS = env_str_list(
-    "CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS", ["CVD_DIVERGENCE"]
+    "CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS", []
 )
 # Boolean "favorable" readings derived from efficiency_ratio/funding_rate/
 # long_short_ratio - journaled independently (the blended confluence_score
@@ -2641,6 +2656,25 @@ EXECUTION_MODE = os.getenv("EXECUTION_MODE", "SHADOW").strip().upper()
 # default the same way every other mechanism in this file does. Names must
 # match signal_engine.py's signal_trigger values - case-insensitive, see
 # env_str_list above (comma-split, stripped, uppercased).
+#
+# 2026-09-09 - CVD_DIVERGENCE EARNED ITS LIVE DEFAULT and was removed from
+# the live .env list. This is the mechanism working exactly as designed: a
+# trigger with no track record ran shadow, accumulated 207 journaled trades,
+# and was then judged on real evidence rather than on how it was doing in
+# the bot's own optimistic-looking shadow outcomes.
+#
+# The measurement that promoted it (see .env for the full table): those 207
+# had already passed every gate, so they are precisely the population that
+# would have traded live. Re-scored on real 5m paths under today's geometry
+# and filtered by MIN_CONFIRMATION_AGREEMENT_RATIO, the surviving 35 returned
+# +9.46/trade at ~4.1 trades/day, positive in BOTH halves.
+#
+# THE METHODOLOGICAL POINT WORTH KEEPING: the journalled shadow outcomes said
+# 86% win; the real-path replay said 41%. The gap was NOT a broken simulator -
+# those trades ran a median 1.03R static-ROI target with DCA enabled, an far
+# easier target than today's 2R. Any future promotion decision must re-score
+# on current geometry rather than trust historic journalled outcomes, because
+# the config those outcomes were produced under has moved underneath them.
 SHADOW_ONLY_TRIGGERS = env_str_list("SHADOW_ONLY_TRIGGERS", [])
 # Write a row to data/signal_rejects.csv for candidates a gate turned away,
 # so a gate that is ON stops permanently discarding its own counterfactual.
