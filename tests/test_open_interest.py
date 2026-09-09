@@ -58,6 +58,63 @@ class OpenInterestEngineTests(unittest.TestCase):
         # Baseline should be 1000 (in-window), not 500 (stale) -> +10%, not +120%.
         self.assertAlmostEqual(snapshot["oi_change_pct"], 10.0)
 
+    # 2026-09-09 - a STALE feed must read as "cannot measure", never as a
+    # fabricated flat 0.0. The old code fell back to comparing latest_value
+    # against itself, so a symbol whose polling stalled reported OI as
+    # perfectly flat forever; oi_rising is `oi_change_pct > 0`, so every one
+    # of those became a silent FALSE in the confluence count. 21% of all
+    # journalled readings were exactly 0.0 because of this.
+
+    def test_stale_feed_reports_none_not_a_fabricated_zero(self):
+        engine = OpenInterestEngine()
+
+        with patch.object(config, "OI_LOOKBACK_SECONDS", 900):
+            engine.record("BTCUSDT", 1000, timestamp=1000)
+            engine.record("BTCUSDT", 1100, timestamp=1500)
+
+            # every sample is now older than the lookback window
+            snapshot = engine.snapshot("BTCUSDT", now=1500 + 901)
+
+        self.assertIsNone(snapshot["oi_change_pct"])
+        self.assertEqual(snapshot["oi_value"], 1100)
+
+    def test_only_one_sample_inside_the_window_reports_none(self):
+        # Two samples exist, but only the newest is in-window - there is
+        # nothing to measure a change AGAINST.
+        engine = OpenInterestEngine()
+
+        with patch.object(config, "OI_LOOKBACK_SECONDS", 100):
+            engine.record("BTCUSDT", 1000, timestamp=0)
+            engine.record("BTCUSDT", 1100, timestamp=1000)
+
+            snapshot = engine.snapshot("BTCUSDT", now=1000)
+
+        self.assertIsNone(snapshot["oi_change_pct"])
+
+    def test_a_genuine_zero_change_is_still_reported_as_zero(self):
+        # The fix must not swallow a REAL flat reading - two in-window
+        # samples at the same value is measurable, and it is 0.0.
+        engine = OpenInterestEngine()
+
+        with patch.object(config, "OI_LOOKBACK_SECONDS", 900):
+            engine.record("BTCUSDT", 1000, timestamp=1000)
+            engine.record("BTCUSDT", 1000, timestamp=1500)
+
+            snapshot = engine.snapshot("BTCUSDT", now=1500)
+
+        self.assertEqual(snapshot["oi_change_pct"], 0.0)
+
+    def test_a_fresh_feed_is_unaffected_by_the_fix(self):
+        engine = OpenInterestEngine()
+
+        with patch.object(config, "OI_LOOKBACK_SECONDS", 900):
+            for i, value in enumerate((1000, 1050, 1100)):
+                engine.record("BTCUSDT", value, timestamp=1000 + i * 100)
+
+            snapshot = engine.snapshot("BTCUSDT", now=1200)
+
+        self.assertAlmostEqual(snapshot["oi_change_pct"], 10.0)
+
     def test_ignores_none_and_negative_values(self):
         engine = OpenInterestEngine()
         engine.record("BTCUSDT", None, timestamp=1000)

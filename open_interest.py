@@ -104,7 +104,28 @@ class OpenInterestEngine:
             }
 
         cutoff = now - lookback
-        baseline_value = next((value for ts, value in series if ts >= cutoff), latest_value)
+        window = [value for ts, value in series if ts >= cutoff]
+        # A change needs TWO readings inside the window. Fewer than that is
+        # "we cannot measure it", which must read as None so every consumer
+        # fails open - the same convention every gate in signal_engine uses.
+        #
+        # THIS USED TO BE `next(..., latest_value)`, i.e. it fell back to
+        # comparing the latest value against ITSELF and reported a change of
+        # EXACTLY 0.0 with available=True. Real consequence (found 2026-09-09):
+        # once a symbol's polling stalls for longer than OI_LOOKBACK_SECONDS,
+        # every sample drops out of the window and the engine reported "OI
+        # perfectly flat" indefinitely instead of "no data". 21% of all
+        # journalled oi_change_pct readings were exactly 0.0 because of this,
+        # and since oi_rising is `oi_change_pct > 0`, every one of them became
+        # a silent FALSE - an unearned vote against the trade in the
+        # confluence count, and a bogus input to cross_exchange_oi.
+        # compute_agreement. Same class of failure as the WS_DEPTH_SPEED_MS
+        # bug: a dead feed that looks like data instead of an outage.
+        #
+        # Deliberately NOT flipping `available` to False here: oi_value itself
+        # is still a real (if stale) reading and other callers use it. The
+        # narrow claim being fixed is only "we can quote a change".
+        baseline_value = window[0] if len(window) >= 2 else None
         oi_change_pct = (
             round((latest_value - baseline_value) / baseline_value * 100, 4)
             if baseline_value
