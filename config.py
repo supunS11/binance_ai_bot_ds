@@ -141,6 +141,22 @@ WS_DEPTH_LEVELS = os.getenv("WS_DEPTH_LEVELS", "20")
 WS_DEPTH_SPEED_MS = os.getenv("WS_DEPTH_SPEED_MS", "100ms")
 WS_STALE_SECONDS = env_float("WS_STALE_SECONDS", 45)
 WS_WATCHDOG_INTERVAL_SECONDS = env_float("WS_WATCHDOG_INTERVAL_SECONDS", 15)
+# Hard ceiling on how long ws_client._close_websockets may spend closing a
+# batch of sockets, after which the un-closed ones are ABANDONED.
+#
+# REAL INCIDENT (2026-09-09, ~8.7 hours of silent downtime): a keepalive
+# cascade killed the market and depth sockets, and a watchlist refresh landed
+# in the same second. main.py's _refresh_watchlist calls feed.stop(), which
+# calls _close_websockets, which closed each socket SERIALLY with no bound.
+# One socket's close() never returned ("TimeoutError: timed out while closing
+# connection"), so the MAIN LOOP blocked inside it forever - process alive at
+# 0% CPU, 7 of ~20 threads left, all parked on futex_wait_queue. The bot was
+# dead but looked running, and nothing noticed until it was checked by hand.
+#
+# The internal watchdog cannot cover this: it is one of the threads that dies.
+# Abandoning a socket is safe - its reader loop already exits on the
+# generation bump, and the OS reclaims the fd when the process does.
+WS_CLOSE_TIMEOUT_SECONDS = env_float("WS_CLOSE_TIMEOUT_SECONDS", 5)
 WS_RESTART_COOLDOWN_SECONDS = env_float("WS_RESTART_COOLDOWN_SECONDS", 30)
 # How many LTF candle closes of CVD history order_flow.CVDEngine retains
 # per symbol (see CVDEngine.finalize_candle/cvd_history) - backs

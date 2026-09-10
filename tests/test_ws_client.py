@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -52,6 +54,55 @@ class DepthStreamNameTests(unittest.TestCase):
     def test_levels_still_come_from_config(self):
         self.assertEqual(
             self._names("100ms", levels=5), ["btcusdt@depth5@100ms", "ethusdt@depth5@100ms"])
+
+
+class CloseWebsocketsTests(unittest.TestCase):
+    """config.WS_CLOSE_TIMEOUT_SECONDS - THE REGRESSION THIS GUARDS is 8.7
+    hours of silent downtime on 2026-09-09: one socket's close() never
+    returned, and because stop() is called from main.py's _refresh_watchlist
+    on the MAIN loop, the whole bot wedged at 0% CPU while still looking
+    alive. Closing must be bounded, always."""
+
+    def test_a_socket_that_never_closes_does_not_block_the_caller(self):
+        forever = threading.Event()
+        self.addCleanup(forever.set)          # never leave the thread parked
+
+        hung = Mock()
+        hung.close.side_effect = lambda: forever.wait()
+        healthy = Mock()
+
+        with patch.object(config, "WS_CLOSE_TIMEOUT_SECONDS", 0.3):
+            started = time.monotonic()
+            RealtimeMarketData._close_websockets([hung, healthy])
+            elapsed = time.monotonic() - started
+
+        # returned on the deadline, not on the hung socket
+        self.assertLess(elapsed, 3.0)
+        # and the healthy one was still closed despite its neighbour hanging
+        healthy.close.assert_called_once()
+
+    def test_all_healthy_sockets_are_closed(self):
+        sockets = [Mock() for _ in range(5)]
+
+        with patch.object(config, "WS_CLOSE_TIMEOUT_SECONDS", 5):
+            RealtimeMarketData._close_websockets(sockets)
+
+        for socket in sockets:
+            socket.close.assert_called_once()
+
+    def test_a_raising_close_is_logged_and_does_not_propagate(self):
+        boom = Mock()
+        boom.close.side_effect = RuntimeError("boom")
+        healthy = Mock()
+
+        with patch.object(config, "WS_CLOSE_TIMEOUT_SECONDS", 5):
+            RealtimeMarketData._close_websockets([boom, healthy])
+
+        healthy.close.assert_called_once()
+
+    def test_empty_batch_is_a_noop(self):
+        with patch.object(config, "WS_CLOSE_TIMEOUT_SECONDS", 5):
+            RealtimeMarketData._close_websockets([])
 
 
 class CandleStoreTests(unittest.TestCase):

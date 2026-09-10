@@ -335,11 +335,53 @@ class RealtimeMarketData:
 
     @staticmethod
     def _close_websockets(websockets):
-        for websocket in websockets:
+        """Close a batch of sockets WITHOUT ever blocking the caller
+        indefinitely - see config.WS_CLOSE_TIMEOUT_SECONDS for the incident.
+
+        Each close runs on its own daemon thread and the batch is joined
+        against one shared deadline, so this returns in at most
+        WS_CLOSE_TIMEOUT_SECONDS no matter how many sockets refuse to shut
+        down. A socket still closing when the deadline passes is ABANDONED:
+        its reader loop already exits on the generation bump, and the fd is
+        reclaimed with the process.
+
+        This must stay bounded because stop() is called from main.py's
+        _refresh_watchlist on the MAIN loop - a single unbounded close there
+        takes the whole bot down silently, which is exactly what happened."""
+        if not websockets:
+            return
+
+        def _close_one(websocket):
             try:
                 websocket.close()
             except Exception as exc:
                 log_warning(f"Realtime market data websocket close warning: {exc}")
+
+        threads = []
+
+        for websocket in websockets:
+            thread = threading.Thread(
+                target=_close_one,
+                args=(websocket,),
+                name="realtime-ws-close",
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+
+        deadline = time.monotonic() + max(float(config.WS_CLOSE_TIMEOUT_SECONDS), 0)
+
+        for thread in threads:
+            thread.join(max(deadline - time.monotonic(), 0))
+
+        abandoned = sum(1 for thread in threads if thread.is_alive())
+
+        if abandoned:
+            log_warning(
+                f"Realtime market data: abandoned {abandoned} of {len(threads)} "
+                f"websocket close(s) after {config.WS_CLOSE_TIMEOUT_SECONDS}s - "
+                f"continuing rather than blocking the caller"
+            )
 
     # =========================
     # WATCHDOG
