@@ -457,6 +457,22 @@ class SignalJournalTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["entry_range_position"], "0.74")
 
+    def test_append_signal_writes_entry_range_probe_as_a_clean_boolean(self):
+        # config.ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX - the second,
+        # independent probe column, mirroring confluence_probe's own
+        # bool()-not-raw-value treatment: a clean True/False for every row,
+        # never blank, including rows written before this field existed.
+        signal_journal.append_signal(_signal(entry_range_probe=True), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["entry_range_probe"], "True")
+
+    def test_append_signal_writes_entry_range_probe_false_when_absent(self):
+        signal_journal.append_signal(_signal(), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["entry_range_probe"], "False")
+
     def test_append_signal_leaves_entry_range_position_blank_when_absent(self):
         # None on a degenerate range (high == low) or too little history.
         signal_journal.append_signal(_signal(), _plan())

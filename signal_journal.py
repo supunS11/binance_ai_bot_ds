@@ -34,6 +34,12 @@ FIELDNAMES = [
     # probe cohort is indistinguishable from ordinary SHADOW_ONLY_TRIGGERS
     # shadows, and measuring it as its own population is the entire point.
     "confluence_probe",
+    # config.ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX - the second, INDEPENDENT
+    # probe band, mirroring confluence_probe exactly one gate over. A
+    # separate column on purpose (not merged into confluence_probe) - a
+    # trade could even be governed by both bands at once, and the two
+    # populations must stay distinguishable for future analysis.
+    "entry_range_probe",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising",
@@ -335,6 +341,10 @@ def append_signal(signal, plan, execution_result=None):
         # the CSV for every row, including the ones written before the probe
         # existed on the result dict.
         "confluence_probe": bool(signal.get("confluence_probe")),
+        # bool(), not the raw value - same reason as confluence_probe: a
+        # clean True/False for every row, including ones written before
+        # this field existed on the result dict.
+        "entry_range_probe": bool(signal.get("entry_range_probe")),
         "zone_retracement_pct": signal.get("zone_retracement_pct"),
         "order_block_present": bool(signal.get("order_block")),
         "fvg_present": bool(signal.get("fvg")),

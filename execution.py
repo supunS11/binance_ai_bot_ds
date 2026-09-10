@@ -26,10 +26,11 @@ def _is_shadow_mode(plan):
       2. its trigger is individually forced into shadow via
          config.SHADOW_ONLY_TRIGGERS (evidence-gate philosophy applied
          per-trigger instead of bot-wide - see that config's own comment)
-      3. `force_shadow` was set on the plan - currently only by
-         config.CONFLUENCE_SHADOW_PROBE_RATIO, for a candidate that fell
-         under the live confluence bar and is being tracked in shadow to
-         find out whether that bar is set correctly
+      3. `force_shadow` was set on the plan - currently by either
+         config.CONFLUENCE_SHADOW_PROBE_RATIO or config.ENTRY_RANGE_
+         POSITION_SHADOW_PROBE_MAX, for a candidate that fell under one of
+         those two live bars and is being tracked in shadow to find out
+         whether that bar is set correctly
 
     One-directional in every case: these can only ADD shadow behavior on
     top of LIVE, never force a plan LIVE while EXECUTION_MODE is SHADOW or

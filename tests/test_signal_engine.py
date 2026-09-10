@@ -12,11 +12,10 @@ import signal_engine
 
 def _ltf_candles(close, range_high=None, range_low=None):
     # range_high/range_low let a test place `close` anywhere inside the
-    # recent high-low band, which is all config.ENTRY_RANGE_POSITION_REJECT_
-    # ENABLED reads. Defaults reproduce the original fixture exactly, so the
-    # default entry_range_position is 0.67 for a BUY / 0.33 for a SELL -
-    # both inside ENTRY_RANGE_POSITION_MAX, leaving every existing test
-    # unaffected.
+    # recent high-low band, which is what entry_range_position is computed
+    # from (its gate now lives in main.py - see tests/test_main.py).
+    # Defaults reproduce the original fixture exactly, so the default
+    # entry_range_position is 0.67 for a BUY / 0.33 for a SELL.
     return [{
         "open_time": 0, "open": close - 0.5,
         "high": close + 0.5 if range_high is None else range_high,
@@ -885,109 +884,51 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "SELL")
         self.assertEqual(result["ema_trend_bucket"], "BOTH_OPPOSED")
 
-    # config.ENTRY_RANGE_POSITION_REJECT_ENABLED (2026-09-05) - "don't buy
-    # the top of the range, don't sell the bottom". 0.0 = ideal end for the
-    # side, 1.0 = worst end. _run's default ltf_close is 93.0 with the
-    # fixture's own high/low, giving 0.67 for a BUY - deliberately below
-    # ENTRY_RANGE_POSITION_MAX so nothing else in this suite changes.
+    # entry_range_position (2026-09-05) - "how bad is this entry for THIS
+    # side". 0.0 = ideal end, 1.0 = worst end. _run's default ltf_close is
+    # 93.0 with the fixture's own high/low, giving 0.67 for a BUY.
     #
-    # See config.py: every measurement says this gate COSTS money (winners
-    # entered higher in the range than losers, in both halves). It exists on
-    # the operator's explicit decision and ships off.
-
-    def test_entry_range_position_rejects_a_buy_at_the_top_of_the_range(self):
-        # close 93 sits exactly at the range high -> position 1.0
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
-            result = self._run(ltf_range_low=83.0, ltf_range_high=93.0)
-
-        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
-
-    def test_entry_range_position_rejects_a_sell_at_the_bottom_of_the_range(self):
-        # standard SELL fixture (close 108) sitting at the range LOW, which
-        # for a SELL is the worst end -> position 1.0
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
-            result = self._run(
-                ltf_close=108.0, ltf_range_low=108.0, ltf_range_high=118.0,
-                cvd={"available": True, "cvd_score": -0.5},
-                depth={"available": True, "depth_imbalance": -0.2},
-                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
-                sweep_direction="BEARISH", ema_value=115.0,
-            )
-
-        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
+    # 2026-09-10 - the GATE (config.ENTRY_RANGE_POSITION_REJECT_ENABLED)
+    # moved out of this module entirely, to main.py's _evaluate_symbol, so
+    # it could get the same shadow-probe treatment MIN_CONFIRMATION_
+    # AGREEMENT_RATIO already has there (see main.py and tests/test_main.py's
+    # EvaluateSymbolStabilityTests for the gate/probe tests). This class only
+    # keeps the tests that are genuinely about the COMPUTATION - the value
+    # itself is still produced here, unconditionally, regardless of the flag.
 
     def test_entry_range_position_allows_a_buy_near_the_bottom(self):
         # close 93 just above the low of an 83-113 range -> position 0.33
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
-            result = self._run(ltf_range_low=83.0, ltf_range_high=113.0)
+        result = self._run(ltf_range_low=83.0, ltf_range_high=113.0)
 
         self.assertEqual(result["signal"], "BUY")
         self.assertAlmostEqual(result["entry_range_position"], 1.0 / 3.0, places=4)
 
     def test_entry_range_position_allows_a_sell_near_the_top(self):
         # close 108 at the TOP of a 98-108 range is the IDEAL end for a SELL
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
-            result = self._run(
-                ltf_close=108.0, ltf_range_low=98.0, ltf_range_high=108.0,
-                cvd={"available": True, "cvd_score": -0.5},
-                depth={"available": True, "depth_imbalance": -0.2},
-                htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
-                sweep_direction="BEARISH", ema_value=115.0,
-            )
+        result = self._run(
+            ltf_close=108.0, ltf_range_low=98.0, ltf_range_high=108.0,
+            cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+            sweep_direction="BEARISH", ema_value=115.0,
+        )
 
         self.assertEqual(result["signal"], "SELL")
         self.assertAlmostEqual(result["entry_range_position"], 0.0, places=4)
 
-    def test_entry_range_position_exactly_at_the_threshold_passes(self):
-        # strict > , so a position landing exactly on the max is allowed.
-        # low 83, high 95.5 -> (93-83)/12.5 = 0.80
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
-             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 0.80):
-            result = self._run(ltf_range_low=83.0, ltf_range_high=95.5)
-
-        self.assertEqual(result["signal"], "BUY")
-        self.assertAlmostEqual(result["entry_range_position"], 0.80, places=6)
-
-    def test_entry_range_position_gate_off_never_rejects(self):
-        # the one-flag revert path - identical setup to the first test here
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", False):
-            result = self._run(ltf_range_low=83.0, ltf_range_high=93.0)
-
-        self.assertEqual(result["signal"], "BUY")
-        self.assertAlmostEqual(result["entry_range_position"], 1.0, places=4)
-
-    def test_entry_range_position_degenerate_range_never_rejects(self):
+    def test_entry_range_position_degenerate_range_computes_none(self):
         # high == low: no range to place the entry in, so fail open rather
         # than divide by zero or guess.
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True):
-            result = self._run(ltf_range_low=93.0, ltf_range_high=93.0)
+        result = self._run(ltf_range_low=93.0, ltf_range_high=93.0)
 
         self.assertEqual(result["signal"], "BUY")
         self.assertIsNone(result["entry_range_position"])
 
-    def test_entry_range_position_applies_to_reversal_triggers_too(self):
-        # universal, like LTF_TREND_OPPOSED and EMA_TREND_MIXED - never read
-        # from trigger_gate_profiles(). Same CVD_DIVERGENCE fixture that
-        # passes without this gate.
-        analysis = dict(LTF_BULLISH_BREAK)
-        analysis["live_break"] = {"broken": False}
-
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
-             patch.object(config, "CVD_DIVERGENCE_TRIGGER_ENABLED", True):
-            result = self._run(
-                ltf_analysis=analysis, sweep_direction=None,
-                divergence_direction="BULLISH", divergence_level=88,
-                divergence_open_time=555,
-                ltf_range_low=83.0, ltf_range_high=93.0,
-            )
-
-        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
-
-    def test_entry_range_position_is_journaled_with_the_gate_off(self):
-        # ships OFF but must still populate, so the live distribution can be
-        # compared against the measured medians (winners 0.64/losers 0.48).
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", False):
-            result = self._run()
+    def test_entry_range_position_is_always_computed_on_a_successful_signal(self):
+        # Unconditional - main.py's gate (and the live distribution vs the
+        # measured medians, winners 0.64/losers 0.48) both depend on this
+        # being present on every real signal, gate-enabled or not.
+        result = self._run()
 
         self.assertIsNotNone(result["entry_range_position"])
 
@@ -4153,9 +4094,9 @@ class RejectDiagnosticsTests(unittest.TestCase):
         # THE REGRESSION THIS GUARDS: EMA_TREND_MIXED rejects before
         # price_zone is computed. Reading it from _diag() without the early
         # init raises UnboundLocalError - which would kill the scan loop for
-        # that symbol, not merely lose a journal row. (ENTRY_RANGE_POSITION
-        # used to be in the same position; since 2026-09-08 its gate runs
-        # after the zone gates, so it is covered by GateOrderingTests below.)
+        # that symbol, not merely lose a journal row. (ENTRY_RANGE_POSITION's
+        # own gate has since moved entirely out of signal_engine, to
+        # main.py - see tests/test_main.py's EvaluateSymbolStabilityTests.)
         with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True):
             result = self._run(ltf_ema_fast=110.0, ltf_ema_slow=90.0,
                                htf_ema_fast=90.0, htf_ema_slow=110.0)
@@ -4179,55 +4120,11 @@ class RejectDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["signal"], "BUY")
         self.assertFalse([k for k in result if k.startswith("diag_")])
 
-
-class GateOrderingTests(unittest.TestCase):
-    """2026-09-08 - entry_range_position is COMPUTED early but GATED after the
-    zone gates, and price_zone is computed early rather than at its own gate.
-
-    Why it matters: ENTRY_RANGE_POSITION used to run first, so 2256 of 3909
-    live reject rows (58%) recorded it as the reason with a BLANK
-    premium_discount_zone - the reject journal could not answer the question
-    it was built for. Measured across six regime windows, the zone gates
-    already block 92% of what this gate blocks, so running it first mostly
-    claimed their work.
-
-    Reordering CANNOT change which candidates survive: every gate involved is
-    a pure predicate over values hoisted before _evaluate_direction runs, and
-    all are hard rejects, so the surviving set is order-independent. These
-    tests pin both halves of that - the diagnostics improved, the outcome
-    did not move."""
-
-    def _run(self, **kwargs):
-        return SignalEngineTests._run(self, **kwargs)
-
-    def _force_entry_range_reject(self):
-        # MAX below 0 makes any real entry_range_position exceed it, without
-        # needing to hand-craft a range in the fixture candles.
-        return (patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True),
-                patch.object(config, "ENTRY_RANGE_POSITION_MAX", -1.0))
-
-    def test_entry_range_reject_now_carries_the_zone_diagnostics(self):
-        # THE ACTUAL FIX. Before the reorder this reject had
-        # diag_premium_discount_zone = None.
-        a, b = self._force_entry_range_reject()
-        with a, b:
-            result = self._run()
-
-        self.assertEqual(result["reason"], "ENTRY_RANGE_POSITION")
-        self.assertEqual(result["diag_premium_discount_zone"], "DISCOUNT")
-        self.assertIsNotNone(result["diag_entry_range_position"])
-
-    def test_when_both_fire_the_zone_gate_is_the_reported_reason(self):
-        # Attribution moves to the gate doing the real work.
-        a, b = self._force_entry_range_reject()
-        with a, b, patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
-            result = self._run(zone_direction="BEARISH")
-
-        self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
-
     def test_a_zone_reject_still_carries_entry_range_position(self):
-        # The naive fix (moving the COMPUTATION too) would have traded one
-        # blank column for another. Both must be populated.
+        # entry_range_position is computed early, unconditionally - a zone
+        # reject (or any other) must still carry it on the diag snapshot,
+        # regardless of where entry_range_position's OWN gate happens to
+        # live (main.py, as of 2026-09-10 - see tests/test_main.py).
         with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True):
             result = self._run(zone_direction="BEARISH")
 
@@ -4235,21 +4132,19 @@ class GateOrderingTests(unittest.TestCase):
         self.assertIsNotNone(result["diag_entry_range_position"])
         self.assertEqual(result["diag_premium_discount_zone"], "DISCOUNT")
 
-    def test_entry_range_alone_still_rejects(self):
-        # Outcome unchanged: a candidate failing ONLY this gate is still
-        # turned away, exactly as before the reorder.
-        a, b = self._force_entry_range_reject()
-        with a, b:
-            result = self._run()
 
-        self.assertIsNone(result["signal"])
-
-    def test_a_passing_entry_range_still_signals(self):
-        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
-             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 2.0):
-            result = self._run()
-
-        self.assertEqual(result["signal"], "BUY")
+# GateOrderingTests removed 2026-09-10. ENTRY_RANGE_POSITION's enforcement
+# moved entirely out of signal_engine (see main.py's _evaluate_symbol, next
+# to MIN_CONFIRMATION_AGREEMENT_RATIO) so it could get the same shadow-probe
+# treatment that gate already has - signal_engine can only return a real
+# signal or signal=None, never "flagged for shadow". With only one hard-
+# reject site left (main.py, not two competing ones here), the reorder-
+# for-attribution property this class existed to pin no longer has anything
+# to pin. See tests/test_main.py's EvaluateSymbolStabilityTests for the
+# equivalent post-signal gate/probe coverage, and
+# RejectDiagnosticsTests.test_a_zone_reject_still_carries_entry_range_
+# position above for the one assertion from this class that was actually
+# about _diag(), not ordering.
 
 
 class ZoneDirectionGateTests(unittest.TestCase):

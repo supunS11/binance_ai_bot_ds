@@ -1100,38 +1100,33 @@ def evaluate(
             return _reject(f"ZONE_DIRECTION_OPPOSED zone_direction={zone_direction}")
 
         # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - "don't buy the top of
-        # the range, don't sell the bottom", on the 1h range
-        # (ENTRY_RANGE_LOOKBACK_CANDLES). Value computed further up; only the
-        # check lives here.
+        # the range, don't sell the bottom" - the ENFORCEMENT moved to
+        # main.py's _evaluate_symbol on 2026-09-10, immediately after
+        # evaluate() returns, so it could get the same shadow-probe
+        # treatment MIN_CONFIRMATION_AGREEMENT_RATIO already has there
+        # (config.ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX). This function can
+        # only ever return a real signal or a reject with signal=None -
+        # never "a signal flagged for shadow" - so the gate check itself
+        # cannot live here anymore.
         #
-        # ORDER MATTERS ONLY FOR ATTRIBUTION, NEVER FOR OUTCOME. Every gate
-        # between here and the entry_range_position computation is a pure
-        # predicate over values hoisted before _evaluate_direction runs, and
-        # all of them are hard rejects - so the set of candidates that
-        # survive is identical whatever the order. What order decides is
-        # which reason gets recorded, and that is why this now runs LAST of
-        # the three range-position gates rather than first.
+        # entry_range_position ITSELF is UNCHANGED: still computed above,
+        # unconditionally, regardless of the flag. Every reject below this
+        # point (NOT_IN_OTE, NO_ORDER_BLOCK_OR_FVG, ...) still carries
+        # diag_entry_range_position, and every real signal still carries
+        # entry_range_position on the success dict. Full evidence/history
+        # for the threshold itself is in config.py, unmoved.
         #
-        # It is placed after the zone gates specifically because it is very
-        # nearly redundant with them: measured across six 20-day regime
-        # windows, the premium/discount + zone_direction pair already blocked
-        # 92% of everything this gate blocks, leaving it a unique
-        # contribution of 21 candidates out of 2393 (under 1%). Running it
-        # first made it look like the dominant filter (58% of live reject
-        # rows) when it was mostly claiming the zone gates' work.
-        #
-        # READ config.py BEFORE RAISING THE STRICTNESS. The live-journal
-        # evidence says this gate costs money (winners entered HIGHER in the
-        # range than losers, in both halves); the six-window regime replay
-        # disagrees and says it helps in bear markets. Those two measure
-        # different populations and both are recorded in config.py. It ships
-        # off; it is on at the operator's explicit and informed decision.
-        if (
-            config.ENTRY_RANGE_POSITION_REJECT_ENABLED
-            and entry_range_position is not None
-            and entry_range_position > config.ENTRY_RANGE_POSITION_MAX
-        ):
-            return _reject("ENTRY_RANGE_POSITION")
+        # Side effect worth knowing, not a bug to fix: config.
+        # TRIGGER_QUALITY_RANKING_ENABLED means a different trigger than
+        # "first attempted" can now be the one whose candidate reaches
+        # main.py's gate, since candidates that used to die here now
+        # continue through the rest of this pipeline first. The check
+        # itself is still universal (same side, same entry_range_position)
+        # regardless of which trigger wins, so this only changes which
+        # trigger gets attributed in the reject/probe row, never whether a
+        # live trade results - the same "order changes attribution, never
+        # outcome" property this gate's own 2026-09-08 reorder already
+        # established.
 
         # NOT_IN_OTE checks whether CURRENT PRICE sits within a Fibonacci
         # retracement band of the OVERALL HTF range - the classic "break,

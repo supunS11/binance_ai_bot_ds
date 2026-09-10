@@ -844,6 +844,204 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
 
         plan_mock.assert_called_once()
 
+    # config.ENTRY_RANGE_POSITION_REJECT_ENABLED / ENTRY_RANGE_POSITION_
+    # SHADOW_PROBE_MAX - 2026-09-10. Enforcement moved here from
+    # signal_engine (which can only return a signal or signal=None, never
+    # "flagged for shadow" - see that file's own comment at the old site).
+    # Checked FIRST of every post-signal gate in _evaluate_symbol, before
+    # the on-demand long/short REST fetch just above.
+
+    def _entry_range_result(self, position, trigger="EMA_PULLBACK", signal="BUY"):
+        return {"signal": signal, "symbol": "BTCUSDT", "signal_trigger": trigger,
+                "entry_range_position": position}
+
+    def test_entry_range_position_rejects_before_building_a_plan(self):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        reject_counts, reject_symbols = Counter(), {}
+        reject_trigger_counts, reject_trigger_symbols = Counter(), {}
+        result = self._entry_range_result(0.90)
+
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 0.80), \
+             patch.object(config, "ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX", 0.0), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan") as plan_mock:
+            main._evaluate_symbol(
+                feed, "BTCUSDT", positions, 1000, reject_counts, reject_symbols, None,
+                reject_trigger_counts, reject_trigger_symbols,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(reject_counts["ENTRY_RANGE_POSITION"], 1)
+        self.assertIn("BTCUSDT", reject_symbols["ENTRY_RANGE_POSITION"])
+        self.assertEqual(
+            reject_trigger_counts["ENTRY_RANGE_POSITION | triggers=EMA_PULLBACK"], 1)
+
+    def test_entry_range_position_exactly_at_max_is_not_rejected(self):
+        # strict >, mirrors signal_engine's old boundary test.
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 0.80), \
+             patch.object(signal_engine, "evaluate",
+                          return_value=self._entry_range_result(0.80)), \
+             patch.object(risk_manager, "build_trade_plan",
+                          return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(_FakeFeed(), "BTCUSDT", _FakePositions(), 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_entry_range_position_gate_off_never_rejects(self):
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", False), \
+             patch.object(signal_engine, "evaluate",
+                          return_value=self._entry_range_result(0.99)), \
+             patch.object(risk_manager, "build_trade_plan",
+                          return_value=(None, "SL_TOO_TIGHT")) as plan_mock:
+            main._evaluate_symbol(_FakeFeed(), "BTCUSDT", _FakePositions(), 1000)
+
+        plan_mock.assert_called_once()
+
+    def test_entry_range_position_reject_skips_the_long_short_rest_call(self):
+        # THE PLACEMENT DECISION. Checked before the on-demand REST fetch so
+        # a candidate about to be rejected/probed here never pays for it.
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 0.80), \
+             patch.object(config, "ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX", 0.0), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", True), \
+             patch.object(signal_engine, "evaluate",
+                          return_value=self._entry_range_result(0.90)), \
+             patch.object(exchange, "get_long_short_ratio") as ls_mock:
+            main._evaluate_symbol(_FakeFeed(), "BTCUSDT", _FakePositions(), 1000)
+
+        ls_mock.assert_not_called()
+
+    def _run_entry_range_probe(self, position, probe=0.90, live_max=0.80,
+                                exclude=(), trigger="EMA_PULLBACK"):
+        feed = _FakeFeed()
+        positions = _FakePositions()
+        plan = {"symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+                "tp1_price": 102, "tp2_price": 104}
+        rejects = Counter()
+
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", live_max), \
+             patch.object(config, "ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX", probe), \
+             patch.object(config, "ENTRY_RANGE_POSITION_SHADOW_PROBE_EXCLUDE_TRIGGERS",
+                           list(exclude)), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(signal_engine, "evaluate",
+                          return_value=self._entry_range_result(position, trigger=trigger)), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(plan, "OK")), \
+             patch.object(execution, "enter_trade",
+                          return_value={"ok": True, "shadow": True}) as enter_trade, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_1"):
+            main._evaluate_symbol(feed, "BTCUSDT", positions, 1000,
+                                  rejects, {}, None, Counter(), {})
+        return enter_trade, rejects
+
+    def test_an_entry_range_probe_candidate_is_routed_to_shadow_not_rejected(self):
+        enter_trade, rejects = self._run_entry_range_probe(0.85)  # between 0.80/0.90
+
+        self.assertEqual(rejects["ENTRY_RANGE_POSITION"], 0)
+        self.assertTrue(enter_trade.call_args.args[0]["force_shadow"])
+
+    def test_an_entry_range_probe_candidate_can_never_place_a_real_order(self):
+        # THE SAFETY PROPERTY. Even with the bot fully LIVE and no
+        # shadow-only triggers configured, this plan must still be shadow -
+        # otherwise the probe would be risking real capital on exactly the
+        # candidates the live bar was set to refuse.
+        enter_trade, _ = self._run_entry_range_probe(0.85)
+        plan = enter_trade.call_args.args[0]
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", []):
+            self.assertTrue(execution._is_shadow_mode(plan))
+
+    def test_a_candidate_at_the_live_bar_is_untouched_by_the_entry_range_probe(self):
+        enter_trade, rejects = self._run_entry_range_probe(0.70)  # under 0.80 entirely
+
+        self.assertEqual(rejects["ENTRY_RANGE_POSITION"], 0)
+        plan = enter_trade.call_args.args[0]
+        self.assertFalse(plan["force_shadow"])
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", []):
+            self.assertFalse(execution._is_shadow_mode(plan))
+
+    def test_an_excluded_trigger_is_still_rejected_for_entry_range(self):
+        enter_trade, rejects = self._run_entry_range_probe(
+            0.85, exclude=("CVD_DIVERGENCE",), trigger="CVD_DIVERGENCE")
+
+        self.assertEqual(rejects["ENTRY_RANGE_POSITION"], 1)
+        enter_trade.assert_not_called()
+
+    def test_past_the_entry_range_probe_ceiling_is_still_rejected(self):
+        enter_trade, rejects = self._run_entry_range_probe(0.95)  # past probe=0.90
+
+        self.assertEqual(rejects["ENTRY_RANGE_POSITION"], 1)
+        enter_trade.assert_not_called()
+
+    def test_entry_range_probe_at_zero_restores_plain_rejection(self):
+        enter_trade, rejects = self._run_entry_range_probe(0.85, probe=0.0)
+
+        self.assertEqual(rejects["ENTRY_RANGE_POSITION"], 1)
+        enter_trade.assert_not_called()
+
+    def test_the_entry_range_probe_flag_reaches_the_result_for_journalling(self):
+        result = self._entry_range_result(0.85)
+        self._run_entry_range_probe_with_result(result)
+
+        self.assertTrue(result["entry_range_probe"])
+
+    def test_a_normal_entry_range_signal_records_the_flag_as_false_not_missing(self):
+        result = self._entry_range_result(0.50)
+        self._run_entry_range_probe_with_result(result)
+
+        self.assertIs(result["entry_range_probe"], False)
+
+    def _run_entry_range_probe_with_result(self, result, probe=0.90, live_max=0.80):
+        # Like _run_entry_range_probe, but takes a pre-built result dict
+        # directly (so the caller can assert on it afterward) rather than
+        # constructing one from a bare position value.
+        plan = {"symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+                "tp1_price": 102, "tp2_price": 104}
+
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", live_max), \
+             patch.object(config, "ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX", probe), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(plan, "OK")), \
+             patch.object(execution, "enter_trade", return_value={"ok": True}), \
+             patch.object(signal_journal, "append_signal", return_value="x"):
+            main._evaluate_symbol(_FakeFeed(), "BTCUSDT", _FakePositions(), 1000)
+
+    def test_both_probes_can_apply_at_once_and_force_shadow_is_their_or(self):
+        # confluence_probe AND entry_range_probe true simultaneously - the
+        # OR in plan["force_shadow"] must still hold, not silently drop one.
+        result = self._entry_range_result(0.85)
+        result.update(self._confluence_result(available=13, favourable=7))
+        result["entry_range_position"] = 0.85
+        plan = {"symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+                "tp1_price": 102, "tp2_price": 104}
+
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 0.80), \
+             patch.object(config, "ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX", 0.90), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 0), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.65), \
+             patch.object(config, "CONFLUENCE_SHADOW_PROBE_RATIO", 0.53), \
+             patch.object(config, "CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS", []), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(plan, "OK")), \
+             patch.object(execution, "enter_trade",
+                          return_value={"ok": True}) as enter_trade, \
+             patch.object(signal_journal, "append_signal", return_value="x"):
+            main._evaluate_symbol(_FakeFeed(), "BTCUSDT", _FakePositions(), 1000)
+
+        self.assertTrue(result["entry_range_probe"])
+        self.assertTrue(result["confluence_probe"])
+        self.assertTrue(enter_trade.call_args.args[0]["force_shadow"])
+
     # config.MIN_CONFIRMATION_AGREEMENT_RATIO / MIN_CONFIRMATION_FIELDS_
     # AVAILABLE - 2026-09-07, the confluence floor. Closes the fail-open
     # exposure: every gate in signal_engine skips itself on missing data, so

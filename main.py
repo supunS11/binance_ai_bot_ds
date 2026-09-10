@@ -294,6 +294,52 @@ def _evaluate_symbol(
         )
         _journal_reject(symbol, reason, result, ltf_candles)
 
+    # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - moved here 2026-09-10
+    # from signal_engine._evaluate_direction (see that file's own comment
+    # at the old site for the full evidence/history, left in place there).
+    # entry_range_position is STILL computed there, unconditionally, exactly
+    # as before - only the ENFORCEMENT moved, so it could gain the same
+    # shadow-probe treatment MIN_CONFIRMATION_AGREEMENT_RATIO already has
+    # below: signal_engine can only ever return a real signal or a reject
+    # with signal=None, never "a signal flagged for shadow".
+    #
+    # Checked FIRST of every post-signal gate in this function:
+    # entry_range_position needs no REST fetch (it's already fully resolved
+    # on `result`), so rejecting or probing here first saves the on-demand
+    # long/short REST call just below for a candidate that's about to be
+    # turned away anyway - same "rejecting first saves a REST call"
+    # reasoning this file already applies elsewhere.
+    entry_range_probe = False
+    entry_range_position = result.get("entry_range_position")
+
+    if (
+        config.ENTRY_RANGE_POSITION_REJECT_ENABLED
+        and entry_range_position is not None
+        and entry_range_position > config.ENTRY_RANGE_POSITION_MAX
+    ):
+        # config.ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX - a candidate that
+        # fails the live bar but not by more than this ceiling becomes a
+        # SHADOW trade instead of a REJECT, same one-directional shape as
+        # CONFLUENCE_SHADOW_PROBE_RATIO below. This can only ever turn a
+        # reject into a shadow trade.
+        if (
+            config.ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX > 0
+            and entry_range_position <= config.ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX
+            and result.get("signal_trigger")
+            not in config.ENTRY_RANGE_POSITION_SHADOW_PROBE_EXCLUDE_TRIGGERS
+        ):
+            entry_range_probe = True
+            log_info(
+                f"{symbol} entry_range_position {entry_range_position:.3f} is past the "
+                f"live {config.ENTRY_RANGE_POSITION_MAX} bar - routing to SHADOW as a "
+                f"probe (trigger={result.get('signal_trigger')})"
+            )
+        else:
+            _reject_after_signal("ENTRY_RANGE_POSITION")
+            return
+
+    result["entry_range_probe"] = entry_range_probe
+
     # Long/short ratio: fetched on-demand here, not polled across the
     # whole watchlist like the fields above - see
     # config.LONG_SHORT_RATIO_ENABLED for why (no bulk endpoint exists for
@@ -520,10 +566,12 @@ def _evaluate_symbol(
     # config.SHADOW_ONLY_TRIGGERS - execution._is_shadow_mode reads this
     # off plan, not result, to decide per-trigger shadow routing.
     plan["signal_trigger"] = result.get("signal_trigger")
-    # config.CONFLUENCE_SHADOW_PROBE_RATIO - same route, second reason a
-    # plan can be forced shadow. Always assigned (never left absent) so the
-    # flag is unambiguous rather than a missing-key default.
-    plan["force_shadow"] = confluence_probe
+    # config.CONFLUENCE_SHADOW_PROBE_RATIO / config.ENTRY_RANGE_POSITION_
+    # SHADOW_PROBE_MAX - two INDEPENDENT probes, checked separately, each
+    # with its own knobs and its own journal column. A plan is forced
+    # shadow if EITHER one caught it - always assigned (never left absent)
+    # so the flag is unambiguous rather than a missing-key default.
+    plan["force_shadow"] = confluence_probe or entry_range_probe
     # config.RETRACEMENT_DEPTH_AWARE_ENABLED - execution.enter_trade_
     # retracement reads this off plan, not result, to decide whether to
     # rest deeper/wait longer for a weak-depth_imbalance entry.

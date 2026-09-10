@@ -1849,6 +1849,51 @@ ENTRY_RANGE_POSITION_REJECT_ENABLED = env_bool(
     "ENTRY_RANGE_POSITION_REJECT_ENABLED", "False"
 )
 ENTRY_RANGE_POSITION_MAX = env_float("ENTRY_RANGE_POSITION_MAX", 0.80)
+# --- the shadow probe band (2026-09-10) -----------------------------------
+# Mirrors CONFLUENCE_SHADOW_PROBE_RATIO's design exactly - see that flag's
+# own comment for the full rationale. ENTRY_RANGE_POSITION_REJECT_ENABLED
+# can never be re-tested from live data on its own: every candidate it
+# rejects simply disappears. That matters MORE here than for confluence -
+# this gate's own blocked-population replay (see ENTRY_RANGE_POSITION_
+# REJECT_ENABLED's comment below) already FLIPS SIGN split-half (H1
+# -1317.34, H2 +548.38, n=67) and is inconsistent day-by-day (09-08
+# -48.63/trade n=21, 09-09 +5.48/trade n=46). That is real uncertainty, not
+# an established-bad gate - exactly the population a probe is for.
+#
+# A candidate that fails ENTRY_RANGE_POSITION_MAX but not by more than this
+# ceiling is NOT rejected - it is routed to SHADOW, with the real
+# risk_manager plan, real TP/SL, real position_manager tracking and a real
+# journaled outcome, never touching capital. One-directional: it can only
+# ever turn a REJECT into a SHADOW trade. A candidate already inside
+# ENTRY_RANGE_POSITION_MAX is untouched by this.
+#
+# Enforced in main.py, not here - signal_engine._evaluate_direction can
+# only return a real signal or a reject with signal=None, never "a signal
+# flagged for shadow" (see this file's own comment at the old gate site,
+# a few lines below, for why the enforcement moved out of this module).
+# entry_range_position itself is still computed here, unconditionally,
+# exactly as before.
+#
+# Ships OFF (0.0), same first-ship convention as CONFLUENCE_SHADOW_PROBE_
+# RATIO - there is no evidenced "right" ceiling yet. 0 doubles as an
+# explicit disable: entry_range_position is only ever compared against
+# this once it has ALREADY exceeded a positive ENTRY_RANGE_POSITION_MAX,
+# so a ceiling of 0 can never be satisfied.
+ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX = env_float(
+    "ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX", 0.0
+)
+# Triggers excluded from the probe - same purpose as CONFLUENCE_SHADOW_
+# PROBE_EXCLUDE_TRIGGERS: keep the probe population equal to "trades that
+# would otherwise have been REAL". A trigger already in SHADOW_ONLY_
+# TRIGGERS gains nothing from being admitted here while swamping the
+# sample - list it here if that ever applies.
+#
+# env_str_list falls back to the DEFAULT on an empty env value, so an
+# empty list cannot be expressed from .env alone - it has to be the
+# default here too, same note as CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS.
+ENTRY_RANGE_POSITION_SHADOW_PROBE_EXCLUDE_TRIGGERS = env_str_list(
+    "ENTRY_RANGE_POSITION_SHADOW_PROBE_EXCLUDE_TRIGGERS", []
+)
 # 24 -> 12 (2026-09-06, real evidence). SUPERSEDES the earlier note here,
 # which said 12 "separated winners from losers less well" and was measured
 # on winner/loser SEPARATION only - the same mistake that made this whole
@@ -2749,6 +2794,29 @@ REJECT_JOURNAL_ENABLED = env_bool("REJECT_JOURNAL_ENABLED", "False")
 # are wired into the same journalling path and are one env edit from being
 # recorded too - left OFF by default only to keep the file focused on the
 # question actually open right now.
+#
+# 2026-09-10 - MARKET_CHOPPY / NO_LIVE_STRUCTURE_BREAK / AGAINST_HTF_BIAS
+# added. These are UNIVERSE pre-filters, not signal-quality gates - they
+# fire before the zone/entry-range/confluence gates even run, and the
+# funnel investigation that day found the zone family responsible for 91%
+# of distinct blocked setups, but that number is only ever measurable
+# against the reasons THIS list already covers. Nothing upstream of the
+# zone gates has ever been counted in distinct-setups/day terms - only in
+# heartbeat per-tick counts, which overcount a chopping symbol every 5s.
+# Adding these three closes that gap so the full funnel is finally visible,
+# in case a real opportunity is sitting upstream of the zone gates that
+# today's data cannot show. Purely additive - no trade is gated any
+# differently by this, only what gets journalled.
+#
+# Volume note: unlike the deep gates, these fire for a large share of the
+# whole watchlist every hour (a symbol with no live structure break at all
+# is the common case, not the exception). Dedup is still per (symbol,
+# reason, 1h candle) so this adds at most ~3 rows/symbol/hour, not one per
+# tick - but on a ~400-symbol watchlist that can still add several thousand
+# rows/day on top of the existing ~2-8k. Still small in absolute size
+# (each row is ~200 bytes) and disk has ample headroom, but the file will
+# grow noticeably faster than before - worth knowing if signal_rejects.csv
+# suddenly looks much bigger.
 REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
     "ZONE_DIRECTION_OPPOSED",
     "ENTRY_RANGE_POSITION",
@@ -2757,6 +2825,9 @@ REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
     "EMA_TREND_MIXED",
     "WEAK_CONFLUENCE",
     "INSUFFICIENT_CONFIRMATION_DATA",
+    "MARKET_CHOPPY",
+    "NO_LIVE_STRUCTURE_BREAK",
+    "AGAINST_HTF_BIAS",
 ])
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)
