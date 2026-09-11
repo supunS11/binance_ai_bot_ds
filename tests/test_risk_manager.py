@@ -471,6 +471,108 @@ class NearestFavorableStructureRTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class Tp1PoolTouchesTests(unittest.TestCase):
+    """Informational-only field (2026-09-11, see the function's own
+    docstring) - reports the touch count of whichever pool
+    _find_structure_target would ACTUALLY select for TP1, by recomputing
+    the identical selection (same buffer, same min/max R window, same
+    nearest-first tie-break) rather than reading any state off that
+    function. This mirrors NearestFavorableStructureRTests' own fixture
+    shapes deliberately - same TP1 window, same pool shapes - so a
+    reader can compare the two directly."""
+
+    def test_reports_the_touches_of_the_qualifying_pool(self):
+        pools = [{"type": "BUY_SIDE", "price": 104, "touches": 3}]
+
+        result = risk_manager.tp1_pool_touches(
+            pools, 100, "BUY", risk_distance=2, atr=0)
+
+        self.assertEqual(result, 3)
+
+    def test_picks_the_nearest_qualifying_pool_not_the_stronger_one(self):
+        # THE WHOLE POINT of the investigation this instruments: today's
+        # selection is nearest-only, touches never break the tie. A
+        # closer, weaker pool must still win over a farther, stronger one.
+        pools = [
+            {"type": "BUY_SIDE", "price": 104, "touches": 2},  # 2R, nearer
+            {"type": "BUY_SIDE", "price": 108, "touches": 9},  # 4R, stronger
+        ]
+
+        result = risk_manager.tp1_pool_touches(
+            pools, 100, "BUY", risk_distance=2, atr=0)
+
+        self.assertEqual(result, 2)
+
+    def test_a_pool_too_close_to_clear_tp1_min_r_is_ignored(self):
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 3.0):
+            pools = [{"type": "BUY_SIDE", "price": 101, "touches": 5}]  # 0.5R
+
+            result = risk_manager.tp1_pool_touches(
+                pools, 100, "BUY", risk_distance=2, atr=0)
+
+        self.assertIsNone(result)
+
+    def test_a_pool_beyond_tp1_max_r_is_ignored(self):
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 3.0):
+            pools = [{"type": "BUY_SIDE", "price": 120, "touches": 5}]  # 10R
+
+            result = risk_manager.tp1_pool_touches(
+                pools, 100, "BUY", risk_distance=2, atr=0)
+
+        self.assertIsNone(result)
+
+    def test_sell_side_mirrors_buy(self):
+        pools = [{"type": "SELL_SIDE", "price": 96, "touches": 4}]
+
+        result = risk_manager.tp1_pool_touches(
+            pools, 100, "SELL", risk_distance=2, atr=0)
+
+        self.assertEqual(result, 4)
+
+    def test_wrong_side_pool_type_is_ignored(self):
+        pools = [{"type": "SELL_SIDE", "price": 104, "touches": 5}]
+
+        result = risk_manager.tp1_pool_touches(
+            pools, 100, "BUY", risk_distance=2, atr=0)
+
+        self.assertIsNone(result)
+
+    def test_no_pools_returns_none(self):
+        result = risk_manager.tp1_pool_touches(
+            None, 100, "BUY", risk_distance=2, atr=0)
+
+        self.assertIsNone(result)
+
+    def test_zero_risk_distance_returns_none(self):
+        pools = [{"type": "BUY_SIDE", "price": 104, "touches": 3}]
+
+        result = risk_manager.tp1_pool_touches(
+            pools, 100, "BUY", risk_distance=0, atr=0)
+
+        self.assertIsNone(result)
+
+    def test_atr_buffer_can_push_a_marginal_pool_out_of_the_window(self):
+        # Same buffer-before-the-R-test discipline _find_structure_target
+        # itself uses (see STRUCTURE_TARGET_ATR_BUFFER's own comment) -
+        # this function must apply it identically or it will report a
+        # pool that was never actually eligible.
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 3.0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0.25):
+            # raw distance 4.2 / risk_distance 2 = 2.1R, just above the 2R
+            # min - but the buffer is in PRICE units (atr * 0.25 = 0.25),
+            # not R units: effective distance 4.2 - 0.25 = 3.95 -> 1.975R,
+            # which drops below the 2R min.
+            pools = [{"type": "BUY_SIDE", "price": 104.2, "touches": 3}]
+
+            result = risk_manager.tp1_pool_touches(
+                pools, 100, "BUY", risk_distance=2, atr=1)
+
+        self.assertIsNone(result)
+
+
 class ComputeBreakevenPriceTests(unittest.TestCase):
     def test_buy_breakeven_is_slightly_above_entry(self):
         with patch.object(config, "BREAKEVEN_BUFFER_PCT", 0.02):
@@ -961,6 +1063,61 @@ class BuildTradePlanTests(unittest.TestCase):
 
         self.assertEqual(status, "OK")
         self.assertIsNone(plan["nearest_favorable_sr_r"])
+
+    # config.TP1_R_MULTIPLE / TP1_MAX_R_MULTIPLE - tp1_source/tp1_pool_
+    # touches threading (2026-09-11). Same three fixtures needed to prove
+    # each of the three real paths tp1_price can take.
+
+    def test_tp1_source_is_pool_when_a_pool_actually_backs_tp1(self):
+        signal = dict(
+            self._signal(),
+            liquidity_pools=[{"type": "BUY_SIDE", "price": 102, "touches": 4}],
+        )
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(plan["tp1_price"], 102)  # the real pool, not the pure R-multiple
+        self.assertEqual(plan["tp1_source"], "POOL")
+        self.assertEqual(plan["tp1_pool_touches"], 4)
+
+    def test_tp1_source_is_fallback_when_no_pool_qualifies(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            plan, status = risk_manager.build_trade_plan(self._signal(), balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(plan["tp1_source"], "FALLBACK")
+        self.assertIsNone(plan["tp1_pool_touches"])
+
+    def test_tp1_source_is_static_roi_and_touches_is_none_under_that_mode(self):
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "TP_STATIC_ROI_ENABLED", True), \
+             patch.object(config, "TP_TARGET_ROI_PCT", 40), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP2_MAX_R_MULTIPLE", 10.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            # a pool exists and WOULD qualify, but must be ignored: static
+            # ROI is a distinct third path, not "pool" just because one
+            # happens to be nearby.
+            signal = dict(
+                self._signal(),
+                liquidity_pools=[{"type": "BUY_SIDE", "price": 102, "touches": 4}],
+            )
+            plan, status = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(plan["tp1_source"], "STATIC_ROI")
+        self.assertIsNone(plan["tp1_pool_touches"])
 
     def test_plan_is_unaffected_by_limit_entry_mode(self):
         # config.LIMIT_ENTRY_MODE_ENABLED only changes execution.py/

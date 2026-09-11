@@ -26,7 +26,13 @@ JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "signal_journal.csv"
 FIELDNAMES = [
     "timestamp", "trade_id", "symbol", "side", "entry_price", "sl_price",
     "tp1_price", "tp2_price", "quantity", "risk_distance_pct",
-    "structure_level", "entry_extension_r", "nearest_favorable_sr_r", "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "ltf_trend_live", "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket", "entry_range_position", "htf_trend_swing_age_hours", "premium_discount_zone",
+    "structure_level", "entry_extension_r", "nearest_favorable_sr_r",
+    # config.TP1_R_MULTIPLE / TP1_MAX_R_MULTIPLE - risk_manager.tp1_pool_
+    # touches' own docstring has the full rationale. tp1_source is one of
+    # POOL/FALLBACK/STATIC_ROI; tp1_pool_touches is only non-blank when
+    # tp1_source is POOL.
+    "tp1_source", "tp1_pool_touches",
+    "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "ltf_trend_live", "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket", "entry_range_position", "htf_trend_swing_age_hours", "premium_discount_zone",
     "zone_direction",
     "confirmation_available", "confirmation_favourable",
     # config.CONFLUENCE_SHADOW_PROBE_RATIO - True marks a trade that is in
@@ -287,6 +293,8 @@ def append_signal(signal, plan, execution_result=None):
         # config.OI_RISING_REJECT_ENABLED for the precedent of promoting a
         # field like this to a real gate once evidence supports it.
         "nearest_favorable_sr_r": plan.get("nearest_favorable_sr_r"),
+        "tp1_source": plan.get("tp1_source"),
+        "tp1_pool_touches": plan.get("tp1_pool_touches"),
         # How many candles old the underlying setup (CHoCH/FVG/order
         # block/divergence) actually was at entry - distinct from
         # entry_extension_r (that's price distance from the level, not

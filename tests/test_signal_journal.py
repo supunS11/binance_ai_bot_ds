@@ -613,6 +613,22 @@ class SignalJournalTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["nearest_favorable_sr_r"], "0.5")
 
+    def test_append_signal_writes_tp1_source_and_touches_when_pool_backed(self):
+        signal_journal.append_signal(
+            _signal(), _plan(tp1_source="POOL", tp1_pool_touches=3))
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["tp1_source"], "POOL")
+        self.assertEqual(rows[0]["tp1_pool_touches"], "3")
+
+    def test_append_signal_writes_fallback_source_with_blank_touches(self):
+        signal_journal.append_signal(
+            _signal(), _plan(tp1_source="FALLBACK", tp1_pool_touches=None))
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["tp1_source"], "FALLBACK")
+        self.assertEqual(rows[0]["tp1_pool_touches"], "")
+
     def test_append_signal_writes_setup_age_candles_from_the_signal(self):
         signal_journal.append_signal(_signal(setup_age_candles=6), _plan())
         rows = self._read_rows()

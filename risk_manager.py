@@ -125,6 +125,74 @@ def nearest_favorable_structure_r(pools, entry_price, side, risk_distance):
     return abs(price - entry_price) / risk_distance
 
 
+def tp1_pool_touches(pools, entry_price, side, risk_distance, atr=None):
+    """Informational only - the STRENGTH (touches - see market_structure.
+    find_liquidity_pools) of whichever pool _find_structure_target would
+    actually select for TP1, purely so the journal can record it.
+
+    Real gap found 2026-09-11: find_liquidity_pools already computes
+    `touches` per pool, but _find_structure_target's own selection (nearest
+    QUALIFYING pool - see that function's docstring) never reads it, and
+    nothing downstream ever journaled it either - so there was no way to
+    test whether a stronger (more-touched) pool behind TP1 predicts a
+    better outcome than a weaker one, or whether TP1 even resolves to a
+    real pool at all versus falling through to the fixed-R fallback.
+    Reconstructing this after the fact for 35 recent trades found only 7
+    were ever pool-backed at all (28 fell through to the fallback), and
+    only 4 of those 7 could be verified - nowhere near enough to answer
+    either question. Same "log it before gating on it" rollout as
+    nearest_favorable_structure_r above and oi_rising/ema_aligned
+    originally - see config.OI_RISING_REJECT_ENABLED for what happens once
+    evidence exists.
+
+    Deliberately recomputes _find_structure_target's own candidate
+    selection from scratch (same buffer/min/max/nearest-first logic)
+    rather than having that function return extra state - keeps this pure
+    and side-effect-free, so it can never influence what TP1 actually is,
+    exactly the same non-interference guarantee nearest_favorable_
+    structure_r already has. Always uses TP1_R_MULTIPLE/TP1_MAX_R_MULTIPLE
+    specifically, matching compute_targets' own TP1 resolution - meaningless
+    for TP2, not evaluated there.
+
+    Returns None if no pool qualified in TP1's own R-window (TP1 fell
+    through to the fixed-R fallback, or - under config.TP_STATIC_ROI_
+    ENABLED - to a fixed ROI% target; the caller distinguishes those two
+    cases, this function only answers "was there a qualifying pool")."""
+    if risk_distance <= 0:
+        return None
+
+    tp1_min = max(float(config.TP1_R_MULTIPLE), 0)
+    tp1_max = max(float(config.TP1_MAX_R_MULTIPLE), tp1_min)
+    buffer = float(atr or 0) * max(float(config.STRUCTURE_TARGET_ATR_BUFFER), 0)
+    min_distance = tp1_min * risk_distance
+    max_distance = tp1_max * risk_distance if tp1_max else None
+    pool_type = "BUY_SIDE" if side == "BUY" else "SELL_SIDE"
+    candidates = []
+
+    for pool in pools or []:
+        price = pool.get("price")
+
+        if price is None or pool.get("type") != pool_type:
+            continue
+
+        distance = (price - entry_price) if side == "BUY" else (entry_price - price)
+        effective_distance = distance - buffer
+
+        if effective_distance <= 0 or effective_distance < min_distance:
+            continue
+
+        if max_distance is not None and effective_distance > max_distance:
+            continue
+
+        candidates.append((effective_distance, pool.get("touches")))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda candidate: candidate[0])
+    return candidates[0][1]
+
+
 def _find_dca_level(pools, entry_price, side):
     """Nearest real liquidity-pool price in the ADVERSE direction from
     entry - the mirror image of _find_structure_target's favorable-side
@@ -811,6 +879,20 @@ def build_trade_plan(signal, balance):
         signal.get("liquidity_pools"), entry_price, side, risk_distance
     )
 
+    # config.TP_STATIC_ROI_ENABLED - a static-ROI TP1 was never resolved
+    # against a pool at all, so the touches lookup is meaningless there;
+    # tp1_source records which of the three real paths tp1_price actually
+    # took (informational only, mirrors nearest_favorable_sr_r above).
+    if config.TP_STATIC_ROI_ENABLED:
+        tp1_pool_touches_ = None
+        tp1_source = "STATIC_ROI"
+    else:
+        tp1_pool_touches_ = tp1_pool_touches(
+            signal.get("liquidity_pools"), entry_price, side, risk_distance,
+            atr=signal.get("atr"),
+        )
+        tp1_source = "POOL" if tp1_pool_touches_ is not None else "FALLBACK"
+
     if config.RISK_BASED_POSITION_SIZING_ENABLED:
         quantity = calculate_position_size(
             balance, entry_price, sl_price, symbol,
@@ -878,6 +960,10 @@ def build_trade_plan(signal, balance):
         # above if structure_level/risk_distance weren't available.
         "entry_extension_r": extension_r,
         "nearest_favorable_sr_r": nearest_favorable_sr_r,
+        # config.TP1_R_MULTIPLE / TP1_MAX_R_MULTIPLE - see tp1_pool_touches'
+        # own docstring for why this exists. Informational only.
+        "tp1_pool_touches": tp1_pool_touches_,
+        "tp1_source": tp1_source,
         "dca_price": dca_price,
         "dca_quantity": dca_quantity,
         # Carried through so position_manager._execute_dca can recompute
