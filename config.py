@@ -2817,6 +2817,35 @@ REJECT_JOURNAL_ENABLED = env_bool("REJECT_JOURNAL_ENABLED", "False")
 # (each row is ~200 bytes) and disk has ample headroom, but the file will
 # grow noticeably faster than before - worth knowing if signal_rejects.csv
 # suddenly looks much bigger.
+#
+# 2026-09-11 - WHALE_AGAINST / DEPTH_TREND_UNSTABLE / CRASH_MODE added.
+# Full-gate audit (operator request) found both WHALE_AGAINST_REJECT_
+# ENABLED and DEPTH_TREND_MIN_CONSISTENCY_REJECT_ENABLED are live in .env
+# despite each one's own config.py comment explicitly calling it a "brand
+# new, unvalidated mechanism - default OFF" with zero resolved-trade
+# evidence ever written anywhere, and CRASH_DETECTOR_BLOCK_ENTRIES_ENABLED
+# is live despite its own comment describing a two-phase rollout that
+# should stay off until the detector's been "observed firing correctly
+# against real data a few more times" - no such observation is recorded.
+# None of the three has ever had a blocked candidate journaled, and none
+# cracks the heartbeat's top-8 reject-reason line (same invisibility
+# problem OI_RISING had before its own dedicated always-on counter), so
+# their true cost has been completely unmeasurable until now. Purely
+# additive, same as the 2026-09-10 batch above - no trade is gated any
+# differently, only what gets journalled. All three run deep in
+# _evaluate_direction (behind HTF bias/zone/OTE/order-block), same low-
+# volume position in the funnel as OI_RISING, so this should NOT reproduce
+# the 2026-09-10 batch's several-thousand-rows/day volume jump.
+#
+# Same-day follow-up: CROSS_EXCHANGE_OI_DISAGREE added too -
+# CROSS_EXCHANGE_OI_AGREE_REJECT_ENABLED is its own "EXPLICIT LIVE TEST,
+# zero resolved-trade evidence" (see its own config.py comment) and had
+# the exact same never-journaled gap as the three above. Same low-volume
+# funnel position, same purely-additive change. VP_ALREADY_EXTENDED
+# deliberately NOT added - the same audit pass proved VP_EXTENSION_
+# REJECT_ENABLED is dead weight (see that flag's own comment) and turned
+# it off, so this reason can no longer fire at all; journaling it would
+# be pure clutter.
 REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
     "ZONE_DIRECTION_OPPOSED",
     "ENTRY_RANGE_POSITION",
@@ -2828,6 +2857,10 @@ REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
     "MARKET_CHOPPY",
     "NO_LIVE_STRUCTURE_BREAK",
     "AGAINST_HTF_BIAS",
+    "WHALE_AGAINST",
+    "DEPTH_TREND_UNSTABLE",
+    "CRASH_MODE",
+    "CROSS_EXCHANGE_OI_DISAGREE",
 ])
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)
