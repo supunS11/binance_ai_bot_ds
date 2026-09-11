@@ -884,6 +884,53 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal"], "SELL")
         self.assertEqual(result["ema_trend_bucket"], "BOTH_OPPOSED")
 
+    def _mixed_sell(self, **kwargs):
+        # want=BEARISH for a SELL: 1h agrees (fast < slow -> BEARISH), 4h
+        # opposes (fast > slow -> BULLISH) - exactly 1 of 2, same MIXED
+        # shape as _mixed_buy's own pair, mirrored for side.
+        return self._run(
+            ltf_close=108.0,
+            cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH, ltf_analysis=LTF_BEARISH_BREAK,
+            sweep_direction="BEARISH", ema_value=115.0,
+            ltf_ema_fast=100.0, ltf_ema_slow=110.0,
+            htf_ema_fast=110.0, htf_ema_slow=100.0,
+            **kwargs
+        )
+
+    # config.EMA_TREND_MIXED_SELL_EXEMPT_ENABLED (2026-09-11) - real replay
+    # of this gate's actual blocked population (n=2037, 2 days) found the
+    # protective value is BUY-only (-13.33/trade avoided, n=211); SELL
+    # (n=1826, ~90% of the population) was a wash (-0.33/trade). Reject-
+    # only-safer: exempting SELL can only let MORE trades through, never
+    # fewer.
+    def test_ema_trend_mixed_sell_exempt_lets_sell_through_when_enabled(self):
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_SELL_EXEMPT_ENABLED", True):
+            result = self._mixed_sell()
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["ema_trend_bucket"], "MIXED")
+
+    def test_ema_trend_mixed_sell_exempt_off_still_rejects_sell(self):
+        # Default is False - the evidence is only 2 days old, so this must
+        # not silently change behavior unless explicitly turned on.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_SELL_EXEMPT_ENABLED", False):
+            result = self._mixed_sell()
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
+    def test_ema_trend_mixed_sell_exempt_does_not_affect_buy(self):
+        # The evidence is BUY-protective - the exemption must stay scoped
+        # to SELL only, never leak into letting a MIXED BUY through too.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_SELL_EXEMPT_ENABLED", True):
+            result = self._mixed_buy()
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
     # entry_range_position (2026-09-05) - "how bad is this entry for THIS
     # side". 0.0 = ideal end, 1.0 = worst end. _run's default ltf_close is
     # 93.0 with the fixture's own high/low, giving 0.67 for a BUY.

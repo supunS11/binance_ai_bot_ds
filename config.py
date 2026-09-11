@@ -759,6 +759,19 @@ LTF_TREND_EMA_PERIOD = env_int("LTF_TREND_EMA_PERIOD", 20)
 # Same "earns a live default only after real forward data" rule as every
 # other entry-affecting mechanism in this file.
 EMA_TREND_MIXED_REJECT_ENABLED = env_bool("EMA_TREND_MIXED_REJECT_ENABLED", "False")
+# 2026-09-11 full-gate audit (real trade-count concern - see this flag's
+# own use in signal_engine.py for the exact condition). Real 5m replay of
+# EMA_TREND_MIXED's ACTUAL blocked population (n=2037 real rejects since
+# it joined REJECT_JOURNAL_REASONS, 2 days): BUY -13.33/trade if let
+# through (n=211, genuinely protective) vs SELL -0.33/trade (n=1826, ~90%
+# of the population, a statistical wash - no benefit is being sacrificed
+# by letting these through). Default OFF - the evidence is only 2 days
+# old, thinner than this project's usual bar, and the operator's own
+# quality-over-quantity priority means this earns immediate use only
+# because it is reject-only-safer (can only ever let MORE trades through,
+# never fewer, and only on a side already shown to gain nothing from
+# blocking) - not a relaxation of anything proven to matter.
+EMA_TREND_MIXED_SELL_EXEMPT_ENABLED = env_bool("EMA_TREND_MIXED_SELL_EXEMPT_ENABLED", "False")
 # Deliberately NOT read from trigger_gate_profiles(), same reasoning as
 # LTF_TREND_FILTER_ENABLED above: the validation applied this to every
 # trigger with no exemption. Here an exemption would point the WRONG way -

@@ -986,7 +986,20 @@ def evaluate(
                 2: "BOTH_AGREE", 1: "MIXED", 0: "BOTH_OPPOSED",
             }[agreeing]
 
-        if config.EMA_TREND_MIXED_REJECT_ENABLED and ema_trend_bucket == "MIXED":
+        # config.EMA_TREND_MIXED_SELL_EXEMPT_ENABLED - 2026-09-11 full-gate
+        # audit, real replay of this gate's actual blocked population
+        # (n=2037 real MIXED rejects, 2 days): BUY candidates it blocks
+        # would have lost -13.33/trade if let through (n=211) - genuinely
+        # protective. SELL candidates (n=1826, ~90% of the population)
+        # were a statistical wash at -0.33/trade - no real benefit is
+        # being sacrificed by letting them through. Reject-only-safer:
+        # this can only ever let MORE trades through, never fewer, and
+        # only on the side already proven to gain nothing from blocking.
+        if (
+            config.EMA_TREND_MIXED_REJECT_ENABLED
+            and ema_trend_bucket == "MIXED"
+            and not (config.EMA_TREND_MIXED_SELL_EXEMPT_ENABLED and side == "SELL")
+        ):
             return _reject("EMA_TREND_MIXED")
 
         # entry_range_position ("how bad is this entry for THIS side" - 0.0 =
