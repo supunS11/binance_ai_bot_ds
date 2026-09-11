@@ -772,6 +772,18 @@ EMA_TREND_MIXED_REJECT_ENABLED = env_bool("EMA_TREND_MIXED_REJECT_ENABLED", "Fal
 # never fewer, and only on a side already shown to gain nothing from
 # blocking) - not a relaxation of anything proven to matter.
 EMA_TREND_MIXED_SELL_EXEMPT_ENABLED = env_bool("EMA_TREND_MIXED_SELL_EXEMPT_ENABLED", "False")
+# 2026-09-11, same-day follow-up - see EMA_TREND_MIXED_SELL_EXEMPT_ENABLED's
+# own comment above and this flag's use in signal_engine.py for the full
+# per-trigger evidence table. Supersedes the side-based flag: ORDER_
+# BLOCK_RETEST is the one trigger whose MIXED population is a net LOSS to
+# block (n=308, +1.28/trade), and it happens to be ~99% SELL - which is
+# why the cruder side-based version looked like it worked. Every other
+# trigger's SELL-side MIXED population is still genuinely protective, so
+# scoping by trigger (not side) avoids giving that up for free. Default
+# empty - matches CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS' own
+# env_str_list gotcha: an empty .env value falls back to this default,
+# never to a non-empty stale list.
+EMA_TREND_MIXED_EXEMPT_TRIGGERS = env_str_list("EMA_TREND_MIXED_EXEMPT_TRIGGERS", [])
 # Deliberately NOT read from trigger_gate_profiles(), same reasoning as
 # LTF_TREND_FILTER_ENABLED above: the validation applied this to every
 # trigger with no exemption. Here an exemption would point the WRONG way -

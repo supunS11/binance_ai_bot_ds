@@ -988,16 +988,41 @@ def evaluate(
 
         # config.EMA_TREND_MIXED_SELL_EXEMPT_ENABLED - 2026-09-11 full-gate
         # audit, real replay of this gate's actual blocked population
-        # (n=2037 real MIXED rejects, 2 days): BUY candidates it blocks
-        # would have lost -13.33/trade if let through (n=211) - genuinely
-        # protective. SELL candidates (n=1826, ~90% of the population)
-        # were a statistical wash at -0.33/trade - no real benefit is
-        # being sacrificed by letting them through. Reject-only-safer:
-        # this can only ever let MORE trades through, never fewer, and
-        # only on the side already proven to gain nothing from blocking.
+        # (n=2037 real MIXED rejects, 2 days) found a BUY/SELL split (BUY
+        # -13.33/trade protective, n=211; SELL -0.33/trade wash, n=1826)
+        # that looked like a clean lever. Superseded same day by the
+        # per-trigger breakdown below, which is strictly more precise:
+        # backing ORDER_BLOCK_RETEST (n=308, 304 of them SELL) out of the
+        # SELL total shows the REST of SELL is actually -0.65/trade if let
+        # through - genuinely worth blocking. The side-based exemption was
+        # only "working" because ORDER_BLOCK_RETEST happens to be ~99%
+        # SELL; it was giving up real protection on every other trigger's
+        # SELL population for no evidence-backed reason. Ships OFF -
+        # config.EMA_TREND_MIXED_EXEMPT_TRIGGERS below is the replacement.
+        #
+        # config.EMA_TREND_MIXED_EXEMPT_TRIGGERS - the per-trigger
+        # breakdown of that same n=2037 population (single-trigger rows
+        # only, to avoid multi-trigger-candle confounds):
+        #   ORDER_BLOCK_RETEST  n=308  +1.28/trade (net LOSS to block)
+        #   CHOCH_RETEST        n= 63  +0.60/trade (near breakeven)
+        #   STRUCTURE_BREAK     n=382  -2.33/trade
+        #   OB_FVG_RETEST       n=353  -3.07/trade
+        #   CVD_DIVERGENCE      n=184  -2.97/trade
+        #   OI_DIVERGENCE       n= 32  -2.73/trade
+        #   LIQUIDITY_SWEEP     n= 21  -6.45/trade
+        #   EMA_PULLBACK        n=136  -8.03/trade
+        # ORDER_BLOCK_RETEST is the one real exception with a real sample
+        # - every other trigger is still genuinely protective when
+        # blocked. Reject-only-safer, same precedent as the flag above:
+        # can only ever let MORE trades through, never fewer, and only
+        # for the one trigger already shown to gain nothing from
+        # blocking. Evidence is 2 days old - thinner than this project's
+        # usual bar - so this earns immediate scoped use on that basis
+        # alone, not as a general relaxation.
         if (
             config.EMA_TREND_MIXED_REJECT_ENABLED
             and ema_trend_bucket == "MIXED"
+            and trigger not in config.EMA_TREND_MIXED_EXEMPT_TRIGGERS
             and not (config.EMA_TREND_MIXED_SELL_EXEMPT_ENABLED and side == "SELL")
         ):
             return _reject("EMA_TREND_MIXED")

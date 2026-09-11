@@ -931,6 +931,63 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(result["reason"], "EMA_TREND_MIXED")
 
+    # config.EMA_TREND_MIXED_EXEMPT_TRIGGERS (2026-09-11, same-day
+    # follow-up) - supersedes the side-based flag above with a per-trigger
+    # one: ORDER_BLOCK_RETEST's MIXED population is a net LOSS to block
+    # (n=308, +1.28/trade) while every other trigger's is still
+    # protective, so this exemption must be scoped to that one trigger,
+    # not the SELL side generally.
+    def _mixed_order_block_retest_sell(self, **kwargs):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        return self._run(
+            ltf_close=108.0,
+            cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+            sweep_direction=None, ema_value=115.0,
+            order_block_retest_direction="BEARISH", order_block_retest_level=88,
+            ltf_ema_fast=100.0, ltf_ema_slow=110.0,
+            htf_ema_fast=110.0, htf_ema_slow=100.0,
+            **kwargs
+        )
+
+    def test_ema_trend_mixed_exempt_triggers_lets_order_block_retest_through(self):
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._mixed_order_block_retest_sell()
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+        self.assertEqual(result["ema_trend_bucket"], "MIXED")
+
+    def test_ema_trend_mixed_exempt_triggers_empty_by_default_still_rejects(self):
+        # env_str_list's own gotcha (CONFLUENCE_SHADOW_PROBE_EXCLUDE_
+        # TRIGGERS already hit this once) - default must be [], never a
+        # stale non-empty list, so an unconfigured deploy stays protected.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_EXEMPT_TRIGGERS", []), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._mixed_order_block_retest_sell()
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
+    def test_ema_trend_mixed_exempt_triggers_does_not_affect_other_triggers(self):
+        # STRUCTURE_BREAK is still genuinely protective (-2.33/trade) -
+        # exempting ORDER_BLOCK_RETEST must not leak into it. A rejected
+        # candidate carries "triggers" (every trigger that attempted this
+        # direction), not "signal_trigger" (only a real signal has that).
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]):
+            result = self._mixed_sell()
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+        # LIQUIDITY_SWEEP also qualifies (sweep_direction="BEARISH" from
+        # _mixed_sell's own fixture) - both attempted this direction and
+        # both hit the gate, same as before this exemption existed.
+        self.assertEqual(result["triggers"], ["LIQUIDITY_SWEEP", "STRUCTURE_BREAK"])
+
     # entry_range_position (2026-09-05) - "how bad is this entry for THIS
     # side". 0.0 = ideal end, 1.0 = worst end. _run's default ltf_close is
     # 93.0 with the fixture's own high/low, giving 0.67 for a BUY.
