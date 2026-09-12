@@ -4448,6 +4448,57 @@ class ZoneDirectionGateTests(unittest.TestCase):
 
         self.assertIn("zone_direction=BEARISH", result["reason"])
 
+    # config.ZONE_DIRECTION_EXEMPT_TRIGGERS (2026-09-12 per-trigger audit -
+    # see that flag's own config.py comment for the full split-half
+    # evidence table). OB_FVG_RETEST/ORDER_BLOCK_RETEST/EMA_PULLBACK all
+    # showed a real, split-half-consistent positive expectancy in their
+    # ZONE_DIRECTION_OPPOSED-blocked population; every other trigger stays
+    # gated. Same reject-only-safer shape as EMA_TREND_MIXED_EXEMPT_
+    # TRIGGERS above.
+    def _order_block_retest_buy_zone_opposed(self, **kwargs):
+        return self._run(
+            sweep_direction=None,
+            ltf_analysis=dict(LTF_BULLISH_BREAK, live_break={"broken": False}),
+            order_block_retest_direction="BULLISH", order_block_retest_level=90,
+            zone_direction="BEARISH",
+            **kwargs
+        )
+
+    def test_zone_direction_exempt_triggers_lets_order_block_retest_through(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True), \
+             patch.object(config, "ZONE_DIRECTION_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._order_block_retest_buy_zone_opposed()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+
+    def test_zone_direction_exempt_triggers_empty_by_default_still_rejects(self):
+        # env_str_list's own gotcha (CONFLUENCE_SHADOW_PROBE_EXCLUDE_
+        # TRIGGERS/EMA_TREND_MIXED_EXEMPT_TRIGGERS already hit this) -
+        # default must be [], never a stale non-empty list.
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True), \
+             patch.object(config, "ZONE_DIRECTION_EXEMPT_TRIGGERS", []), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._order_block_retest_buy_zone_opposed()
+
+        self.assertIsNone(result["signal"])
+        self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
+
+    def test_zone_direction_exempt_triggers_does_not_affect_other_triggers(self):
+        # STRUCTURE_BREAK is NOT in the exempt list (inconclusive evidence,
+        # flips sign between split halves) - exempting ORDER_BLOCK_RETEST
+        # must not leak into it. LIQUIDITY_SWEEP also qualifies here (the
+        # default _run() fixture's own sweep_direction) - both attempted
+        # this direction and both still hit the gate.
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True), \
+             patch.object(config, "ZONE_DIRECTION_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]):
+            result = self._run(zone_direction="BEARISH")
+
+        self.assertIsNone(result["signal"])
+        self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
+        self.assertEqual(result["triggers"], ["LIQUIDITY_SWEEP", "STRUCTURE_BREAK"])
+
 
 class RejectTriggerTaggingTests(unittest.TestCase):
     """A direction-level rejection (inside _evaluate_direction) now also

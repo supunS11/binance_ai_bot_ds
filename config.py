@@ -543,6 +543,44 @@ ZONE_DIRECTION_REJECT_ENABLED = env_bool("ZONE_DIRECTION_REJECT_ENABLED", "False
 # 18 is its peak and its most balanced point. Deliberately NOT equal to
 # PREMIUM_DISCOUNT_LOOKBACK_CANDLES.
 ZONE_DIRECTION_LOOKBACK_CANDLES = env_int("ZONE_DIRECTION_LOOKBACK_CANDLES", 18)
+# 2026-09-12 universal-gate trigger-by-trigger audit (operator request,
+# same "quality over quantity, but validate before relaxing" methodology
+# as EMA_TREND_MIXED_EXEMPT_TRIGGERS below). Real forward-5m replay of
+# ZONE_DIRECTION_OPPOSED's ACTUAL blocked population (n=1695 real rejects,
+# 2026-09-08..12), using the journal's own recorded entry_price/atr (full
+# pipeline reconstruction was tried first and found infeasible - live
+# trigger detection re-evaluates against the CURRENTLY FORMING candle on
+# every tick, per market_structure.live_break_check's own docstring, which
+# a historical REST kline fetch can only ever return the CLOSED version
+# of - NO_LIVE_STRUCTURE_BREAK fired on ~97% of a 450-row reconstruction
+# attempt). Per-trigger split, split-half validated:
+#   OB_FVG_RETEST        n=134  +0.387R/trade  H1=+23.00  H2=+28.87  (both +)
+#   ORDER_BLOCK_RETEST   n=136  +0.203R/trade  H1=+16.00  H2=+11.66  (both +)
+#   EMA_PULLBACK         n=287  +0.192R/trade  H1=+40.00  H2=+15.21  (both +)
+#   STRUCTURE_BREAK      n=258  -0.093R/trade  H1=-27.00  H2= +2.99  (flips - inconclusive)
+#   CHOCH_RETEST         n= 89  +0.194R/trade  H1=+19.00  H2= -1.73  (flips - inconclusive)
+#   OI_DIVERGENCE        n= 81  -0.550R/trade  H1=-20.11  H2=-24.45  (both - genuinely protective)
+#   LIQUIDITY_SWEEP      n= 46  -0.341R/trade  H1= -5.00  H2=-10.70  (both - genuinely protective, thinner n)
+# (CVD_DIVERGENCE measured +0.211R/trade, n=1178, but that trigger is
+# CVD_DIVERGENCE_TRIGGER_ENABLED=False as of this same session - excluded,
+# not forward-relevant.) Only the three triggers with BOTH a real sample
+# and split-half-consistent positive expectancy are exempted here -
+# STRUCTURE_BREAK/CHOCH_RETEST flip sign between halves (left gated,
+# genuinely inconclusive) and OI_DIVERGENCE/LIQUIDITY_SWEEP are
+# consistently negative (the gate is doing real protective work there,
+# left alone). Reject-only-safer, same precedent as EMA_TREND_MIXED_
+# EXEMPT_TRIGGERS: can only ever let MORE trades through, never fewer.
+#
+# Caveat carried over honestly: this replay uses the FLAT MIN_STOP_
+# DISTANCE_PCT/ATR_MULTIPLE floor, not the real structure-anchored SL live
+# trades get (structure_level isn't in the reject journal and, per the
+# above, can't be reconstructed) - the real stop is usually tighter, so if
+# anything this likely UNDERSTATES how often SL would have hit, making
+# these positive numbers a conservative floor rather than an inflated one.
+# Default empty - same env_str_list empty-default gotcha as every other
+# *_EXEMPT_TRIGGERS flag in this file (an empty .env value falls back to
+# this default, never a non-empty stale list).
+ZONE_DIRECTION_EXEMPT_TRIGGERS = env_str_list("ZONE_DIRECTION_EXEMPT_TRIGGERS", [])
 # Raised from 0.618 -> 0.705 (2026-08-14, operator feedback): BUY signals
 # were seen firing in the discount zone while price kept falling anyway,
 # and SELL signals in premium while price kept rising - both consistent

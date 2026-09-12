@@ -1303,10 +1303,23 @@ def evaluate(
         # replacing it and relaxing it to an OR are worse than the zone
         # alone (see config.ZONE_DIRECTION_REJECT_ENABLED for the table).
         # Fails open on a None direction, matching every other trend read.
+        #
+        # config.ZONE_DIRECTION_EXEMPT_TRIGGERS - 2026-09-12 per-trigger
+        # audit (see that flag's own config.py comment for the full
+        # split-half evidence table). OB_FVG_RETEST/ORDER_BLOCK_RETEST/
+        # EMA_PULLBACK all showed a real, split-half-consistent positive
+        # expectancy in their ZONE_DIRECTION_OPPOSED-blocked population;
+        # every other trigger is either still genuinely protective
+        # (OI_DIVERGENCE, LIQUIDITY_SWEEP) or inconclusive (STRUCTURE_
+        # BREAK, CHOCH_RETEST) and stays gated. Reject-only-safer, same
+        # precedent as EMA_TREND_MIXED_EXEMPT_TRIGGERS: can only ever let
+        # MORE trades through, never fewer. Default empty, so this is a
+        # no-op until the operator opts specific triggers in.
         if (
             config.ZONE_DIRECTION_REJECT_ENABLED
             and zone_direction is not None
             and zone_direction != direction
+            and trigger not in config.ZONE_DIRECTION_EXEMPT_TRIGGERS
         ):
             return _reject(f"ZONE_DIRECTION_OPPOSED zone_direction={zone_direction}")
 
