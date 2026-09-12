@@ -532,12 +532,24 @@ def evaluate(
     # informational field (see absorption.py's own docstring). Direction-
     # independent (like btc_return above) - only the alignment-with-this-
     # candidate's-own-side comparison varies per direction, computed
-    # inside _evaluate_direction below. depth_snapshot may not carry
-    # "price_change_pct_1m" at all when unavailable/stale - .get() returns
-    # None in that case, same fail-open convention as depth_imbalance.
+    # inside _evaluate_direction below.
+    #
+    # Gated on depth_snapshot's own "available" (the same WS_STALE_
+    # SECONDS-based freshness check depth_imbalance already uses) rather
+    # than trusting price_change_pct_1m to self-degrade to None on its
+    # own. Real bug found 2026-09-12 (full-gate audit): the field is
+    # ALWAYS present when depth_snapshot has any state at all - the old
+    # comment here claiming ".get() returns None when unavailable/stale"
+    # was false - and orderbook._price_change_pct only detects staleness
+    # past its own ABSORPTION_WINDOW_SECONDS window, a looser bound than
+    # WS_STALE_SECONDS. Without this check a depth feed that died 45-59s
+    # ago (already stale by WS_STALE_SECONDS, not yet caught by the
+    # window check) could still feed a real-looking price_change_pct_1m
+    # into absorption.compute alongside a genuinely fresh cvd_snapshot,
+    # manufacturing a false absorption signal from dead depth data.
     absorption_signal = None
 
-    if config.ABSORPTION_TRACKING_ENABLED:
+    if config.ABSORPTION_TRACKING_ENABLED and depth_snapshot.get("available"):
         absorption_signal = absorption.compute(
             cvd_snapshot, depth_snapshot.get("price_change_pct_1m")
         )

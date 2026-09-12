@@ -147,6 +147,19 @@ class DepthImbalanceEngine:
 
         window_seconds = max(float(config.ABSORPTION_WINDOW_SECONDS), 1)
         cutoff = now - window_seconds
+
+        # mid_price_history is only pruned inside record_depth (on write) -
+        # if the depth stream has silently died, it freezes with whatever
+        # samples it had. Without this check, a fully-stale history makes
+        # the search below walk every (frozen) entry and end with
+        # reference == history[-1][1] == current, fabricating a 0% "price
+        # hasn't moved" reading for what is actually dead data, not a real
+        # flat market. Real bug found 2026-09-12 auditing absorption_
+        # signal's real inputs - if even the MOST RECENT sample is already
+        # older than the window, there is no genuine "now" to compare.
+        if history[-1][0] <= cutoff:
+            return None
+
         current = history[-1][1]
         reference = None
 

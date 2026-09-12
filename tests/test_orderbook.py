@@ -146,6 +146,26 @@ class PriceChangePctTests(unittest.TestCase):
         state = engine._book["BTCUSDT"]
         self.assertEqual(len(state["mid_price_history"]), 1)
 
+    def test_a_dead_feed_reports_none_not_a_fabricated_zero_percent(self):
+        # Real bug found 2026-09-12 (full-gate audit): mid_price_history is
+        # only pruned inside record_depth (on write), so a feed that dies
+        # silently freezes it forever. Before this was fixed, snapshot()
+        # walking a fully-stale history ended with reference==current,
+        # reporting a manufactured 0% "price hasn't moved" for what is
+        # actually dead data - which absorption.compute could then read as
+        # a real flat-price reading alongside a genuinely fresh CVD score.
+        engine = DepthImbalanceEngine()
+        engine.record_depth("BTCUSDT", bids=[["99.5", "1"]], asks=[["100.5", "1"]], timestamp=1000)
+
+        with patch.object(config, "ABSORPTION_WINDOW_SECONDS", 60), \
+             patch.object(config, "ABSORPTION_PRICE_HISTORY_SECONDS", 90):
+            # No further record_depth calls - the feed "died" right after
+            # the one sample. Called far enough later that the single
+            # sample is now older than the window on both ends.
+            snapshot = engine.snapshot("BTCUSDT", now=2000)
+
+        self.assertIsNone(snapshot["price_change_pct_1m"])
+
     def test_missing_symbol_has_no_price_change_key_error(self):
         engine = DepthImbalanceEngine()
         snapshot = engine.snapshot("NOPE")

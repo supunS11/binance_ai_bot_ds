@@ -1644,6 +1644,24 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNone(result["absorption_signal"])
         self.assertIsNone(result["absorption_aligned"])
 
+    def test_absorption_signal_none_when_depth_snapshot_is_stale(self):
+        # Real bug found 2026-09-12 (full-gate audit): price_change_pct_1m
+        # can carry a real-looking value even when the depth feed itself
+        # is stale (orderbook._price_change_pct only detects staleness
+        # past its own ABSORPTION_WINDOW_SECONDS window, a looser bound
+        # than WS_STALE_SECONDS/"available"). Must gate on depth_snapshot's
+        # own available flag, not trust the field to self-degrade.
+        cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
+        depth = {"available": False, "depth_imbalance": 0.2, "price_change_pct_1m": 0.01}
+
+        with patch.object(config, "ABSORPTION_TRACKING_ENABLED", True), \
+             patch.object(config, "ABSORPTION_MIN_CVD_RATIO", 0.5), \
+             patch.object(config, "ABSORPTION_MAX_PRICE_MOVE_PCT", 0.05):
+            result = self._run(cvd=cvd, depth=depth)
+
+        self.assertIsNone(result["absorption_signal"])
+        self.assertIsNone(result["absorption_aligned"])
+
     def test_absorption_disabled_by_config(self):
         cvd = {"available": True, "cvd_score": 0.5, "ratio_1m": -0.8, "notional_1m": 10000}
         depth = {"available": True, "depth_imbalance": 0.2, "price_change_pct_1m": 0.01}
