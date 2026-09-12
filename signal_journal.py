@@ -46,6 +46,12 @@ FIELDNAMES = [
     # trade could even be governed by both bands at once, and the two
     # populations must stay distinguishable for future analysis.
     "entry_range_probe",
+    # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - the third, INDEPENDENT
+    # probe band. Set inside signal_engine itself (unlike the two above,
+    # which main.py sets after evaluate() returns), but journaled the same
+    # way - a separate column so this population stays distinguishable from
+    # ordinary SHADOW_ONLY_TRIGGERS shadows and from the other two probes.
+    "against_htf_bias_probe",
     "zone_retracement_pct",
     "order_block_present", "fvg_present", "cvd_score", "depth_imbalance",
     "sweep_confluence", "oi_change_pct", "oi_rising",
@@ -353,6 +359,8 @@ def append_signal(signal, plan, execution_result=None):
         # clean True/False for every row, including ones written before
         # this field existed on the result dict.
         "entry_range_probe": bool(signal.get("entry_range_probe")),
+        # bool(), not the raw value - same reason as the two probes above.
+        "against_htf_bias_probe": bool(signal.get("against_htf_bias_probe")),
         "zone_retracement_pct": signal.get("zone_retracement_pct"),
         "order_block_present": bool(signal.get("order_block")),
         "fvg_present": bool(signal.get("fvg")),

@@ -1042,6 +1042,82 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
         self.assertTrue(result["confluence_probe"])
         self.assertTrue(enter_trade.call_args.args[0]["force_shadow"])
 
+    # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - the third, INDEPENDENT
+    # probe. Unlike the two above, the probe DECISION itself is made
+    # entirely inside signal_engine.evaluate() (deep inside the
+    # AGAINST_HTF_BIAS gate, long before a plan exists) - these tests only
+    # need to prove the main.py wiring: a mocked evaluate() result that
+    # already carries against_htf_bias_probe=True must force plan[
+    # "force_shadow"], with the same never-place-a-real-order safety
+    # property as the other two probes.
+
+    def _against_htf_bias_probe_result(self, probe, trigger="STRUCTURE_BREAK", signal="BUY"):
+        return {"signal": signal, "symbol": "BTCUSDT", "signal_trigger": trigger,
+                "against_htf_bias_probe": probe}
+
+    def _run_against_htf_bias_probe(self, probe):
+        plan = {"symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+                "tp1_price": 102, "tp2_price": 104}
+
+        with patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(signal_engine, "evaluate",
+                          return_value=self._against_htf_bias_probe_result(probe)), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(plan, "OK")), \
+             patch.object(execution, "enter_trade",
+                          return_value={"ok": True, "shadow": True}) as enter_trade, \
+             patch.object(signal_journal, "append_signal", return_value="BTCUSDT_1"):
+            main._evaluate_symbol(_FakeFeed(), "BTCUSDT", _FakePositions(), 1000,
+                                  Counter(), {}, None, Counter(), {})
+        return enter_trade
+
+    def test_an_against_htf_bias_probe_candidate_forces_shadow(self):
+        enter_trade = self._run_against_htf_bias_probe(True)
+
+        self.assertTrue(enter_trade.call_args.args[0]["force_shadow"])
+
+    def test_an_against_htf_bias_probe_candidate_can_never_place_a_real_order(self):
+        # THE SAFETY PROPERTY, mirroring the entry-range probe's own -
+        # even with the bot fully LIVE and no shadow-only triggers
+        # configured, this plan must still be shadow.
+        enter_trade = self._run_against_htf_bias_probe(True)
+        plan = enter_trade.call_args.args[0]
+
+        with patch.object(config, "EXECUTION_MODE", "LIVE"), \
+             patch.object(config, "SHADOW_ONLY_TRIGGERS", []):
+            self.assertTrue(execution._is_shadow_mode(plan))
+
+    def test_against_htf_bias_probe_false_leaves_force_shadow_to_the_other_two(self):
+        enter_trade = self._run_against_htf_bias_probe(False)
+
+        self.assertFalse(enter_trade.call_args.args[0]["force_shadow"])
+
+    def test_all_three_probes_can_apply_at_once_and_force_shadow_is_their_or(self):
+        result = self._entry_range_result(0.85)
+        result.update(self._confluence_result(available=13, favourable=7))
+        result["entry_range_position"] = 0.85
+        result["against_htf_bias_probe"] = True
+        plan = {"symbol": "BTCUSDT", "entry_price": 100, "sl_price": 98,
+                "tp1_price": 102, "tp2_price": 104}
+
+        with patch.object(config, "ENTRY_RANGE_POSITION_REJECT_ENABLED", True), \
+             patch.object(config, "ENTRY_RANGE_POSITION_MAX", 0.80), \
+             patch.object(config, "ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX", 0.90), \
+             patch.object(config, "LONG_SHORT_RATIO_ENABLED", False), \
+             patch.object(config, "MIN_CONFIRMATION_FIELDS_AVAILABLE", 0), \
+             patch.object(config, "MIN_CONFIRMATION_AGREEMENT_RATIO", 0.65), \
+             patch.object(config, "CONFLUENCE_SHADOW_PROBE_RATIO", 0.53), \
+             patch.object(config, "CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS", []), \
+             patch.object(signal_engine, "evaluate", return_value=result), \
+             patch.object(risk_manager, "build_trade_plan", return_value=(plan, "OK")), \
+             patch.object(execution, "enter_trade",
+                          return_value={"ok": True}) as enter_trade, \
+             patch.object(signal_journal, "append_signal", return_value="x"):
+            main._evaluate_symbol(_FakeFeed(), "BTCUSDT", _FakePositions(), 1000)
+
+        self.assertTrue(result["entry_range_probe"])
+        self.assertTrue(result["confluence_probe"])
+        self.assertTrue(enter_trade.call_args.args[0]["force_shadow"])
+
     # config.MIN_CONFIRMATION_AGREEMENT_RATIO / MIN_CONFIRMATION_FIELDS_
     # AVAILABLE - 2026-09-07, the confluence floor. Closes the fail-open
     # exposure: every gate in signal_engine skips itself on missing data, so

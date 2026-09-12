@@ -1471,6 +1471,58 @@ _OB_FVG_TAUTOLOGICAL_TRIGGERS = frozenset({"OB_FVG_RETEST", "ORDER_BLOCK_RETEST"
 AGAINST_HTF_BIAS_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED = env_bool(
     "AGAINST_HTF_BIAS_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", "True"
 )
+# --- the shadow probe band (2026-09-12) -------------------------------------
+# Mirrors CONFLUENCE_SHADOW_PROBE_RATIO's and ENTRY_RANGE_POSITION_SHADOW_
+# PROBE_MAX's design exactly - see CONFLUENCE_SHADOW_PROBE_RATIO's own
+# comment for the full rationale. AGAINST_HTF_BIAS can never be re-tested
+# from live data on its own: every candidate it rejects simply disappears,
+# and unlike the two probes above, it fires deep inside signal_engine.py
+# before a "signal" object even exists - the reversal triggers (CVD_
+# DIVERGENCE/OI_DIVERGENCE/LIQUIDATION_SWEEP_CONFIRMED, plus CHOCH_RETEST
+# via _TREND_AGREEMENT_EXEMPT_TRIGGERS) are already exempt from this gate
+# and get to take a counter-trend shot; every trend-following trigger
+# (STRUCTURE_BREAK/OB_FVG_RETEST/LIQUIDITY_SWEEP/ORDER_BLOCK_RETEST/
+# EMA_PULLBACK) currently gets none at all.
+#
+# Motivating data (2026-09-08 to 2026-09-12, real fills): only 5 real
+# trades, all hit SL. Forensic replay showed 3/5 would eventually have
+# reached their original target (consistent with the previously-measured
+# 63% population-wide reversal rate for SL-hit trades), 1/5 a genuinely
+# correct stop, 1/5 a scratch. All 5 either carried an exempt reversal
+# trigger or were blocked outright by AGAINST_HTF_BIAS with zero real
+# outcome ever recorded for the blocked side. This is the one major gate
+# left unexamined after MIN_CONFIRMATION_AGREEMENT_RATIO, ENTRY_RANGE_
+# POSITION, EMA_TREND_MIXED, MARKET_CHOPPY, and the zone family were each
+# already individually re-validated with real data the same day.
+#
+# A candidate that fails the plain AGAINST_HTF_BIAS agreement check but
+# whose confirmation_confluence() ratio (computed from only the 13 fields
+# already resolved this early - see signal_engine.py's own
+# _against_htf_bias_probe_ratio docstring for exactly which 4 are
+# deliberately excluded, and why omitting them can only make the ratio
+# harder to clear, never fabricate false confidence) is AT OR ABOVE this
+# ratio is NOT rejected - it is routed to SHADOW, with the real
+# risk_manager plan, real TP/SL, real position_manager tracking and a real
+# journaled outcome, never touching capital. One-directional, same as
+# every other probe in this file: it can only ever turn a REJECT into a
+# SHADOW trade. The nested HTF_TREND_LIVE_WEAK_DISTANCE/_SLOPE checks
+# (signal_engine.py, right after this gate) are explicitly skipped once a
+# candidate is probed - see that gate site's own comment for why those
+# don't apply to a bias-opposed candidate.
+#
+# Ships OFF (0.0), same first-ship convention as CONFLUENCE_SHADOW_PROBE_
+# RATIO/ENTRY_RANGE_POSITION_SHADOW_PROBE_MAX - there is no evidenced
+# "right" ratio yet, this closes the measurement gap, not the gate itself.
+AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO = env_float("AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO", 0.0)
+# Triggers excluded from the probe - same purpose and same gotcha as
+# CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS: keep the probe population equal
+# to "trades that would otherwise have been REAL". env_str_list falls back
+# to the DEFAULT on an empty env value, so an empty list cannot be
+# expressed from .env alone - it has to be the default here too, same note
+# as CONFLUENCE_SHADOW_PROBE_EXCLUDE_TRIGGERS.
+AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS = env_str_list(
+    "AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS", []
+)
 # Same reasoning and same exempt-trigger group as AGAINST_HTF_BIAS above -
 # HTF_TREND_STALE is just a second, faster-updating measure of the same
 # "does this agree with the broader trend" question.

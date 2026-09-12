@@ -473,6 +473,20 @@ class SignalJournalTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["entry_range_probe"], "False")
 
+    def test_append_signal_writes_against_htf_bias_probe_as_a_clean_boolean(self):
+        # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - the third, independent
+        # probe column, same bool()-not-raw-value treatment as the two above.
+        signal_journal.append_signal(_signal(against_htf_bias_probe=True), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["against_htf_bias_probe"], "True")
+
+    def test_append_signal_writes_against_htf_bias_probe_false_when_absent(self):
+        signal_journal.append_signal(_signal(), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["against_htf_bias_probe"], "False")
+
     def test_append_signal_leaves_entry_range_position_blank_when_absent(self):
         # None on a degenerate range (high == low) or too little history.
         signal_journal.append_signal(_signal(), _plan())

@@ -634,6 +634,106 @@ class SignalEngineTests(unittest.TestCase):
         self.assertAlmostEqual(result["htf_trend_live_distance_pct"], 5.0, places=4)
         self.assertAlmostEqual(result["htf_trend_live_slope_pct"], 5.263157, places=4)
 
+    # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO (2026-09-12) - real trade
+    # data (5 real fills over 4 days, all SL_HIT, 3 of them exempt reversal
+    # triggers taking counter-trend bets during a persistent bearish
+    # stretch) motivated giving trend-following triggers the same real,
+    # zero-risk shot the reversal triggers already get. Mismatch fixture:
+    # htf_trend_ema=105.0 > ltf_close (default 93.0) -> effective_htf_trend
+    # reads BEARISH, opposing the default BUY candidate. The four OI/
+    # cross-exchange/liquidation/funding flags are pinned False in every
+    # test below so the achievable probe ratio is fully predictable: only
+    # ema_aligned (93 > ema_alignment_value=85 -> True), btc_aligned
+    # (btc_return=0.02>0 -> True), cvd_score (0.5>0 -> favorable), and
+    # depth_imbalance (0.2>0 -> favorable) are ever available, all four
+    # favorable -> an achievable ratio of exactly 1.0.
+
+    def _mismatched_htf_bias_fixture(self, **kwargs):
+        htf_candles = [{"open_time": 0, "close": 100}]
+        return self._run(
+            htf_candles=htf_candles, htf_trend_ema=105.0, htf_trend_ema_primary_enabled=True,
+            **kwargs
+        )
+
+    def test_against_htf_bias_probe_routes_a_mismatched_candidate_to_shadow(self):
+        with patch.object(config, "AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO", 0.5), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._mismatched_htf_bias_fixture()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertTrue(result["against_htf_bias_probe"])
+
+    def test_against_htf_bias_probe_at_zero_restores_plain_rejection(self):
+        # The shipped default - must not silently change behavior.
+        with patch.object(config, "AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO", 0.0), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._mismatched_htf_bias_fixture()
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_against_htf_bias_probe_below_the_ratio_still_hard_rejects(self):
+        # 1.5 can never be cleared - a ratio is always <= 1.0.
+        with patch.object(config, "AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO", 1.5), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._mismatched_htf_bias_fixture()
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_against_htf_bias_probe_excluded_trigger_still_rejects(self):
+        # Default fixture's winning trigger is STRUCTURE_BREAK.
+        # LIQUIDITY_SWEEP_TRIGGER_ENABLED is live in .env and the default
+        # sweep_direction="BULLISH" fixture would otherwise make LIQUIDITY_
+        # SWEEP a second, non-excluded candidate that wins the ranking
+        # instead - disabled here so only STRUCTURE_BREAK is a candidate.
+        with patch.object(config, "AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO", 0.5), \
+             patch.object(config, "AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS", ["STRUCTURE_BREAK"]), \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._mismatched_htf_bias_fixture()
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_against_htf_bias_probe_skips_the_nested_strength_and_slope_checks(self):
+        # Real bug this guards against: without the `not against_htf_bias_
+        # mismatch` guard, a probed candidate would fall through into the
+        # nested HTF_TREND_LIVE_WEAK_DISTANCE/_SLOPE checks for the first
+        # time ever - and a mismatched candidate's signed distance is
+        # trivially negative (price on the wrong side of the EMA), so it
+        # would almost always fail them, silently defeating the probe.
+        with patch.object(config, "AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO", 0.5), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False), \
+             patch.object(config, "HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED", True), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3):
+            result = self._mismatched_htf_bias_fixture()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertTrue(result["against_htf_bias_probe"])
+
+    def test_against_htf_bias_probe_flag_is_false_on_a_normal_success(self):
+        result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertFalse(result["against_htf_bias_probe"])
+
     # config.LTF_TREND_FILTER_ENABLED (2026-09-05) - the 1h sibling of
     # AGAINST_HTF_BIAS. Real evidence in that flag's own config.py comment:
     # the median real trade lives 2.0h while htf_trend_live has 80h of

@@ -840,6 +840,14 @@ def evaluate(
         price_zone = None
         ema_trend_bucket = None
         entry_range_position = None
+        # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - initialised here (not
+        # just at the gate site below) so the success dict at the bottom of
+        # this function always carries the key, even for triggers where
+        # "AGAINST_HTF_BIAS" is never in applicable_gates at all (the
+        # reversal triggers/CHOCH_RETEST) - same reasoning as the three
+        # inits above, just for a different reason (this one isn't read by
+        # _diag(), it's read by the final success dict).
+        against_htf_bias_probe = False
 
         def _diag():
             """Snapshot of the diagnostics known at THIS point, merged into
@@ -909,14 +917,153 @@ def evaluate(
         # expression per gate.
         applicable_gates = config.trigger_gate_profiles().get(trigger, frozenset())
 
+        def _against_htf_bias_probe_ratio():
+            """config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - confirmation_
+            confluence()'s ratio for THIS candidate, computed from only the
+            fields already resolved this early (before AGAINST_HTF_BIAS
+            runs). Deliberately mirrors each field's real boolean derivation
+            later in this same function EXACTLY, not approximately, so this
+            can never silently diverge from the real gate's own
+            definitions.
+
+            Omits sweep_confluence (needs `sweep`, deliberately lazily
+            computed - see the `nonlocal pools, sweep` note above),
+            order_block/fvg (need a fresh, non-memoized market_structure.
+            find_order_block scan), and long_short_favorable (categorically
+            unavailable this early - only ever resolved in main.py post-
+            signal via an on-demand REST fetch, same limitation
+            WEAK_CONFLUENCE already lives with). Evidence-neutral: order_
+            block/fvg would still count toward `available` with
+            favourable=0 under confirmation_confluence's own ALWAYS_
+            PRESENT semantics, so omitting them here can only make the
+            ratio a bit more conservative, never fabricate false
+            confidence."""
+            oi_snapshot_ = oi_snapshot or {}
+            oi_change_pct_ = None
+
+            if config.OI_CONFIRMATION_ENABLED and oi_snapshot_.get("available"):
+                oi_change_pct_ = oi_snapshot_.get("oi_change_pct")
+
+            oi_rising_ = oi_change_pct_ > 0 if oi_change_pct_ is not None else None
+            cross_exchange_oi_agree_ = None
+
+            if config.CROSS_EXCHANGE_OI_TRACKING_ENABLED:
+                oi_snapshot_bybit_ = oi_snapshot_bybit or {}
+                oi_snapshot_okx_ = oi_snapshot_okx or {}
+                oi_change_pct_bybit_ = (
+                    oi_snapshot_bybit_.get("oi_change_pct") if oi_snapshot_bybit_.get("available") else None
+                )
+                oi_change_pct_okx_ = (
+                    oi_snapshot_okx_.get("oi_change_pct") if oi_snapshot_okx_.get("available") else None
+                )
+                cross_exchange_oi_agree_ = cross_exchange_oi.compute_agreement(
+                    oi_change_pct_, oi_change_pct_bybit_, oi_change_pct_okx_
+                )
+
+            liquidation_snapshot_ = liquidation_snapshot or {}
+            liquidation_cluster_ = None
+            liquidation_aligned_ = None
+
+            if config.LIQUIDATION_CONFIRMATION_ENABLED and liquidation_snapshot_.get("available"):
+                liquidation_notional_net_ = liquidation_snapshot_.get("net_liquidation_notional")
+                total_notional_ = (
+                    liquidation_snapshot_.get("long_liquidation_notional", 0)
+                    + liquidation_snapshot_.get("short_liquidation_notional", 0)
+                )
+                liquidation_cluster_ = total_notional_ >= config.LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT
+
+                if liquidation_notional_net_ is not None:
+                    liquidation_aligned_ = (
+                        liquidation_notional_net_ > 0 if direction == "BULLISH"
+                        else liquidation_notional_net_ < 0
+                    )
+
+            cvd_score_ = cvd_snapshot.get("cvd_score") if cvd_snapshot.get("available") else None
+            depth_imbalance_ = None
+            depth_trend_aligned_ = None
+
+            if depth_snapshot.get("available"):
+                depth_imbalance_ = depth_snapshot.get("depth_imbalance", 0)
+
+                if depth_consistency_pct is not None:
+                    signed_depth_trend_ = depth_imbalance_ if side == "BUY" else -depth_imbalance_
+                    depth_trend_aligned_ = (
+                        signed_depth_trend_ > 0
+                        and depth_consistency_pct >= config.DEPTH_TREND_MIN_CONSISTENCY_PCT
+                    )
+
+            efficiency_ratio_ = ltf_analysis.get("efficiency_ratio")
+            efficiency_favorable_ = (
+                efficiency_ratio_ > config.EFFICIENCY_RATIO_CHOP_THRESHOLD
+                if efficiency_ratio_ is not None else None
+            )
+            funding_rate__ = funding_rate if config.FUNDING_RATE_ENABLED else None
+            funding_favorable_ = None
+
+            if funding_rate__ is not None:
+                adverse_ = config.FUNDING_RATE_ADVERSE_THRESHOLD
+                funding_favorable_ = (
+                    funding_rate__ <= adverse_ if side == "BUY" else funding_rate__ >= -adverse_
+                )
+
+            probe_candidate = {
+                "signal": side,
+                "ema_aligned": (
+                    (latest_price > ema_alignment_value if side == "BUY" else latest_price < ema_alignment_value)
+                    if ema_alignment_value is not None else None
+                ),
+                "btc_aligned": (
+                    (btc_return > 0 if side == "BUY" else btc_return < 0) if btc_return is not None else None
+                ),
+                "oi_rising": oi_rising_,
+                "cross_exchange_oi_agree": cross_exchange_oi_agree_,
+                "liquidation_cluster": liquidation_cluster_,
+                "liquidation_aligned": liquidation_aligned_,
+                "absorption_aligned": absorption_signal == side if absorption_signal is not None else None,
+                "depth_trend_aligned": depth_trend_aligned_,
+                "whale_aligned": (
+                    whale_direction == side
+                    if whale_notional is not None and whale_notional >= config.WHALE_TRADE_MIN_NOTIONAL_USDT
+                    else None
+                ),
+                "efficiency_favorable": efficiency_favorable_,
+                "funding_favorable": funding_favorable_,
+                "cvd_score": cvd_score_,
+                "depth_imbalance": depth_imbalance_,
+            }
+            available, favourable = confirmation_confluence(probe_candidate)
+            return favourable / available if available else 0.0
+
         if "AGAINST_HTF_BIAS" in applicable_gates:
             effective_htf_trend = (
                 htf_trend_live if config.HTF_TREND_EMA_PRIMARY_ENABLED else htf_structure.get("trend")
             )
             htf_side = _BULLISH_TO_SIDE.get(effective_htf_trend)
+            against_htf_bias_mismatch = bool(htf_side and side != htf_side)
 
-            if htf_side and side != htf_side:
-                return _reject(f"AGAINST_HTF_BIAS htf={effective_htf_trend} ltf={direction}")
+            if against_htf_bias_mismatch:
+                # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - checked in
+                # this exact order so a disabled/inert probe (ratio<=0, the
+                # shipped default) costs nothing beyond the two attribute
+                # reads below: the expensive _against_htf_bias_probe_ratio()
+                # call only runs once every cheaper condition already
+                # passed. Reject-only-safer, same precedent as every other
+                # probe in this project: this can only ever turn a REJECT
+                # into a SHADOW trade, never the reverse.
+                if (
+                    config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO > 0
+                    and trigger not in config.AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS
+                    and _against_htf_bias_probe_ratio() >= config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO
+                ):
+                    against_htf_bias_probe = True
+                    log_info(
+                        f"{symbol} against_htf_bias mismatch (htf={effective_htf_trend} "
+                        f"ltf={direction}) but confluence clears the "
+                        f"{config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO} probe bar - routing to "
+                        f"SHADOW as a probe (trigger={trigger})"
+                    )
+                else:
+                    return _reject(f"AGAINST_HTF_BIAS htf={effective_htf_trend} ltf={direction}")
 
             # config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED - real evidence
             # (2026-09-01, 57 historical trades, real 4h klines
@@ -938,18 +1085,32 @@ def evaluate(
             # deliberately carry no continuous value (same convention as
             # OI_RISING/CVD_NOT_CONFIRMED/DEPTH_OPPOSING) so main.py's
             # reject-reason tally aggregates by gate, not by exact float.
-            if config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED and config.HTF_TREND_EMA_PRIMARY_ENABLED:
-                if (
-                    htf_trend_live_distance_pct is not None
-                    and htf_trend_live_distance_pct < config.HTF_TREND_LIVE_MIN_DISTANCE_PCT
-                ):
-                    return _reject("HTF_TREND_LIVE_WEAK_DISTANCE")
+            #
+            # Explicitly gated on `not against_htf_bias_mismatch` (2026-
+            # 09-12): before the shadow probe existed, this was implicit -
+            # the mismatch branch above always returned, so these two
+            # sub-checks were only ever reached once bias already agreed.
+            # Now that a probed candidate can fall through the mismatch
+            # branch instead of returning, this guard keeps that same
+            # behaviour explicit - these two checks measure "given HTF
+            # bias already agrees, is it strongly separated", which is
+            # meaningless (and was never validated) for a bias-OPPOSED
+            # candidate. Without this guard a probed candidate could pick
+            # up an unrelated, never-validated extra reject on top of the
+            # probe.
+            if not against_htf_bias_mismatch:
+                if config.HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED and config.HTF_TREND_EMA_PRIMARY_ENABLED:
+                    if (
+                        htf_trend_live_distance_pct is not None
+                        and htf_trend_live_distance_pct < config.HTF_TREND_LIVE_MIN_DISTANCE_PCT
+                    ):
+                        return _reject("HTF_TREND_LIVE_WEAK_DISTANCE")
 
-                if (
-                    htf_trend_live_slope_pct is not None
-                    and htf_trend_live_slope_pct < config.HTF_TREND_LIVE_MIN_SLOPE_PCT
-                ):
-                    return _reject("HTF_TREND_LIVE_WEAK_SLOPE")
+                    if (
+                        htf_trend_live_slope_pct is not None
+                        and htf_trend_live_slope_pct < config.HTF_TREND_LIVE_MIN_SLOPE_PCT
+                    ):
+                        return _reject("HTF_TREND_LIVE_WEAK_SLOPE")
 
         # config.LTF_TREND_FILTER_ENABLED - the 1h sibling of
         # AGAINST_HTF_BIAS above, placed here so both direction gates read
@@ -1630,6 +1791,13 @@ def evaluate(
             "htf_trend_live": htf_trend_live,
             "htf_trend_live_distance_pct": htf_trend_live_distance_pct,
             "htf_trend_live_slope_pct": htf_trend_live_slope_pct,
+            # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - True marks a
+            # candidate that only reached this point because it cleared the
+            # probe bar after failing the plain AGAINST_HTF_BIAS agreement
+            # check. Set here (not in main.py, unlike confluence_probe/
+            # entry_range_probe) because the decision itself happens inside
+            # this function, long before a "signal" object exists.
+            "against_htf_bias_probe": against_htf_bias_probe,
             # config.LTF_TREND_FILTER_ENABLED - journaled unconditionally
             # (even with the gate off) so the prospective 1h-vs-4h horizon
             # comparison keeps building either way.

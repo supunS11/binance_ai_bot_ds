@@ -567,11 +567,17 @@ def _evaluate_symbol(
     # off plan, not result, to decide per-trigger shadow routing.
     plan["signal_trigger"] = result.get("signal_trigger")
     # config.CONFLUENCE_SHADOW_PROBE_RATIO / config.ENTRY_RANGE_POSITION_
-    # SHADOW_PROBE_MAX - two INDEPENDENT probes, checked separately, each
-    # with its own knobs and its own journal column. A plan is forced
-    # shadow if EITHER one caught it - always assigned (never left absent)
-    # so the flag is unambiguous rather than a missing-key default.
-    plan["force_shadow"] = confluence_probe or entry_range_probe
+    # SHADOW_PROBE_MAX / config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - three
+    # INDEPENDENT probes, checked separately, each with its own knobs and
+    # its own journal column. A plan is forced shadow if ANY ONE caught it
+    # - always assigned (never left absent) so the flag is unambiguous
+    # rather than a missing-key default. Unlike the other two,
+    # against_htf_bias_probe arrives already computed on `result` -
+    # signal_engine.evaluate() decides it internally, deep inside the
+    # AGAINST_HTF_BIAS gate itself, long before a plan exists here.
+    plan["force_shadow"] = (
+        confluence_probe or entry_range_probe or bool(result.get("against_htf_bias_probe"))
+    )
     # config.RETRACEMENT_DEPTH_AWARE_ENABLED - execution.enter_trade_
     # retracement reads this off plan, not result, to decide whether to
     # rest deeper/wait longer for a weak-depth_imbalance entry.
