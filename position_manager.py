@@ -4963,23 +4963,24 @@ class PositionManager:
         (shadow mode) a simulated touch/fallback. Builds a settled plan
         (entry_price/quantity/tp1_quantity/tp2_quantity/breakeven_price/
         risk_distance recomputed from these real numbers; every REAL
-        structure-anchored level - sl_price/tp2_price/tp_price/dca_price -
-        left exactly as risk_manager originally computed it, same
-        principle _resolve_real_entry already applies for ordinary
-        slippage on a synchronous market entry. tp1_price is the one
-        exception: under config.TP_STATIC_ROI_ENABLED it's a pure
-        function of entry_price, not a structure level, so it's
-        recomputed here via _resolve_tp1_price - safe to do here
-        specifically because protection orders haven't been placed yet at
-        this point, unlike the synchronous entry paths - see that
-        function's own docstring for the real bug this closes), places
-        protection orders (DCA-shaped or plain, per position["is_dca"]/
-        plan["single_tp"]), and hands off to register_dca_pending()/
-        register() so the position ends up in the exact same shape a
-        direct entry at this real price would have produced from the
-        start. Returns an outcome string only if a non-DCA settle's SL
-        placement failed outright (closed already, at market - see
-        execution.place_protection_orders); None otherwise, including the
+        structure-anchored level - tp2_price/tp_price/dca_price - left
+        exactly as risk_manager originally computed it, same principle
+        _resolve_real_entry already applies for ordinary slippage on a
+        synchronous market entry. tp1_price is the one exception: under
+        config.TP_STATIC_ROI_ENABLED it's a pure function of entry_price,
+        not a structure level, so it's recomputed here via
+        _resolve_tp1_price - safe to do here specifically because
+        protection orders haven't been placed yet at this point, unlike
+        the synchronous entry paths - see that function's own docstring
+        for the real bug this closes), places protection orders (DCA-
+        shaped or plain, per position["is_dca"]/plan["single_tp"]), and
+        hands off to register_dca_pending()/register() so the position
+        ends up in the exact same shape a direct entry at this real price
+        would have produced from the start. Returns an outcome string only
+        if a non-DCA settle's SL placement failed outright, OR (see
+        config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED below) a
+        revalidated stop now breaches MAX_SL_ROI_PCT (both close the
+        position already-filled, at market); None otherwise, including the
         ordinary case where this settled into DCA_PENDING/TP1_PENDING,
         which is not itself a closed-trade outcome.
 
@@ -4988,7 +4989,22 @@ class PositionManager:
         alongside the real fill lag - see signal_journal.
         append_retracement_settle's own docstring for why this also
         corrects the original signal row's stale (pre-retracement)
-        entry_price, not just adds new fields."""
+        entry_price, not just adds new fields.
+
+        config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - a retracement fill
+        lands CLOSER to the stop than the original signal price by design
+        (that is the entire point of waiting for a deeper pullback), which
+        can shrink the realized risk distance well under what MIN_STOP_
+        DISTANCE_PCT/MIN_STOP_DISTANCE_ATR_MULTIPLE were meant to
+        guarantee - risk_manager.revalidate_retracement_stop re-checks that
+        floor against the REAL fill and, if breached, re-anchors sl_price
+        to the next real liquidity pool beyond it (falling back to the
+        flat floor only if no such pool exists). See that function's own
+        docstring and config.py's comment for the real evidence.
+        Deliberately NOT extended to dca_price (same stale-anchor shape
+        exists there) - config.DCA_ENABLED is False live, making it
+        currently inert; revisit only if DCA_ENABLED is ever turned back
+        on."""
         plan = position["plan"]
         symbol = position["symbol"]
         side = position["side"]
@@ -5000,7 +5016,16 @@ class PositionManager:
         settled_plan["entry_price"] = entry_price
         settled_plan["quantity"] = quantity
         settled_plan["breakeven_price"] = risk_manager.compute_breakeven_price(entry_price, side)
-        risk_distance = abs(entry_price - plan["sl_price"])
+
+        sl_widen_reason = None
+
+        if config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED:
+            settled_plan["sl_price"], sl_widen_reason = risk_manager.revalidate_retracement_stop(
+                entry_price, plan["sl_price"], side,
+                atr=plan.get("atr"), pools=plan.get("liquidity_pools"),
+            )
+
+        risk_distance = abs(entry_price - settled_plan["sl_price"])
         settled_plan["risk_distance"] = risk_distance if risk_distance > 0 else plan.get("risk_distance")
         # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real fill-time anchor
         # overriding the stale signal-time snapshot, same "resting order
@@ -5034,7 +5059,33 @@ class PositionManager:
         signal_journal.append_retracement_settle(
             symbol, trade_id, entry_price, fill_type, fill_lag_seconds,
             used_deep_retracement=position.get("used_deep_retracement", False),
+            sl_price=settled_plan["sl_price"], sl_widen_reason=sl_widen_reason,
         )
+
+        # config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - only reachable
+        # when this settle actually widened the stop (sl_widen_reason is
+        # only ever set on that path), so this can never change behavior
+        # for any settle the flag doesn't touch. Both _stop_roi_too_high's
+        # and MAX_SL_ROI_PCT's own docstrings state the operator's policy
+        # is to reject an oversized stop outright, at any size - that
+        # shouldn't quietly stop applying just because capital already
+        # landed on the exchange moments before this check runs.
+        if sl_widen_reason and risk_manager._stop_roi_too_high(risk_distance, entry_price):
+            self.positions.pop(symbol, None)
+            self._closed_at[symbol] = time.time()
+            log_error(
+                f"{symbol} retracement settle rejected - revalidated stop "
+                f"({sl_widen_reason}) breaches MAX_SL_ROI_PCT at the real fill"
+            )
+
+            if not shadow:
+                try:
+                    exchange.close_position_market(symbol, side, quantity)
+                except Exception as exc:
+                    log_error(f"{symbol} CRITICAL: failed to close position after SL-ROI rejection: {exc}")
+
+            signal_journal.append_outcome(symbol, "RETRACEMENT_SL_ROI_TOO_HIGH", trade_id)
+            return "RETRACEMENT_SL_ROI_TOO_HIGH"
 
         if plan.get("single_tp"):
             settled_plan["tp1_quantity"] = None

@@ -525,6 +525,98 @@ def compute_stop_loss(signal, side):
     return _apply_min_stop_distance(sl_price, signal.get("entry_price"), side, atr=atr)
 
 
+def _next_pool_beyond_stop(entry_price, sl_price, side, pools):
+    """Nearest real liquidity-pool price that sits FURTHER from
+    entry_price than the current sl_price itself - i.e. strictly beyond
+    today's stop in the adverse direction, not merely somewhere adverse of
+    entry (that weaker condition is what _find_dca_level checks instead).
+    Same pool_type convention _find_dca_level already uses: SELL_SIDE
+    support below entry for a BUY's stop, BUY_SIDE resistance above for a
+    SELL's. None if nothing qualifies."""
+    pool_type = "SELL_SIDE" if side == "BUY" else "BUY_SIDE"
+    candidates = []
+
+    for pool in pools or []:
+        price = pool.get("price")
+
+        if price is None or pool.get("type") != pool_type:
+            continue
+
+        if side == "BUY":
+            if price >= sl_price:
+                continue
+        else:
+            if price <= sl_price:
+                continue
+
+        candidates.append((abs(price - entry_price), price))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda candidate: candidate[0])
+    return candidates[0][1]
+
+
+def revalidate_retracement_stop(entry_price, sl_price, side, atr=0, pools=None):
+    """config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - position_manager.
+    _finalize_retracement_entry calls this once the REAL retracement fill
+    price is known, to re-check the min-stop-distance floor
+    (_apply_min_stop_distance's own floor formula, reused here WITHOUT
+    calling that function - its flat re-center-at-entry-minus-distance
+    behaviour is exactly what must not happen when a real structure level
+    is available) against the real fill instead of the stale signal-time
+    entry_price the stop was originally sized against.
+
+    Evidence (2026-09-13): 25 real SL_HIT/SHADOW_SL_HIT retracement
+    trades, 70% stopped within the first 5-minute bar after fill, 83% of
+    those went on to reach the original real tp1_price anyway (avg
+    +7.09R afterward). Simply re-running _apply_min_stop_distance against
+    the real fill only rescues 2/25 (8%) - the floor itself is too thin.
+    Anchoring instead to the next real liquidity pool beyond the current
+    stop (already-available signal.liquidity_pools, no new fetch) rescues
+    27% of real SL_HIT trades in a 15-trade forward replay, at a median
+    +1.88R wider risk (range 0.09R-13.44R, highly variable) - real but
+    unproven-at-scale, hence gated off by default (see config.py).
+
+    Returns (resolved_sl_price, reason): reason is None (floor already
+    cleared - byte-identical no-op, the ordinary case), "POOL" (re-
+    anchored to a real structural level, same STRUCTURE_STOP_ATR_BUFFER
+    treatment compute_stop_loss applies), or "FLOOR_FALLBACK" (no
+    qualifying pool - same flat floor compute_stop_loss already falls
+    back to for a normal signal-time stop, just now allowed to fire
+    against the real fill)."""
+    entry_price = float(entry_price or 0)
+
+    if entry_price <= 0 or sl_price is None:
+        return sl_price, None
+
+    risk_distance = abs(entry_price - sl_price)
+    min_pct = max(float(config.MIN_STOP_DISTANCE_PCT), 0) / 100
+    min_atr_multiple = max(float(config.MIN_STOP_DISTANCE_ATR_MULTIPLE), 0)
+    floor = max(entry_price * min_pct, float(atr or 0) * min_atr_multiple)
+
+    if floor <= 0 or risk_distance >= floor:
+        return sl_price, None
+
+    pool_price = _next_pool_beyond_stop(entry_price, sl_price, side, pools)
+
+    if pool_price is not None:
+        buffer = float(atr or 0) * max(float(config.STRUCTURE_STOP_ATR_BUFFER), 0)
+        widened = pool_price - buffer if side == "BUY" else pool_price + buffer
+        still_correct_side = widened < entry_price if side == "BUY" else widened > entry_price
+
+        # Safety net: a large ATR buffer could in principle eat past the
+        # stop it's supposed to widen, or cross entry entirely. Judgment
+        # call, not evidence-backed either way - falls through to the
+        # flat floor rather than ship a pool-anchored stop that's actually
+        # narrower than what triggered this path at all.
+        if still_correct_side and abs(entry_price - widened) > risk_distance:
+            return widened, "POOL"
+
+    return _apply_min_stop_distance(sl_price, entry_price, side, atr=atr), "FLOOR_FALLBACK"
+
+
 def compute_targets(entry_price, sl_price, side, pools=None, atr=None):
     risk_distance = abs(entry_price - sl_price)
 

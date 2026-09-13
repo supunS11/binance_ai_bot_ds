@@ -1491,6 +1491,62 @@ class ComputeDcaSlPriceTests(unittest.TestCase):
         self.assertEqual(sl, 89.0)  # unchanged from the plain default-buffer test above
 
 
+class RevalidateRetracementStopTests(unittest.TestCase):
+    """config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - re-checks the
+    min-stop-distance floor against the REAL retracement fill price,
+    re-anchoring to the next real liquidity pool beyond the stop when
+    breached (falling back to the flat floor only when no pool
+    qualifies)."""
+
+    def setUp(self):
+        self.pct_patcher = patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6)
+        self.pct_patcher.start()
+        self.atr_patcher = patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0)
+        self.atr_patcher.start()
+
+    def tearDown(self):
+        self.pct_patcher.stop()
+        self.atr_patcher.stop()
+
+    def test_floor_already_cleared_is_a_byte_identical_noop(self):
+        sl, reason = risk_manager.revalidate_retracement_stop(99.5, 98, "BUY", atr=0, pools=[])
+
+        self.assertEqual(sl, 98)
+        self.assertIsNone(reason)
+
+    def test_floor_breached_widens_to_the_next_pool_with_atr_buffer(self):
+        pools = [{"type": "SELL_SIDE", "price": 95}]
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5):
+            sl, reason = risk_manager.revalidate_retracement_stop(99.9, 98, "BUY", atr=2, pools=pools)
+
+        self.assertEqual(sl, 94.0)  # 95 - (2 * 0.5)
+        self.assertEqual(reason, "POOL")
+
+    def test_floor_breached_no_qualifying_pool_falls_back_to_flat_floor(self):
+        sl, reason = risk_manager.revalidate_retracement_stop(99.9, 98, "BUY", atr=2, pools=[])
+
+        self.assertEqual(sl, 97.9)  # 99.9 - max(99.9*0.006, 2*1.0)
+        self.assertEqual(reason, "FLOOR_FALLBACK")
+
+    def test_pool_between_entry_and_current_stop_does_not_qualify(self):
+        # Not FURTHER from entry than the current stop - must be ignored,
+        # falling through to the flat floor instead.
+        pools = [{"type": "SELL_SIDE", "price": 99}]
+        sl, reason = risk_manager.revalidate_retracement_stop(99.9, 98, "BUY", atr=2, pools=pools)
+
+        self.assertEqual(reason, "FLOOR_FALLBACK")
+
+    def test_sell_side_mirrors_buy(self):
+        pools = [{"type": "BUY_SIDE", "price": 105}]
+
+        with patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5):
+            sl, reason = risk_manager.revalidate_retracement_stop(100.1, 102, "SELL", atr=2, pools=pools)
+
+        self.assertEqual(sl, 106.0)  # 105 + (2 * 0.5)
+        self.assertEqual(reason, "POOL")
+
+
 class ComputeDcaTargetTests(unittest.TestCase):
     def setUp(self):
         patcher = patch.object(config, "DCA_TP_STATIC_ROI_ENABLED", False)

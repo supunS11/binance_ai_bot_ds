@@ -354,6 +354,32 @@ class SignalJournalTests(unittest.TestCase):
         rows = self._read_rows()
         self.assertEqual(rows[1]["used_deep_retracement"], "False")
 
+    # config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - the REAL, settle-
+    # time stop (and why it changed, if it did) - previously always blank
+    # here, silently leaving every retracement-settled row on the stale
+    # pre-fill sl_price forever.
+
+    def test_append_retracement_settle_writes_the_resolved_sl_price_and_widen_reason(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())  # planned sl_price=98
+        signal_journal.append_retracement_settle(
+            "BTCUSDT", trade_id, 99.9, "LIMIT", 12.0, sl_price=94.0, sl_widen_reason="POOL",
+        )
+
+        rows = self._read_rows()
+        self.assertEqual(rows[0]["sl_price"], "98.0")  # original row untouched
+        self.assertEqual(rows[1]["sl_price"], "94.0")  # real, revalidated stop
+        self.assertEqual(rows[1]["retracement_sl_widen_reason"], "POOL")
+
+    def test_append_retracement_settle_leaves_sl_fields_blank_when_not_given(self):
+        # Old callers/tests (no sl_price/sl_widen_reason kwargs) must be
+        # unaffected - both fields stay blank, not "None" or some default.
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_retracement_settle("BTCUSDT", trade_id, 99.5, "LIMIT", 184.2)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["sl_price"], "")
+        self.assertEqual(rows[1]["retracement_sl_widen_reason"], "")
+
     def test_append_signal_writes_quote_volume_usdt(self):
         signal_journal.append_signal(_signal(quote_volume_usdt=12_500_000), _plan())
         rows = self._read_rows()

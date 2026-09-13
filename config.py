@@ -3208,6 +3208,38 @@ RETRACEMENT_REJECT_ON_RUNAWAY_R = env_float("RETRACEMENT_REJECT_ON_RUNAWAY_R", 0
 # closed.
 RETRACEMENT_MIN_SETTLED_RR = env_float("RETRACEMENT_MIN_SETTLED_RR", 0.0)
 
+# 2026-09-13 operator investigation: sl_price is built once at signal time
+# (risk_manager.compute_stop_loss) and position_manager._finalize_
+# retracement_entry deliberately leaves it untouched once the real
+# retracement fill lands - but a retracement fill lands CLOSER to the stop
+# by design (that is the entire point of waiting for a deeper pullback),
+# which can shrink the REALIZED risk distance well under what MIN_STOP_
+# DISTANCE_PCT/MIN_STOP_DISTANCE_ATR_MULTIPLE were meant to guarantee - the
+# floor is only ever checked once, against the stale signal-time price.
+#
+# Real evidence: 25 real SL_HIT/SHADOW_SL_HIT trades, 24 retracement-
+# filled - 70% stopped out in the very first 5-minute bar after fill, 83%
+# of THOSE went on to reach the original real tp1_price anyway (avg
+# +7.09R afterward). Simply re-running the existing _apply_min_stop_
+# distance floor against the real fill only rescues 2/25 (8%) - too thin,
+# and its own behaviour (discard the structural anchor, re-center at a
+# flat entry-minus-distance) is not "structure-based" per the operator's
+# explicit requirement. risk_manager.revalidate_retracement_stop instead
+# re-anchors to the NEXT REAL LIQUIDITY POOL beyond the current stop
+# (signal.liquidity_pools - already carried on the plan, see
+# build_trade_plan, no new fetch) when the floor is breached, falling back
+# to the flat floor only when no such pool exists - a separate 15-trade
+# forward replay found this rescues 27% of real SL_HIT trades, at a
+# median +1.88R wider risk (0.09R-13.44R, highly variable).
+#
+# Default False - the entry-timing PROBLEM is evidence-backed, but this
+# specific FIX has zero live track record of its own (the pool-rescue
+# number is a thinner, 15-trade replay) - same "earns a live default only
+# after real data on the mechanism itself" rule already applied to
+# RETRACEMENT_ENTRY_ENABLED/RETRACEMENT_STRUCTURE_TARGET_ENABLED above.
+# When off, _finalize_retracement_entry is byte-identical to today.
+RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED = env_bool("RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", "False")
+
 # =========================
 # LOGGING / ALERTING
 # =========================

@@ -5237,6 +5237,151 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         fill_lag = append_settle.call_args.args[4]
         self.assertAlmostEqual(fill_lag, 184.2, delta=1.0)
 
+    # config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED (2026-09-13) - a
+    # retracement fill lands closer to the stop than the signal-time price
+    # by design; these tests use dca=False (plain SL path, exchange.
+    # place_stop_loss) with an artificially tight fill (99.9 vs the fixture's
+    # sl=98, atr=2) that breaches a 0.6%/1.0xATR floor unless the flag
+    # revalidates it.
+
+    def test_flag_off_leaves_sl_unchanged_regardless_of_fill_tightness(self):
+        manager = _retracement_manager(dca=False, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["atr"] = 2
+        position["plan"]["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 95}]
+
+        with patch.object(config, "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", False), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        final = manager.positions["BTCUSDT"]
+        self.assertEqual(final["sl_price"], 98)
+        sl.assert_called_once_with("BTCUSDT", "BUY", 98)
+        self.assertIsNone(append_settle.call_args.kwargs.get("sl_widen_reason"))
+
+    def test_flag_on_widens_to_pool_when_fill_breaches_floor(self):
+        manager = _retracement_manager(dca=False, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["atr"] = 2
+        position["plan"]["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 95}]
+
+        with patch.object(config, "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", True), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        final = manager.positions["BTCUSDT"]
+        self.assertEqual(final["sl_price"], 94.0)  # 95 - (2 * 0.5)
+        self.assertAlmostEqual(final["risk_distance"], abs(99.9 - 94.0))
+        sl.assert_called_once_with("BTCUSDT", "BUY", 94.0)
+
+    def test_flag_on_falls_back_to_flat_floor_when_no_pool_qualifies(self):
+        manager = _retracement_manager(dca=False, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["atr"] = 2
+        position["plan"]["liquidity_pools"] = []
+
+        with patch.object(config, "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", True), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        final = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(final["sl_price"], 97.9)  # 99.9 - max(99.9*0.006, 2*1.0)
+        sl.assert_called_once_with("BTCUSDT", "BUY", final["sl_price"])
+
+    def test_journal_receives_the_resolved_sl_price_and_widen_reason(self):
+        manager = _retracement_manager(dca=False, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["atr"] = 2
+        position["plan"]["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 95}]
+
+        with patch.object(config, "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", True), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5), \
+             patch.object(config, "MAX_SL_ROI_PCT", 0), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        kwargs = append_settle.call_args.kwargs
+        self.assertEqual(kwargs["sl_price"], 94.0)
+        self.assertEqual(kwargs["sl_widen_reason"], "POOL")
+
+    def test_widened_stop_breaching_max_sl_roi_rejects_and_closes(self):
+        manager = _retracement_manager(dca=False, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["atr"] = 2
+        position["plan"]["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 95}]
+
+        with patch.object(config, "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", True), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5), \
+             patch.object(config, "MAX_SL_ROI_PCT", 1), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "place_stop_loss") as sl:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertEqual(outcome, "RETRACEMENT_SL_ROI_TOO_HIGH")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+        sl.assert_not_called()
+
+    def test_widened_stop_breaching_max_sl_roi_in_shadow_skips_the_real_close(self):
+        manager = _retracement_manager(dca=False, single_tp=False, shadow=True)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["atr"] = 2
+        position["plan"]["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 95}]
+
+        with patch.object(config, "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", True), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0.6), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5), \
+             patch.object(config, "MAX_SL_ROI_PCT", 1), \
+             patch.object(config, "LEVERAGE", 10), \
+             patch.object(exchange, "close_position_market") as close_market:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertEqual(outcome, "RETRACEMENT_SL_ROI_TOO_HIGH")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        close_market.assert_not_called()
+
+    def test_existing_fixture_stays_a_noop_even_with_flag_on(self):
+        # The default _retracement_manager() fixture never sets atr/
+        # liquidity_pools, so plan.get("atr") is None and the floor
+        # collapses to entry_price*0.006 - every current fixture's real
+        # risk distance already clears that easily. Proves turning the
+        # flag on doesn't disturb any existing fixture.
+        manager = _retracement_manager(dca=False, single_tp=False)
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED", True), \
+             patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            manager._finalize_retracement_entry(position, 99.5, 1.0, "LIMIT")
+
+        final = manager.positions["BTCUSDT"]
+        self.assertEqual(final["sl_price"], 98)
+        sl.assert_called_once_with("BTCUSDT", "BUY", 98)
+
 
 class PollRetracementPendingTests(unittest.TestCase):
     def test_shadow_position_is_a_noop(self):

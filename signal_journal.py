@@ -69,6 +69,11 @@ FIELDNAMES = [
     "break_confirmed_by_close", "dca_applied", "dca_breakeven_direction_confirmed",
     "dca_pressure_confirmed", "retracement_fill_type", "retracement_fill_lag_seconds",
     "used_deep_retracement", "dca_protective_stop_hit",
+    # config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - "", "POOL", or
+    # "FLOOR_FALLBACK". sl_price itself (already a FIELDNAME above) is now
+    # also populated by append_retracement_settle regardless of this flag -
+    # this column records WHY it changed, when it did.
+    "retracement_sl_widen_reason",
     "outcome",
 ]
 
@@ -410,7 +415,8 @@ def append_signal(signal, plan, execution_result=None):
 
 
 def append_retracement_settle(
-    symbol, trade_id, entry_price, fill_type, fill_lag_seconds, used_deep_retracement=False
+    symbol, trade_id, entry_price, fill_type, fill_lag_seconds, used_deep_retracement=False,
+    sl_price=None, sl_widen_reason=None,
 ):
     """config.RETRACEMENT_ENTRY_ENABLED - a second, partial row for the
     same trade_id, appended once a retracement-pending signal actually
@@ -439,7 +445,18 @@ def append_retracement_settle(
     whether this specific trade was routed to the deeper/longer-timeout
     path (weak depth_imbalance at entry) or the normal shallow one - what
     makes that mechanism evidence-checkable later (fill lag / outcome by
-    routing) instead of guessed at, same as every other mechanism here."""
+    routing) instead of guessed at, same as every other mechanism here.
+
+    config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - `sl_price` is the
+    REAL, settle-time stop (recomputed against the real fill when that
+    flag is on; otherwise identical to the original signal-time value) -
+    closes the analogous stale-forever gap this function already fixed
+    for entry_price above, but for sl_price (previously always blank
+    here, silently leaving every retracement-settled trade's journal row
+    on the stale pre-fill sl_price forever). `sl_widen_reason`
+    ("POOL"/"FLOOR_FALLBACK") is only non-blank when this settle actually
+    widened the stop; blank means either the flag was off or the real
+    fill still cleared the floor on its own."""
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
     row["trade_id"] = trade_id or ""
@@ -448,6 +465,13 @@ def append_retracement_settle(
     row["retracement_fill_type"] = fill_type
     row["retracement_fill_lag_seconds"] = fill_lag_seconds
     row["used_deep_retracement"] = used_deep_retracement
+
+    if sl_price is not None:
+        row["sl_price"] = sl_price
+
+    if sl_widen_reason is not None:
+        row["retracement_sl_widen_reason"] = sl_widen_reason
+
     _append_row(row)
 
 
