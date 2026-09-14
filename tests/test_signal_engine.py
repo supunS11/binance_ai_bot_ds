@@ -1,5 +1,6 @@
+import contextlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import config
 import cvd_divergence
@@ -126,7 +127,18 @@ class SignalEngineTests(unittest.TestCase):
         ltf_range_low=None,
         liquidation_snapshot_bybit=None,
         liquidation_snapshot_okx=None,
+        htf_liquidity_pools=None,
+        htf_stop_pools=None,
+        htf_atr=0.0,
     ):
+        # config.SL_TP_USE_HTF_STRUCTURE - find_structure_candidates/
+        # average_true_range now run unconditionally on whatever
+        # htf_candles fixture a test supplies (several tests below use
+        # minimal open_time-only fixtures) - mocked here the same way
+        # find_liquidity_pools/find_swing_points already are, so no
+        # existing test needs to know these exist unless it opts in.
+        htf_liquidity_pools = [] if htf_liquidity_pools is None else htf_liquidity_pools
+        htf_stop_pools = [] if htf_stop_pools is None else htf_stop_pools
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
         htf_structure = HTF_BULLISH if htf_structure is None else htf_structure
@@ -267,29 +279,49 @@ class SignalEngineTests(unittest.TestCase):
         # gate into a silent no-op for tests that rely on it firing (e.g.
         # test_no_signal_against_htf_bias). Same insulation pattern as
         # oi_rising_reject_enabled above.
-        with patch.object(config, "OI_RISING_REJECT_ENABLED", oi_rising_reject_enabled), \
-             patch.object(config, "HTF_TREND_EMA_PRIMARY_ENABLED", htf_trend_ema_primary_enabled), \
-             patch.object(market_structure, "structure_state", return_value=htf_structure), \
-             patch.object(market_structure, "premium_discount_zone", return_value=zone), \
-             patch.object(market_structure, "zone_direction", return_value=zone_direction), \
-             patch.object(market_structure, "analyze", return_value=ltf_analysis), \
-             patch.object(market_structure, "find_order_block", return_value=order_block), \
-             patch.object(market_structure, "find_liquidity_pools", return_value=[]), \
-             patch.object(market_structure, "find_swing_points", return_value=[]), \
-             patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest), \
-             patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest), \
-             patch.object(market_structure, "detect_ema_pullback", return_value=ema_pullback), \
-             patch.object(market_structure, "exponential_moving_average", side_effect=_ema_side_effect), \
-             patch.object(market_structure, "ema_prior_value", return_value=htf_trend_ema_prior), \
-             patch.object(market_structure, "price_correlation", return_value=btc_correlation), \
-             patch.object(market_structure, "price_return", return_value=btc_return), \
-             patch.object(liquidity_sweep, "detect_sweep", return_value=sweep), \
-             patch.object(
-                 liquidity_sweep, "detect_liquidation_confirmed_sweep",
-                 return_value=liquidation_confirmed_sweep,
-             ), \
-             patch.object(cvd_divergence, "detect_divergence", return_value=divergence), \
-             patch.object(oi_divergence, "detect_divergence", return_value=oi_divergence_result):
+        # contextlib.ExitStack, not a plain chained `with a, b, c, ...:` -
+        # this method already patches ~20 targets, and config.
+        # SL_TP_USE_HTF_STRUCTURE's 2 new ones (find_structure_candidates/
+        # average_true_range) pushed a plain chained with-statement past
+        # the compiler's static-block-nesting limit ("too many statically
+        # nested blocks"). ExitStack enters each context manager via a
+        # plain function call instead, sidestepping that limit entirely -
+        # same enter order, same reverse-order cleanup, exceptions
+        # propagate identically.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(config, "OI_RISING_REJECT_ENABLED", oi_rising_reject_enabled))
+            stack.enter_context(patch.object(config, "HTF_TREND_EMA_PRIMARY_ENABLED", htf_trend_ema_primary_enabled))
+            stack.enter_context(patch.object(market_structure, "structure_state", return_value=htf_structure))
+            stack.enter_context(patch.object(market_structure, "premium_discount_zone", return_value=zone))
+            stack.enter_context(patch.object(market_structure, "zone_direction", return_value=zone_direction))
+            stack.enter_context(patch.object(market_structure, "analyze", return_value=ltf_analysis))
+            stack.enter_context(patch.object(market_structure, "find_order_block", return_value=order_block))
+            stack.enter_context(patch.object(market_structure, "find_liquidity_pools", return_value=[]))
+            stack.enter_context(patch.object(market_structure, "find_swing_points", return_value=[]))
+            stack.enter_context(patch.multiple(
+                market_structure,
+                find_structure_candidates=MagicMock(
+                    side_effect=lambda candles, left=None, right=None, for_stop=False: (
+                        htf_stop_pools if for_stop else htf_liquidity_pools
+                    ),
+                ),
+                average_true_range=MagicMock(return_value=htf_atr),
+            ))
+            stack.enter_context(patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest))
+            stack.enter_context(patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest))
+            stack.enter_context(patch.object(market_structure, "detect_ema_pullback", return_value=ema_pullback))
+            stack.enter_context(patch.object(market_structure, "exponential_moving_average", side_effect=_ema_side_effect))
+            stack.enter_context(patch.object(market_structure, "ema_prior_value", return_value=htf_trend_ema_prior))
+            stack.enter_context(patch.object(market_structure, "price_correlation", return_value=btc_correlation))
+            stack.enter_context(patch.object(market_structure, "price_return", return_value=btc_return))
+            stack.enter_context(patch.object(liquidity_sweep, "detect_sweep", return_value=sweep))
+            stack.enter_context(patch.object(
+                liquidity_sweep, "detect_liquidation_confirmed_sweep",
+                return_value=liquidation_confirmed_sweep,
+            ))
+            stack.enter_context(patch.object(cvd_divergence, "detect_divergence", return_value=divergence))
+            stack.enter_context(patch.object(oi_divergence, "detect_divergence", return_value=oi_divergence_result))
+
             return signal_engine.evaluate(
                 symbol, htf_candles, ltf_candle_list, cvd, depth,
                 oi_snapshot=oi_snapshot, liquidation_snapshot=liquidation_snapshot,
@@ -2820,6 +2852,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_order_block", return_value=None), \
              patch.object(market_structure, "find_liquidity_pools", return_value=[]) as mock_pools, \
              patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_structure_candidates", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.0), \
              patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
              patch.object(market_structure, "price_correlation", return_value=0.5), \
              patch.object(market_structure, "price_return", return_value=0.02), \
@@ -2842,6 +2876,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_order_block", return_value=None), \
              patch.object(market_structure, "find_liquidity_pools", return_value=[]) as mock_pools, \
              patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_structure_candidates", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.0), \
              patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
              patch.object(market_structure, "price_correlation", return_value=0.5), \
              patch.object(market_structure, "price_return", return_value=0.02), \
@@ -4283,6 +4319,8 @@ class SignalEngineTests(unittest.TestCase):
              patch.object(market_structure, "find_order_block", return_value=None) as mock_ob, \
              patch.object(market_structure, "find_liquidity_pools", return_value=[]) as mock_pools, \
              patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_structure_candidates", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.0), \
              patch.object(market_structure, "find_fvg_retest", return_value=None), \
              patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
              patch.object(market_structure, "price_correlation", return_value=0.5), \

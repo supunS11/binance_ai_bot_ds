@@ -521,6 +521,27 @@ PREMIUM_DISCOUNT_LOOKBACK_CANDLES = env_int(
 # precedent as EMA_TREND_MIXED_EXEMPT_TRIGGERS: can only ever let MORE
 # trades through, never fewer.
 #
+# 2026-09-14 correction, independent review (a second AI given the raw
+# reject-journal rows + this exact replay methodology, asked to try to
+# find problems rather than confirm the conclusion): the "single-trigger
+# rows only" grouping above actually counts a row toward EVERY trigger it
+# lists when a row names more than one (e.g. "CHOCH_RETEST,STRUCTURE_
+# BREAK") - not truly single-trigger, and not independent samples across
+# triggers that share rows. Re-running STRUCTURE_BREAK/LIQUIDITY_SWEEP
+# under STRICT exact-match (row's own trigger field equals that name and
+# nothing else) found neither holds up:
+#   STRUCTURE_BREAK (exact)   n=964  +0.120R/trade  H1=+0.251  H2=-0.010  (flips - was masked by multi-trigger rows)
+#   LIQUIDITY_SWEEP (exact)   n= 48  -0.063R/trade  H1= 0.000  H2=-0.125  (negative - was masked the same way)
+# Both H2 win rates (34.1%, 33.6%) sit essentially AT the 33.33% breakeven
+# for a 2R target - noise, not edge. ORDER_BLOCK_RETEST and CHOCH_RETEST
+# were re-checked the same way and DO hold up under exact-match (n=275
+# +0.364R/trade both halves positive; n=106 +0.132R/trade both halves
+# positive respectively) - only those two remain exempted below.
+# STRUCTURE_BREAK/LIQUIDITY_SWEEP removed - reverting to gated is itself
+# reject-only-safer in the opposite direction (can only ever remove
+# trades that were never evidenced in the first place, never trades a
+# solid result would have earned).
+#
 # NOT_IN_DISCOUNT (the BUY-side half of the same gate) is deliberately NOT
 # touched here - separately confirmed genuinely protective in aggregate
 # (avg_r=-0.190, stable negative across both halves), no per-trigger
@@ -1907,6 +1928,18 @@ STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # Deliberately smaller than the 0.5 used on stops: a stop wants clearance
 # from the level, a target only wants to be in front of the queue at it.
 STRUCTURE_TARGET_ATR_BUFFER = env_float("STRUCTURE_TARGET_ATR_BUFFER", 0.0)
+# 2026-09-14, operator-requested: "market movements happen with 4h
+# liquidity pools/FVGs/OBs" - anchors the INITIAL SL/TP1/TP2 (not DCA,
+# not retracement entry pricing) to HTF_KLINE_INTERVAL (4h) structure
+# instead of LTF (1h). No live evidence yet for this specific mechanism -
+# defaults off, same rollout convention as every other structural change
+# this session. Deliberately reuses STRUCTURE_STOP_ATR_BUFFER/
+# STRUCTURE_TARGET_ATR_BUFFER/SWING_LEFT/SWING_RIGHT/
+# LIQUIDITY_POOL_TOLERANCE_PCT/ORDER_BLOCK_RETEST_LOOKBACK_EVENTS/
+# FVG_LOOKBACK_CANDLES/ATR_PERIOD for the HTF computation too - same shape
+# of computation, just fed 4h candles instead of 1h ones; no new,
+# untuned knobs.
+SL_TP_USE_HTF_STRUCTURE = env_bool("SL_TP_USE_HTF_STRUCTURE", "False")
 # Hard floor: SL is never allowed closer to entry than this % of entry
 # price, regardless of how close the structure level happened to land -
 # prevents a pathologically tight stop (and the oversized position that

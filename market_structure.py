@@ -459,6 +459,66 @@ def find_liquidity_pools(swings, tolerance_pct=None):
     return pools
 
 
+def _ob_edges_as_pool(order_block, near):
+    if order_block["direction"] == "BULLISH":  # demand zone, below price
+        return {
+            "type": "SELL_SIDE",
+            "price": order_block["high"] if near else order_block["low"],
+            "touches": 0,
+        }
+
+    return {  # BEARISH - supply zone, above price
+        "type": "BUY_SIDE",
+        "price": order_block["low"] if near else order_block["high"],
+        "touches": 0,
+    }
+
+
+def _fvg_edges_as_pool(gap, near):
+    if gap["type"] == "BULLISH":  # gap below price, support
+        return {
+            "type": "SELL_SIDE",
+            "price": gap["top"] if near else gap["bottom"],
+            "touches": 0,
+        }
+
+    return {  # BEARISH - gap above price, resistance
+        "type": "BUY_SIDE",
+        "price": gap["bottom"] if near else gap["top"],
+        "touches": 0,
+    }
+
+
+def find_structure_candidates(candles, left=None, right=None, for_stop=False):
+    """Real liquidity pools PLUS order-block/FVG zone edges, normalised to
+    find_liquidity_pools' own {"type","price","touches"} shape so every
+    existing pool-consuming function in risk_manager.py (_find_structure_
+    target, _find_dca_level, _next_pool_beyond_stop) works unchanged
+    regardless of which candidate produced the level. touches=0 (never
+    produced by a real liquidity pool, which requires >=2) keeps a
+    synthetic OB/FVG edge distinguishable without colliding with the
+    None-means-fallback convention tp1_source relies on.
+
+    for_stop=False (target/TP usage, default): OB/FVG zones contribute
+    their NEAR edge (first realistic touch point) - matches
+    _find_structure_target's own nearest-qualifying-candidate bias.
+    for_stop=True (SL usage): zones contribute their FAR edge instead - a
+    stop must clear the whole zone, not rest at its first-touch edge."""
+    # list(...) copies rather than mutates find_liquidity_pools' own
+    # returned list in place via the .append() calls below - it may be a
+    # cached/shared object, not necessarily a fresh list per call.
+    pools = list(find_liquidity_pools(find_swing_points(candles, left, right)))
+    near = not for_stop
+
+    for block in find_order_blocks(candles, left, right):
+        pools.append(_ob_edges_as_pool(block, near))
+
+    for gap in find_fair_value_gaps(candles):
+        pools.append(_fvg_edges_as_pool(gap, near))
+
+    return pools
+
+
 def find_fvg_retest(
     candles, fvgs=None, max_age_candles=None, require_closed_candle=None,
     min_close_through_pct=None,

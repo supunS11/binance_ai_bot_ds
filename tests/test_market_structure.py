@@ -863,6 +863,68 @@ class LiquidityPoolTests(unittest.TestCase):
         self.assertEqual(pools, [])
 
 
+class FindStructureCandidatesTests(unittest.TestCase):
+    def test_bullish_order_block_becomes_sell_side_near_edge_by_default(self):
+        block = {"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}
+        with patch.object(ms, "find_liquidity_pools", return_value=[]), \
+             patch.object(ms, "find_order_blocks", return_value=[block]), \
+             patch.object(ms, "find_fair_value_gaps", return_value=[]):
+            pools = ms.find_structure_candidates([_candle(0, high=5, low=4)])
+
+        self.assertEqual(pools, [{"type": "SELL_SIDE", "price": 5, "touches": 0}])
+
+    def test_bullish_order_block_uses_far_edge_for_stop(self):
+        block = {"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}
+        with patch.object(ms, "find_liquidity_pools", return_value=[]), \
+             patch.object(ms, "find_order_blocks", return_value=[block]), \
+             patch.object(ms, "find_fair_value_gaps", return_value=[]):
+            pools = ms.find_structure_candidates([_candle(0, high=5, low=4)], for_stop=True)
+
+        self.assertEqual(pools, [{"type": "SELL_SIDE", "price": 4, "touches": 0}])
+
+    def test_bearish_order_block_becomes_buy_side(self):
+        block = {"direction": "BEARISH", "high": 10, "low": 9, "index": 0, "open_time": 0}
+        with patch.object(ms, "find_liquidity_pools", return_value=[]), \
+             patch.object(ms, "find_order_blocks", return_value=[block]), \
+             patch.object(ms, "find_fair_value_gaps", return_value=[]):
+            near = ms.find_structure_candidates([_candle(0, high=10, low=9)])
+            far = ms.find_structure_candidates([_candle(0, high=10, low=9)], for_stop=True)
+
+        self.assertEqual(near, [{"type": "BUY_SIDE", "price": 9, "touches": 0}])
+        self.assertEqual(far, [{"type": "BUY_SIDE", "price": 10, "touches": 0}])
+
+    def test_bullish_fvg_becomes_sell_side(self):
+        gap = {"type": "BULLISH", "top": 95, "bottom": 90, "index": 2}
+        with patch.object(ms, "find_liquidity_pools", return_value=[]), \
+             patch.object(ms, "find_order_blocks", return_value=[]), \
+             patch.object(ms, "find_fair_value_gaps", return_value=[gap]):
+            near = ms.find_structure_candidates([_candle(0, high=10, low=9)])
+            far = ms.find_structure_candidates([_candle(0, high=10, low=9)], for_stop=True)
+
+        self.assertEqual(near, [{"type": "SELL_SIDE", "price": 95, "touches": 0}])
+        self.assertEqual(far, [{"type": "SELL_SIDE", "price": 90, "touches": 0}])
+
+    def test_bearish_fvg_becomes_buy_side(self):
+        gap = {"type": "BEARISH", "top": 110, "bottom": 105, "index": 2}
+        with patch.object(ms, "find_liquidity_pools", return_value=[]), \
+             patch.object(ms, "find_order_blocks", return_value=[]), \
+             patch.object(ms, "find_fair_value_gaps", return_value=[gap]):
+            near = ms.find_structure_candidates([_candle(0, high=10, low=9)])
+            far = ms.find_structure_candidates([_candle(0, high=10, low=9)], for_stop=True)
+
+        self.assertEqual(near, [{"type": "BUY_SIDE", "price": 105, "touches": 0}])
+        self.assertEqual(far, [{"type": "BUY_SIDE", "price": 110, "touches": 0}])
+
+    def test_merges_with_real_liquidity_pools(self):
+        real_pool = {"type": "BUY_SIDE", "price": 120, "touches": 3}
+        with patch.object(ms, "find_liquidity_pools", return_value=[real_pool]), \
+             patch.object(ms, "find_order_blocks", return_value=[]), \
+             patch.object(ms, "find_fair_value_gaps", return_value=[]):
+            pools = ms.find_structure_candidates([_candle(0, high=10, low=9)])
+
+        self.assertEqual(pools, [real_pool])
+
+
 class PremiumDiscountZoneTests(unittest.TestCase):
     def _candles(self):
         return [_candle(i, high=110, low=90) for i in range(5)]

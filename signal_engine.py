@@ -201,6 +201,16 @@ def evaluate(
     if not htf_structure.get("available"):
         return _reject("HTF_STRUCTURE_UNAVAILABLE")
 
+    # config.SL_TP_USE_HTF_STRUCTURE - always computed regardless of the
+    # flag (cheap, pure, reuses already-in-memory htf_candles), same
+    # "log it before gating on it" pattern as nearest_favorable_
+    # structure_r/tp1_pool_touches/oi_rising. Hoisted here, not inside
+    # _evaluate_direction, so it only ever runs once per eval tick
+    # regardless of how many candidates get evaluated.
+    htf_target_pools = market_structure.find_structure_candidates(htf_candles, for_stop=False)
+    htf_stop_pools = market_structure.find_structure_candidates(htf_candles, for_stop=True)
+    htf_atr = market_structure.average_true_range(htf_candles)
+
     # config.HTF_TREND_SWING_AGE_REJECT_ENABLED - EXPLICIT LIVE TEST
     # (2026-08-27), see config.py's own comment for the real evidence and
     # its honest caveat (non-monotonic win rate, real MAE effect). "now" is
@@ -1302,11 +1312,14 @@ def evaluate(
             return _reject(f"NOT_IN_DISCOUNT price_zone={price_zone}")
 
         # config.NOT_IN_PREMIUM_EXEMPT_TRIGGERS (2026-09-13, see config.py's
-        # own comment for the full per-trigger evidence table) - STRUCTURE_
-        # BREAK/ORDER_BLOCK_RETEST/CHOCH_RETEST/LIQUIDITY_SWEEP all showed a
+        # own comment for the full per-trigger evidence table and the
+        # 2026-09-14 correction) - ORDER_BLOCK_RETEST/CHOCH_RETEST showed a
         # real, split-half-consistent positive expectancy in their blocked
-        # population; every other trigger stays gated. NOT_IN_DISCOUNT above
-        # is deliberately untouched - separately confirmed protective, no
+        # population under strict exact-match grouping; STRUCTURE_BREAK/
+        # LIQUIDITY_SWEEP looked the same only under a looser multi-trigger-
+        # row grouping and were removed once independent review caught that.
+        # Every other trigger stays gated. NOT_IN_DISCOUNT above is
+        # deliberately untouched - separately confirmed protective, no
         # per-trigger breakdown done for it.
         if (
             side == "SELL" and price_zone != "PREMIUM"
@@ -1876,6 +1889,11 @@ def evaluate(
             # carried through here at zero added cost, same as liquidity_pools
             # above - see risk_manager.compute_retracement_price.
             "fair_value_gaps": ltf_analysis["fair_value_gaps"],
+            # config.SL_TP_USE_HTF_STRUCTURE - see the hoisted computation
+            # above (once per eval tick, same as htf_structure itself).
+            "htf_liquidity_pools": htf_target_pools,
+            "htf_stop_pools": htf_stop_pools,
+            "htf_atr": htf_atr,
             "ema_value": ema_value,
             "ema_alignment_value": ema_alignment_value,
             "ema_aligned": ema_aligned,

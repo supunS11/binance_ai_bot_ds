@@ -513,16 +513,34 @@ def _apply_min_stop_distance(sl_price, entry_price, side, atr=0):
 
 
 def compute_stop_loss(signal, side):
-    level = signal.get("structure_level")
+    entry_price = signal.get("entry_price")
+
+    if config.SL_TP_USE_HTF_STRUCTURE:
+        # config.SL_TP_USE_HTF_STRUCTURE - the LTF structure_level a
+        # trigger fires against isn't used here; instead search the
+        # 4h-derived pool/OB/FVG candidates for the nearest real level
+        # beyond entry in the adverse direction, same shape compute_dca_
+        # sl_price already uses for its own DCA-fill stop. Falls back to
+        # 2x htf_atr (_dca_fallback_distance) when none qualifies, rather
+        # than refusing the trade outright - same reasoning that fallback
+        # already carries for the DCA leg.
+        atr = signal.get("htf_atr") or 0
+        level = _find_dca_level(signal.get("htf_stop_pools"), entry_price, side)
+
+        if level is None:
+            distance = _dca_fallback_distance(atr)
+            level = entry_price - distance if side == "BUY" else entry_price + distance
+    else:
+        level = signal.get("structure_level")
+        atr = signal.get("atr") or 0
 
     if level is None:
         return None
 
-    atr = signal.get("atr") or 0
     buffer = atr * max(float(config.STRUCTURE_STOP_ATR_BUFFER), 0)
     sl_price = level - buffer if side == "BUY" else level + buffer
 
-    return _apply_min_stop_distance(sl_price, signal.get("entry_price"), side, atr=atr)
+    return _apply_min_stop_distance(sl_price, entry_price, side, atr=atr)
 
 
 def _next_pool_beyond_stop(entry_price, sl_price, side, pools):
@@ -937,17 +955,32 @@ def build_trade_plan(signal, balance):
     # it was computed from turns out not to be the real one.
     tp1_static_roi_pct = config.TP_TARGET_ROI_PCT if config.TP_STATIC_ROI_ENABLED else None
 
+    # config.SL_TP_USE_HTF_STRUCTURE - TP1/TP2 search the 4h-derived pool/
+    # OB/FVG candidates (and their own htf_atr for the target buffer)
+    # instead of the LTF ones, same flag compute_stop_loss already
+    # branches on above. DCA (compute_dca_price below) and the plan's own
+    # carried-through liquidity_pools/fair_value_gaps/atr stay LTF -
+    # deliberately out of scope, see the plan doc.
+    pools_for_targets = (
+        signal.get("htf_liquidity_pools")
+        if config.SL_TP_USE_HTF_STRUCTURE else signal.get("liquidity_pools")
+    )
+    atr_for_targets = (
+        signal.get("htf_atr")
+        if config.SL_TP_USE_HTF_STRUCTURE else signal.get("atr")
+    )
+
     # config.STRUCTURE_TARGET_ATR_BUFFER - `atr` is only consumed to offset
     # the target off the pool it resolves to; a 0 buffer ignores it entirely.
     if config.TP_STATIC_ROI_ENABLED:
         tp1_price, tp2_price = compute_static_tp1_structure_tp2(
             entry_price, sl_price, side, config.TP_TARGET_ROI_PCT,
-            pools=signal.get("liquidity_pools"), atr=signal.get("atr"),
+            pools=pools_for_targets, atr=atr_for_targets,
         )
     else:
         tp1_price, tp2_price = compute_targets(
             entry_price, sl_price, side,
-            pools=signal.get("liquidity_pools"), atr=signal.get("atr"),
+            pools=pools_for_targets, atr=atr_for_targets,
         )
 
     if tp1_price is None or tp2_price is None:
@@ -968,7 +1001,7 @@ def build_trade_plan(signal, balance):
         single_tp = True
 
     nearest_favorable_sr_r = nearest_favorable_structure_r(
-        signal.get("liquidity_pools"), entry_price, side, risk_distance
+        pools_for_targets, entry_price, side, risk_distance
     )
 
     # config.TP_STATIC_ROI_ENABLED - a static-ROI TP1 was never resolved
@@ -980,8 +1013,8 @@ def build_trade_plan(signal, balance):
         tp1_source = "STATIC_ROI"
     else:
         tp1_pool_touches_ = tp1_pool_touches(
-            signal.get("liquidity_pools"), entry_price, side, risk_distance,
-            atr=signal.get("atr"),
+            pools_for_targets, entry_price, side, risk_distance,
+            atr=atr_for_targets,
         )
         tp1_source = "POOL" if tp1_pool_touches_ is not None else "FALLBACK"
 

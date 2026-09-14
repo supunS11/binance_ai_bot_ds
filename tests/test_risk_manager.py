@@ -26,6 +26,60 @@ class ComputeStopLossTests(unittest.TestCase):
         sl = risk_manager.compute_stop_loss({"structure_level": None, "atr": 2}, "BUY")
         self.assertIsNone(sl)
 
+    def test_htf_flag_on_uses_htf_stop_pools_and_htf_atr(self):
+        signal = {
+            "structure_level": 100, "atr": 2, "entry_price": 100,
+            "htf_stop_pools": [{"type": "SELL_SIDE", "price": 90, "touches": 0}],
+            "htf_atr": 5,
+        }
+
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertEqual(sl, 87.5)  # 90 - (5 * 0.5), NOT the LTF structure_level=100/atr=2 path
+
+    def test_htf_flag_on_falls_through_to_zero_buffer_when_htf_atr_missing(self):
+        signal = {
+            "structure_level": 100, "atr": 2, "entry_price": 100,
+            "htf_stop_pools": [{"type": "SELL_SIDE", "price": 90, "touches": 0}],
+        }
+
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0.5):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertEqual(sl, 90.0)  # htf_atr missing -> atr=0 -> buffer=0
+
+    def test_htf_flag_on_with_no_qualifying_pool_falls_back_to_htf_atr_distance(self):
+        signal = {
+            "structure_level": 100, "atr": 2, "entry_price": 100,
+            "htf_stop_pools": [], "htf_atr": 3,
+        }
+
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 0), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertEqual(sl, 94.0)  # entry(100) - 2*htf_atr(3) fallback, buffer=0
+
+    def test_htf_flag_on_with_no_pool_and_no_atr_still_applies_min_stop_floor(self):
+        # No htf_atr -> fallback distance is 2*0=0 -> level collapses to
+        # entry_price itself, same "never leave a trade with no computable
+        # stop" guarantee _dca_fallback_distance's callers already rely on
+        # - _apply_min_stop_distance's own floor then widens it from there,
+        # it does not return None.
+        signal = {"structure_level": 100, "atr": 2, "entry_price": 100, "htf_stop_pools": []}
+
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "MIN_STOP_DISTANCE_PCT", 1.0), \
+             patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", 0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertEqual(sl, 99.0)  # 100 - 1% floor
+
 
 class MinStopDistanceFloorTests(unittest.TestCase):
     """A structure level landing pathologically close to entry (fast/noisy
@@ -864,13 +918,19 @@ class BuildTradePlanTests(unittest.TestCase):
         self.tp2_enabled_patcher.stop()
         self.tp1_close_pct_patcher.stop()
 
-    def _signal(self, side="BUY", entry_price=100, structure_level=98, atr=1):
+    def _signal(
+        self, side="BUY", entry_price=100, structure_level=98, atr=1,
+        htf_stop_pools=None, htf_liquidity_pools=None, htf_atr=None,
+    ):
         return {
             "signal": side,
             "symbol": "BTCUSDT",
             "entry_price": entry_price,
             "structure_level": structure_level,
             "atr": atr,
+            "htf_stop_pools": htf_stop_pools,
+            "htf_liquidity_pools": htf_liquidity_pools,
+            "htf_atr": htf_atr,
         }
 
     def test_happy_path_produces_a_full_plan(self):
@@ -890,6 +950,26 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertEqual(plan["tp2_quantity"], 5.0)
         self.assertIsNone(plan["tp_price"])
         self.assertFalse(plan["single_tp"])
+
+    def test_htf_flag_on_uses_htf_pools_for_sl_and_targets(self):
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            signal = self._signal(
+                htf_stop_pools=[{"type": "SELL_SIDE", "price": 90, "touches": 0}],
+                htf_liquidity_pools=[{"type": "BUY_SIDE", "price": 130, "touches": 0}],
+                htf_atr=1,
+            )
+            plan, status = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(plan["sl_price"], 90)    # HTF pool, NOT the LTF structure_level=98
+        self.assertEqual(plan["tp1_price"], 130)  # HTF pool, NOT LTF liquidity_pools (none given)
 
     def test_static_roi_mode_uses_static_tp1_and_structure_tp2(self):
         # 2026-08-21: revised from a single whole-position target to a
