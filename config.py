@@ -498,6 +498,41 @@ LIQUIDITY_POOL_TOLERANCE_PCT = env_float("LIQUIDITY_POOL_TOLERANCE_PCT", 0.001)
 PREMIUM_DISCOUNT_LOOKBACK_CANDLES = env_int(
     "PREMIUM_DISCOUNT_LOOKBACK_CANDLES", 60
 )
+# 2026-09-13, real evidence - per-trigger breakdown of NOT_IN_PREMIUM's own
+# real blocked population (signal_engine._evaluate_direction, the SELL half
+# of the universal NOT_IN_DISCOUNT/NOT_IN_PREMIUM zone gate - see this
+# flag's use in signal_engine.py). Unlike EMA_TREND_MIXED/ZONE_DIRECTION_
+# OPPOSED, this gate had NO per-trigger exemption at all before this. Real
+# forward-5m replay (reject journal, Sep 6-13, real MIN_STOP_DISTANCE-floor
+# stop/2R target, same methodology as those two audits), single-trigger
+# rows only:
+#   STRUCTURE_BREAK      n=1587  +0.176R/trade  H1=+0.328  H2=+0.024  (both +)
+#   ORDER_BLOCK_RETEST   n= 551  +0.236R/trade  H1=+0.407  H2=+0.065  (both +)
+#   CHOCH_RETEST         n= 328  +0.335R/trade  H1=+0.390  H2=+0.281  (both +)
+#   LIQUIDITY_SWEEP      n= 214  +0.136R/trade  H1=+0.262  H2=+0.009  (both +)
+#   EMA_PULLBACK         n= 741  -0.105R/trade  H1=-0.003  H2=-0.208  (both - protective)
+#   CVD_DIVERGENCE       n=1627  +0.051R/trade  H1=+0.188  H2=-0.086  (flips - inconclusive)
+#   OB_FVG_RETEST        n=1129  +0.161R/trade  H1=+0.394  H2=-0.071  (flips - inconclusive)
+#   OI_DIVERGENCE        n=  91  -0.143R/trade  H1=+0.200  H2=-0.478  (flips - inconclusive)
+# Only the four triggers with BOTH a real sample and split-half-consistent
+# positive expectancy are exempted here - EMA_PULLBACK is genuinely
+# protective (left gated), CVD_DIVERGENCE/OB_FVG_RETEST/OI_DIVERGENCE flip
+# sign between halves (left gated, inconclusive). Reject-only-safer, same
+# precedent as EMA_TREND_MIXED_EXEMPT_TRIGGERS: can only ever let MORE
+# trades through, never fewer.
+#
+# NOT_IN_DISCOUNT (the BUY-side half of the same gate) is deliberately NOT
+# touched here - separately confirmed genuinely protective in aggregate
+# (avg_r=-0.190, stable negative across both halves), no per-trigger
+# breakdown was done for it, and it is out of scope for this flag.
+#
+# Same caveat as the other two audits, carried over honestly: this replay
+# uses the flat MIN_STOP_DISTANCE_PCT/ATR_MULTIPLE floor, not the real
+# structure-anchored SL live trades get - the real stop is usually
+# tighter, so if anything this understates how often SL would have hit,
+# making these positive numbers a conservative floor. Default empty - same
+# env_str_list empty-default gotcha as every other *_EXEMPT_TRIGGERS flag.
+NOT_IN_PREMIUM_EXEMPT_TRIGGERS = env_str_list("NOT_IN_PREMIUM_EXEMPT_TRIGGERS", [])
 # 2026-09-06, real evidence, operator-proposed. The NOT_IN_DISCOUNT/
 # NOT_IN_PREMIUM gate (signal_engine._evaluate_direction) asks only WHERE
 # price sits in the HTF range. It cannot tell "cheap inside a rising or
@@ -563,13 +598,29 @@ ZONE_DIRECTION_LOOKBACK_CANDLES = env_int("ZONE_DIRECTION_LOOKBACK_CANDLES", 18)
 #   LIQUIDITY_SWEEP      n= 46  -0.341R/trade  H1= -5.00  H2=-10.70  (both - genuinely protective, thinner n)
 # (CVD_DIVERGENCE measured +0.211R/trade, n=1178, but that trigger is
 # CVD_DIVERGENCE_TRIGGER_ENABLED=False as of this same session - excluded,
-# not forward-relevant.) Only the three triggers with BOTH a real sample
-# and split-half-consistent positive expectancy are exempted here -
-# STRUCTURE_BREAK/CHOCH_RETEST flip sign between halves (left gated,
-# genuinely inconclusive) and OI_DIVERGENCE/LIQUIDITY_SWEEP are
-# consistently negative (the gate is doing real protective work there,
-# left alone). Reject-only-safer, same precedent as EMA_TREND_MIXED_
-# EXEMPT_TRIGGERS: can only ever let MORE trades through, never fewer.
+# not forward-relevant.) At the time, only the three triggers with BOTH a
+# real sample and split-half-consistent positive expectancy were exempted -
+# STRUCTURE_BREAK/CHOCH_RETEST flipped sign between halves (left gated,
+# genuinely inconclusive) and OI_DIVERGENCE/LIQUIDITY_SWEEP were
+# consistently negative (the gate doing real protective work there, left
+# alone). Reject-only-safer, same precedent as EMA_TREND_MIXED_EXEMPT_
+# TRIGGERS: can only ever let MORE trades through, never fewer.
+#
+# 2026-09-13 update, same methodology, a full week of real rejects instead
+# of the original's Sep 8-12 window (n=1695 -> the same reject journal's
+# fuller history, real forward-5m replay, real MIN_STOP_DISTANCE floor):
+#   STRUCTURE_BREAK      n=331  -0.121R/trade  H1=-0.2545  H2=+0.0120  (still flips - left gated)
+#   OI_DIVERGENCE        n=143  -0.539R/trade  H1=-0.4507  H2=-0.6250  (still both - - left gated)
+#   LIQUIDITY_SWEEP      n= 56  -0.357R/trade  H1=-0.2500  H2=-0.4643  (still both - - left gated)
+#   CHOCH_RETEST         n=126  +0.191R/trade  H1=+0.2381  H2=+0.1429  (NOW both + - exempted below)
+# The first three reproduce the original call exactly - real confirmation
+# the 2026-09-12 audit was sound, not something this update second-guesses.
+# CHOCH_RETEST is a genuine update, not a re-litigation: the original n=89
+# flip (H1=+19.00/H2=-1.73) was a reasonable read of a thinner, shorter
+# sample - a fuller week changed the answer, so the flag changes with it.
+# (CVD_DIVERGENCE remeasured +0.203R/trade, n=2274, stable both halves -
+# still excluded, that trigger remains disabled entirely as of this same
+# session, unrelated to this gate.)
 #
 # Caveat carried over honestly: this replay uses the FLAT MIN_STOP_
 # DISTANCE_PCT/ATR_MULTIPLE floor, not the real structure-anchored SL live

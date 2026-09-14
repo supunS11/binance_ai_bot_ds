@@ -1088,6 +1088,34 @@ class SignalEngineTests(unittest.TestCase):
         # both hit the gate, same as before this exemption existed.
         self.assertEqual(result["triggers"], ["LIQUIDITY_SWEEP", "STRUCTURE_BREAK"])
 
+    # config.EMA_TREND_MIXED_EXEMPT_TRIGGERS - 2026-09-13 update, a fuller
+    # week of real reject-journal replay found CHOCH_RETEST's own MIXED
+    # population (originally n=63, "near breakeven") now n=349, split-half
+    # STABLE positive - added alongside ORDER_BLOCK_RETEST (see this flag's
+    # own comment above for the exact numbers).
+    def _mixed_choch_retest_buy(self, **kwargs):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        analysis["last_event"] = {"type": "CHoCH", "direction": "BULLISH", "index": -9, "price": 95}
+        analysis["last_swing_low"] = 88
+        analysis["last_swing_high"] = 112
+        return self._run(
+            ltf_ema_fast=110.0, ltf_ema_slow=100.0,
+            htf_ema_fast=100.0, htf_ema_slow=110.0,
+            ltf_analysis=analysis, sweep_direction=None,
+            **kwargs
+        )
+
+    def test_ema_trend_mixed_exempt_triggers_lets_choch_retest_through(self):
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_EXEMPT_TRIGGERS", ["CHOCH_RETEST"]), \
+             patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._mixed_choch_retest_buy()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
+        self.assertEqual(result["ema_trend_bucket"], "MIXED")
+
     # entry_range_position (2026-09-05) - "how bad is this entry for THIS
     # side". 0.0 = ideal end, 1.0 = worst end. _run's default ltf_close is
     # 93.0 with the fixture's own high/low, giving 0.67 for a BUY.
@@ -1249,6 +1277,60 @@ class SignalEngineTests(unittest.TestCase):
     def test_no_signal_when_price_not_in_discount_for_buy(self):
         result = self._run(ltf_close=105.0)
         self.assertIn("NOT_IN_DISCOUNT", result["reason"])
+
+    # config.NOT_IN_PREMIUM_EXEMPT_TRIGGERS (2026-09-13, see that flag's
+    # own config.py comment for the full per-trigger evidence table) -
+    # STRUCTURE_BREAK/ORDER_BLOCK_RETEST/CHOCH_RETEST/LIQUIDITY_SWEEP all
+    # showed a real, split-half-consistent positive expectancy in their
+    # NOT_IN_PREMIUM-blocked population; every other trigger stays gated.
+    # NOT_IN_DISCOUNT (the BUY-side half of this same gate) is untouched -
+    # separately confirmed genuinely protective, out of scope here.
+    def _sell_not_in_premium(self, ltf_analysis=None, sweep_direction="BEARISH", **kwargs):
+        ltf_analysis = LTF_BEARISH_BREAK if ltf_analysis is None else ltf_analysis
+        return self._run(
+            ltf_close=93.0,  # DISCOUNT, not PREMIUM - triggers NOT_IN_PREMIUM for a SELL
+            cvd={"available": True, "cvd_score": -0.5},
+            depth={"available": True, "depth_imbalance": -0.2},
+            htf_structure=HTF_BEARISH,
+            ltf_analysis=ltf_analysis,
+            sweep_direction=sweep_direction,
+            ema_value=115.0,
+            **kwargs,
+        )
+
+    def _order_block_retest_sell_not_in_premium(self, **kwargs):
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        return self._sell_not_in_premium(
+            ltf_analysis=analysis, sweep_direction=None,
+            order_block_retest_direction="BEARISH", order_block_retest_level=88,
+            **kwargs
+        )
+
+    def test_not_in_premium_exempt_triggers_lets_order_block_retest_through(self):
+        with patch.object(config, "NOT_IN_PREMIUM_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._order_block_retest_sell_not_in_premium()
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+
+    def test_not_in_premium_exempt_triggers_empty_by_default_still_rejects(self):
+        with patch.object(config, "NOT_IN_PREMIUM_EXEMPT_TRIGGERS", []), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._order_block_retest_sell_not_in_premium()
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("NOT_IN_PREMIUM", result["reason"])
+
+    def test_not_in_premium_exempt_triggers_does_not_affect_other_triggers(self):
+        # default _sell_not_in_premium fixture activates STRUCTURE_BREAK/
+        # LIQUIDITY_SWEEP, neither of which is exempted here - must still reject.
+        with patch.object(config, "NOT_IN_PREMIUM_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]):
+            result = self._sell_not_in_premium()
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("NOT_IN_PREMIUM", result["reason"])
 
     def test_no_signal_when_not_in_ote(self):
         # 99 is still < midpoint(100) -> discount, but outside (90, 95) OTE.
@@ -4498,6 +4580,28 @@ class ZoneDirectionGateTests(unittest.TestCase):
         self.assertIsNone(result["signal"])
         self.assertTrue(result["reason"].startswith("ZONE_DIRECTION_OPPOSED"))
         self.assertEqual(result["triggers"], ["LIQUIDITY_SWEEP", "STRUCTURE_BREAK"])
+
+    # config.ZONE_DIRECTION_EXEMPT_TRIGGERS - 2026-09-13 update, a fuller
+    # week of real reject-journal replay (see that flag's own config.py
+    # comment) found CHOCH_RETEST's blocked population now split-half
+    # STABLE positive (the original, thinner sample had flipped sign) -
+    # added to the exempt list alongside the three from the original audit.
+    def _choch_retest_buy_zone_opposed(self, **kwargs):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        analysis["last_event"] = {"type": "CHoCH", "direction": "BULLISH", "index": -9, "price": 95}
+        analysis["last_swing_low"] = 88
+        analysis["last_swing_high"] = 112
+        return self._run(sweep_direction=None, ltf_analysis=analysis, zone_direction="BEARISH", **kwargs)
+
+    def test_zone_direction_exempt_triggers_lets_choch_retest_through(self):
+        with patch.object(config, "ZONE_DIRECTION_REJECT_ENABLED", True), \
+             patch.object(config, "ZONE_DIRECTION_EXEMPT_TRIGGERS", ["CHOCH_RETEST"]), \
+             patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._choch_retest_buy_zone_opposed()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "CHOCH_RETEST")
 
 
 class RejectTriggerTaggingTests(unittest.TestCase):

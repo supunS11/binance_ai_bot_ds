@@ -1192,6 +1192,16 @@ def evaluate(
         # blocking. Evidence is 2 days old - thinner than this project's
         # usual bar - so this earns immediate scoped use on that basis
         # alone, not as a general relaxation.
+        #
+        # 2026-09-13 update: CHOCH_RETEST's own n=63 read above was "near
+        # breakeven," too thin to act on at the time. Real forward-5m
+        # replay of a full week's real reject-journal population (same
+        # MIN_STOP_DISTANCE-floor methodology, reject journal + real 5m
+        # klines) now shows n=349, +0.384R/trade, split-half STABLE
+        # positive (H1=+0.53, H2=+0.23) - a fuller sample changed a
+        # marginal call, not a re-litigation of the original one. Added
+        # alongside ORDER_BLOCK_RETEST for the same reason: a real,
+        # net-positive population this gate was blocking for free.
         if (
             config.EMA_TREND_MIXED_REJECT_ENABLED
             and ema_trend_bucket == "MIXED"
@@ -1291,7 +1301,17 @@ def evaluate(
         if side == "BUY" and price_zone != "DISCOUNT":
             return _reject(f"NOT_IN_DISCOUNT price_zone={price_zone}")
 
-        if side == "SELL" and price_zone != "PREMIUM":
+        # config.NOT_IN_PREMIUM_EXEMPT_TRIGGERS (2026-09-13, see config.py's
+        # own comment for the full per-trigger evidence table) - STRUCTURE_
+        # BREAK/ORDER_BLOCK_RETEST/CHOCH_RETEST/LIQUIDITY_SWEEP all showed a
+        # real, split-half-consistent positive expectancy in their blocked
+        # population; every other trigger stays gated. NOT_IN_DISCOUNT above
+        # is deliberately untouched - separately confirmed protective, no
+        # per-trigger breakdown done for it.
+        if (
+            side == "SELL" and price_zone != "PREMIUM"
+            and trigger not in config.NOT_IN_PREMIUM_EXEMPT_TRIGGERS
+        ):
             return _reject(f"NOT_IN_PREMIUM price_zone={price_zone}")
 
         # ZONE_DIRECTION_OPPOSED - the companion to the two rejects above.
