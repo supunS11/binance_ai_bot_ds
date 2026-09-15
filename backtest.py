@@ -10,9 +10,16 @@ Usage:
 
 Known, accepted fidelity gaps (see backtest_feed.py's module docstring and
 config sections below for why):
-  - Depth imbalance, open interest, and liquidations are unavailable
-    (informational-only in evaluate(), so this makes the backtest strictly
-    more permissive on those specific checks, never silently wrong).
+  - Depth imbalance, open interest, same-exchange liquidations, cross-
+    exchange liquidations, the liquidation-heatmap cluster feed
+    (signal["liquidation_pools"], so config.LIQUIDATION_HEATMAP_SL_TP_
+    ENABLED/LIQUIDATION_HEATMAP_SWEEP_ENABLED are no-ops here), and the
+    flash-crash detector (config.CRASH_DETECTOR_ENABLED - CrashDetector
+    needs real-time trades off CRASH_DETECTOR_REFERENCE_SYMBOL, only
+    fetched here for whichever symbol is currently being backtested) are
+    all unavailable (informational/fail-open in evaluate()/position_
+    manager.py, so this makes the backtest strictly more permissive on
+    those specific checks, never silently wrong).
   - CVD (a REQUIRED, gating input - unlike the three above) is only
     reconstructable for the most recent ~2 days of any range: Binance's
     aggTrades endpoint hard-rejects any startTime older than that

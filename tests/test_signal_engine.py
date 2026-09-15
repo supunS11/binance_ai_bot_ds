@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import config
 import cvd_divergence
+import liquidation_heatmap
 import liquidity_sweep
 import market_structure
 import oi_divergence
@@ -100,6 +101,14 @@ class SignalEngineTests(unittest.TestCase):
         ema_pullback_direction=None,
         ema_pullback_level=None,
         ema_pullback_open_time=555,
+        # config.CHOCH_RETEST_TRIGGER_ENABLED's real retest condition
+        # (detect_level_pullback) - defaults to matching whatever
+        # ltf_analysis's own CHoCH last_event already describes, so every
+        # existing CHOCH_RETEST test (built around _choch_analysis, none
+        # of which set up real candle price action for a wick-touch)
+        # keeps passing unchanged. Pass False to simulate "the age gate
+        # passed but price never actually retested this tick".
+        choch_retest_confirmed=True,
         ema_value=85.0,
         ema_alignment_value=85.0,
         htf_trend_ema=None,
@@ -127,6 +136,13 @@ class SignalEngineTests(unittest.TestCase):
         ltf_range_low=None,
         liquidation_snapshot_bybit=None,
         liquidation_snapshot_okx=None,
+        # config.LIQUIDATION_HEATMAP_ENABLED - always patched True inside
+        # this helper (see the ExitStack block below), with the real
+        # liquidation_heatmap.get_liquidation_pools mocked to return
+        # exactly this list - observably identical to the real
+        # production default ([] when the flag is off) for every
+        # existing test, since [] is also this kwarg's own default.
+        liquidation_pools=None,
         htf_liquidity_pools=None,
         htf_stop_pools=None,
         htf_atr=0.0,
@@ -139,6 +155,7 @@ class SignalEngineTests(unittest.TestCase):
         # existing test needs to know these exist unless it opts in.
         htf_liquidity_pools = [] if htf_liquidity_pools is None else htf_liquidity_pools
         htf_stop_pools = [] if htf_stop_pools is None else htf_stop_pools
+        liquidation_pools = [] if liquidation_pools is None else liquidation_pools
         cvd = {"available": True, "cvd_score": 0.5} if cvd is None else cvd
         depth = {"available": True, "depth_imbalance": 0.2} if depth is None else depth
         htf_structure = HTF_BULLISH if htf_structure is None else htf_structure
@@ -153,6 +170,18 @@ class SignalEngineTests(unittest.TestCase):
         )
         zone = ZONE if zone is None else zone
         ltf_analysis = LTF_BULLISH_BREAK if ltf_analysis is None else ltf_analysis
+        # config.CHOCH_RETEST_TRIGGER_ENABLED - mocked detect_level_
+        # pullback result, derived from ltf_analysis's own CHoCH
+        # last_event by default (see choch_retest_confirmed's own
+        # comment above).
+        _choch_event = ltf_analysis.get("last_event") or {}
+        _choch_default_direction = (
+            _choch_event.get("direction") if _choch_event.get("type") == "CHoCH" else None
+        )
+        choch_retest_result = (
+            {"direction": _choch_default_direction, "level": None, "open_time": None}
+            if choch_retest_confirmed and _choch_default_direction else None
+        )
         sweep = (
             {"direction": sweep_direction, "level": sweep_level, "open_time": sweep_open_time}
             if sweep_direction else None
@@ -310,6 +339,9 @@ class SignalEngineTests(unittest.TestCase):
             stack.enter_context(patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest))
             stack.enter_context(patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest))
             stack.enter_context(patch.object(market_structure, "detect_ema_pullback", return_value=ema_pullback))
+            stack.enter_context(patch.object(market_structure, "detect_level_pullback", return_value=choch_retest_result))
+            stack.enter_context(patch.object(config, "LIQUIDATION_HEATMAP_ENABLED", True))
+            stack.enter_context(patch.object(liquidation_heatmap, "get_liquidation_pools", return_value=liquidation_pools))
             stack.enter_context(patch.object(market_structure, "exponential_moving_average", side_effect=_ema_side_effect))
             stack.enter_context(patch.object(market_structure, "ema_prior_value", return_value=htf_trend_ema_prior))
             stack.enter_context(patch.object(market_structure, "price_correlation", return_value=btc_correlation))
@@ -765,6 +797,87 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(result["signal"], "BUY")
         self.assertFalse(result["against_htf_bias_probe"])
+
+    # config.AGAINST_HTF_BIAS_EXEMPT_TRIGGERS (2026-09-15) - real,
+    # evidence-backed pass-through, not a probe. See config.py's own
+    # comment for the full replay evidence (n=431, avg_r=+0.2251,
+    # split-half stable positive).
+
+    def test_against_htf_bias_exempt_triggers_lets_order_block_retest_through(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "AGAINST_HTF_BIAS_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._mismatched_htf_bias_fixture(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+        # Real pass, not a probe - against_htf_bias_probe must stay False.
+        self.assertFalse(result["against_htf_bias_probe"])
+
+    def test_against_htf_bias_exempt_triggers_empty_by_default_still_rejects(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "AGAINST_HTF_BIAS_EXEMPT_TRIGGERS", []), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._mismatched_htf_bias_fixture(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_against_htf_bias_exempt_triggers_does_not_affect_other_triggers(self):
+        # Default fixture's winning trigger is STRUCTURE_BREAK - not exempted.
+        with patch.object(config, "AGAINST_HTF_BIAS_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False):
+            result = self._mismatched_htf_bias_fixture()
+
+        self.assertIsNone(result["signal"])
+        self.assertIn("AGAINST_HTF_BIAS", result["reason"])
+
+    def test_against_htf_bias_exempt_triggers_also_skips_nested_strength_and_slope_checks(self):
+        # Same real bug shape the probe's own equivalent test guards
+        # against: without going through the exempt branch FIRST, an
+        # exempted-but-mismatched candidate could fall into the nested
+        # HTF_TREND_LIVE_WEAK_DISTANCE/_SLOPE checks and get rejected
+        # there instead, silently defeating the exemption.
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "AGAINST_HTF_BIAS_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "CROSS_EXCHANGE_OI_TRACKING_ENABLED", False), \
+             patch.object(config, "LIQUIDATION_CONFIRMATION_ENABLED", False), \
+             patch.object(config, "FUNDING_RATE_ENABLED", False), \
+             patch.object(config, "HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED", True), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_DISTANCE_PCT", 0.5), \
+             patch.object(config, "HTF_TREND_LIVE_MIN_SLOPE_PCT", 0.3):
+            result = self._mismatched_htf_bias_fixture(
+                ltf_analysis=analysis, sweep_direction=None,
+                order_block_retest_direction="BULLISH", order_block_retest_level=88,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
 
     # config.LTF_TREND_FILTER_ENABLED (2026-09-05) - the 1h sibling of
     # AGAINST_HTF_BIAS. Real evidence in that flag's own config.py comment:
@@ -2893,6 +3006,73 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(mock_pools.call_count, 1)
         self.assertEqual(mock_detect.call_count, 1)
 
+    def test_liquidation_heatmap_sweep_enabled_merges_liquidation_pools_into_sweep_search(self):
+        # A liquidation cluster positioned so ONLY it (not the real swing
+        # pool, which is a totally different level) could produce a sweep -
+        # proves LIQUIDATION_HEATMAP_SWEEP_ENABLED actually merges
+        # liquidation_pools into detect_sweep's own candidate list, not
+        # just that the flag exists.
+        real_pool = [{"type": "SELL_SIDE", "price": 200.0, "touches": 2}]
+        liquidation_pools = [{"type": "BUY_SIDE", "price": 88.0, "touches": 5}]
+
+        with patch.object(market_structure, "structure_state", return_value=HTF_BULLISH), \
+             patch.object(market_structure, "premium_discount_zone", return_value=ZONE), \
+             patch.object(market_structure, "analyze", return_value=LTF_BULLISH_BREAK), \
+             patch.object(market_structure, "find_order_block", return_value=None), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=real_pool), \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_structure_candidates", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.0), \
+             patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
+             patch.object(market_structure, "price_correlation", return_value=0.5), \
+             patch.object(market_structure, "price_return", return_value=0.02), \
+             patch.object(liquidity_sweep, "detect_sweep", return_value=None) as mock_detect, \
+             patch.object(liquidation_heatmap, "get_liquidation_pools", return_value=liquidation_pools), \
+             patch.object(config, "LIQUIDATION_HEATMAP_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_HEATMAP_SWEEP_ENABLED", True), \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_RISING_REJECT_ENABLED", False):
+            signal_engine.evaluate(
+                "BTCUSDT", [{"open_time": 0, "close": 100}], _ltf_candles(93.0),
+                {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
+                oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
+            )
+
+        searched_pools = mock_detect.call_args[0][1]
+        self.assertIn(real_pool[0], searched_pools)
+        self.assertIn(liquidation_pools[0], searched_pools)
+
+    def test_liquidation_heatmap_sweep_disabled_does_not_merge_liquidation_pools(self):
+        real_pool = [{"type": "SELL_SIDE", "price": 200.0, "touches": 2}]
+        liquidation_pools = [{"type": "BUY_SIDE", "price": 88.0, "touches": 5}]
+
+        with patch.object(market_structure, "structure_state", return_value=HTF_BULLISH), \
+             patch.object(market_structure, "premium_discount_zone", return_value=ZONE), \
+             patch.object(market_structure, "analyze", return_value=LTF_BULLISH_BREAK), \
+             patch.object(market_structure, "find_order_block", return_value=None), \
+             patch.object(market_structure, "find_liquidity_pools", return_value=real_pool), \
+             patch.object(market_structure, "find_swing_points", return_value=[]), \
+             patch.object(market_structure, "find_structure_candidates", return_value=[]), \
+             patch.object(market_structure, "average_true_range", return_value=0.0), \
+             patch.object(market_structure, "exponential_moving_average", return_value=85.0), \
+             patch.object(market_structure, "price_correlation", return_value=0.5), \
+             patch.object(market_structure, "price_return", return_value=0.02), \
+             patch.object(liquidity_sweep, "detect_sweep", return_value=None) as mock_detect, \
+             patch.object(liquidation_heatmap, "get_liquidation_pools", return_value=liquidation_pools), \
+             patch.object(config, "LIQUIDATION_HEATMAP_ENABLED", True), \
+             patch.object(config, "LIQUIDATION_HEATMAP_SWEEP_ENABLED", False), \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True), \
+             patch.object(config, "OI_RISING_REJECT_ENABLED", False):
+            signal_engine.evaluate(
+                "BTCUSDT", [{"open_time": 0, "close": 100}], _ltf_candles(93.0),
+                {"available": True, "cvd_score": 0.5}, {"available": True, "depth_imbalance": 0.2},
+                oi_snapshot=OI_RISING, liquidation_snapshot=LIQUIDATION_LONG_CLUSTER,
+            )
+
+        searched_pools = mock_detect.call_args[0][1]
+        self.assertIn(real_pool[0], searched_pools)
+        self.assertNotIn(liquidation_pools[0], searched_pools)
+
     # config.OB_FVG_RETEST_TRIGGER_ENABLED - a fresh rejection wick into an
     # unmitigated FVG, independent of any live break right now. Priority:
     # STRUCTURE_BREAK > OB_FVG_RETEST > LIQUIDITY_SWEEP > CHOCH_RETEST.
@@ -3114,6 +3294,19 @@ class SignalEngineTests(unittest.TestCase):
 
         with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", False):
             result = self._run(ltf_analysis=analysis, sweep_direction=None)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_choch_retest_requires_a_real_retest_not_just_age(self):
+        # Same fixture every other CHOCH_RETEST test uses (age=9, within
+        # the window) - the only difference is choch_retest_confirmed=
+        # False, simulating "the age gate passed but price never actually
+        # wicked back to the level this tick".
+        analysis = self._choch_analysis("BULLISH", event_price=95)
+
+        with patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(ltf_analysis=analysis, sweep_direction=None, choch_retest_confirmed=False)
 
         self.assertIsNone(result["signal"])
         self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
@@ -3687,10 +3880,19 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal_trigger"], "CVD_DIVERGENCE")
 
     def test_order_block_retest_still_respects_htf_bias(self):
+        # config.AGAINST_HTF_BIAS_EXEMPT_TRIGGERS - live .env now exempts
+        # ORDER_BLOCK_RETEST from this gate (real evidence, 2026-09-15 -
+        # see test_against_htf_bias_exempt_triggers_lets_order_block_
+        # retest_through for that behavior). This test predates that
+        # exemption and is about the GATE ITSELF still working correctly
+        # for a non-exempted trigger - pinned to [] so a live value can't
+        # silently flip what this test is actually checking, same pattern
+        # test_risk_manager.py's own module-level HTF-flag pin uses.
         analysis = dict(LTF_BULLISH_BREAK)
         analysis["live_break"] = {"broken": False}
 
-        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "AGAINST_HTF_BIAS_EXEMPT_TRIGGERS", []):
             result = self._run(
                 ltf_analysis=analysis, sweep_direction=None,
                 order_block_retest_direction="BULLISH", order_block_retest_level=88,
@@ -4868,6 +5070,34 @@ class DirectionStillConfirmedTests(unittest.TestCase):
         )
 
         self.assertFalse(confirmed)
+
+
+class LiquidationPoolsFieldTests(unittest.TestCase):
+    """config.LIQUIDATION_HEATMAP_ENABLED - additive-only field, see
+    liquidation_heatmap.py. Not merged into any gate/SL/TP path, so no
+    further fixture wiring beyond _run()'s own liquidation_pools= kwarg
+    is needed - just confirm the field is correctly populated on the
+    result. The real evaluate()-level `if config.LIQUIDATION_HEATMAP_
+    ENABLED else []` short-circuit itself is a trivial one-line ternary
+    not separately tested here - _run() always exercises the True path
+    (mocking get_liquidation_pools) so liquidation_pools=None/[] (the
+    default) already proves the off-by-default production behavior
+    observably, without needing _run() to also support toggling the
+    flag itself."""
+
+    def test_liquidation_pools_populated_when_enabled(self):
+        pools = [{"type": "SELL_SIDE", "price": 100.0, "touches": 3}]
+        result = SignalEngineTests()._run(liquidation_pools=pools)
+
+        self.assertEqual(result["liquidation_pools"], pools)
+
+    def test_liquidation_pools_empty_by_default(self):
+        result = SignalEngineTests()._run()
+
+        # No liquidation_pools kwarg -> get_liquidation_pools (mocked
+        # True inside _run) returns [] by default, same as the real
+        # production result whenever LIQUIDATION_HEATMAP_ENABLED=False.
+        self.assertEqual(result["liquidation_pools"], [])
 
 
 if __name__ == "__main__":

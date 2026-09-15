@@ -32,6 +32,11 @@ FIELDNAMES = [
     # POOL/FALLBACK/STATIC_ROI; tp1_pool_touches is only non-blank when
     # tp1_source is POOL.
     "tp1_source", "tp1_pool_touches",
+    # config.LIQUIDATION_HEATMAP_ENABLED - how many real historical
+    # liquidation clusters existed for this symbol at signal time.
+    # Additive/informational only - see liquidation_heatmap.py; nothing
+    # yet gates on this, it's here so real evidence can accumulate first.
+    "liquidation_pool_count",
     "setup_age_candles", "signal_trigger", "atr", "ema_value", "ema_alignment_value", "ema_aligned", "htf_trend", "htf_trend_live", "htf_trend_live_distance_pct", "htf_trend_live_slope_pct", "ltf_trend_live", "ltf_ema_regime", "htf_ema_regime", "ema_trend_bucket", "entry_range_position", "htf_trend_swing_age_hours", "premium_discount_zone",
     "zone_direction",
     "confirmation_available", "confirmation_favourable",
@@ -306,6 +311,7 @@ def append_signal(signal, plan, execution_result=None):
         "nearest_favorable_sr_r": plan.get("nearest_favorable_sr_r"),
         "tp1_source": plan.get("tp1_source"),
         "tp1_pool_touches": plan.get("tp1_pool_touches"),
+        "liquidation_pool_count": len(signal.get("liquidation_pools") or []),
         # How many candles old the underlying setup (CHoCH/FVG/order
         # block/divergence) actually was at entry - distinct from
         # entry_extension_r (that's price distance from the level, not

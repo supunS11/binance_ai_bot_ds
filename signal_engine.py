@@ -16,6 +16,7 @@ import absorption
 import config
 import cross_exchange_oi
 import cvd_divergence
+import liquidation_heatmap
 import liquidity_sweep
 import market_structure
 import oi_divergence
@@ -211,6 +212,17 @@ def evaluate(
     htf_stop_pools = market_structure.find_structure_candidates(htf_candles, for_stop=True)
     htf_atr = market_structure.average_true_range(htf_candles)
 
+    # config.LIQUIDATION_HEATMAP_ENABLED - real historical forced-
+    # liquidation clusters (see liquidation_heatmap.py), additive only:
+    # journaled below (liquidation_pool_count) so real evidence
+    # accumulates, but not merged into htf_target_pools/htf_stop_pools or
+    # any live trade's SL/TP yet - zero evidence exists yet that this
+    # predicts anything better than the existing structure-derived pools.
+    liquidation_pools = (
+        liquidation_heatmap.get_liquidation_pools(symbol)
+        if config.LIQUIDATION_HEATMAP_ENABLED else []
+    )
+
     # config.HTF_TREND_SWING_AGE_REJECT_ENABLED - EXPLICIT LIVE TEST
     # (2026-08-27), see config.py's own comment for the real evidence and
     # its honest caveat (non-monotonic win rate, real MAE effect). "now" is
@@ -365,6 +377,14 @@ def evaluate(
         pools = market_structure.find_liquidity_pools(
             market_structure.find_swing_points(ltf_candles)
         )
+
+        # config.LIQUIDATION_HEATMAP_SWEEP_ENABLED - real forced-
+        # liquidation clusters merged alongside the real swing-based
+        # pools, same shape, same sweep search - additive only, can only
+        # ever let detect_sweep find MORE real sweeps, never fewer.
+        if config.LIQUIDATION_HEATMAP_SWEEP_ENABLED:
+            pools = pools + liquidation_pools
+
         sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
 
     # config.OB_FVG_RETEST_TRIGGER_ENABLED - a fourth, alternative entry
@@ -698,27 +718,39 @@ def evaluate(
         and choch_age >= max(int(config.CHOCH_TRIGGER_MIN_AGE_CANDLES), 0)
     ):
         choch_direction = ltf_analysis["last_event"]["direction"]
-        candidates.append({
-            "signal_trigger": "CHOCH_RETEST",
-            "direction": choch_direction,
-            # Deliberately NOT last_event["price"] - that's the price of
-            # the NEW pivot that caused the event (e.g. a swing HIGH for
-            # a bullish reversal), not the level that was broken. The
-            # current retracement level is last_swing_low/last_swing_high,
-            # the same fields STRUCTURE_BREAK already derives from.
-            "structure_level": (
-                ltf_analysis["last_swing_low"] if choch_direction == "BULLISH"
-                else ltf_analysis["last_swing_high"]
-            ),
-            "trigger_candle_open_time": None,
-            # Same expression the age-gate check just above already
-            # computes to enforce CHOCH_TRIGGER_MAX_AGE_CANDLES/MIN_AGE_
-            # CANDLES - never journaled before now (see signal_journal.py's
-            # setup_age_candles comment). CHOCH_RETEST is a retest of an
-            # already-confirmed reversal, so unlike STRUCTURE_BREAK/
-            # EMA_PULLBACK this is almost never 0.
-            "setup_age_candles": choch_age,
-        })
+        # Deliberately NOT last_event["price"] - that's the price of the
+        # NEW pivot that caused the event (e.g. a swing HIGH for a
+        # bullish reversal), not the level that was broken. The current
+        # retracement level is last_swing_low/last_swing_high, the same
+        # fields STRUCTURE_BREAK already derives from.
+        choch_level = (
+            ltf_analysis["last_swing_low"] if choch_direction == "BULLISH"
+            else ltf_analysis["last_swing_high"]
+        )
+        # 2026-09-15, Grok independent review finding: the age gate alone
+        # never confirmed price actually retraced back to choch_level -
+        # unlike OB_FVG_RETEST/ORDER_BLOCK_RETEST, which both require a
+        # real wick-touch-and-reclaim. detect_level_pullback applies that
+        # same condition here, against the active swing level instead of
+        # the EMA (same function EMA_PULLBACK now shares).
+        choch_retest = market_structure.detect_level_pullback(ltf_candles, choch_level)
+
+        if choch_retest is not None and choch_retest["direction"] == choch_direction:
+            candidates.append({
+                "signal_trigger": "CHOCH_RETEST",
+                "direction": choch_direction,
+                "structure_level": choch_level,
+                # Was always None before - now the real retest candle's
+                # open_time, same shape every other retest trigger
+                # already journals.
+                "trigger_candle_open_time": choch_retest.get("open_time"),
+                # Same expression the age-gate check just above already
+                # computes to enforce CHOCH_TRIGGER_MAX_AGE_CANDLES/MIN_
+                # AGE_CANDLES - CHOCH_RETEST is a retest of an already-
+                # confirmed reversal, so unlike STRUCTURE_BREAK/
+                # EMA_PULLBACK this is almost never 0.
+                "setup_age_candles": choch_age,
+            })
 
     if (
         config.CVD_DIVERGENCE_TRIGGER_ENABLED
@@ -1052,6 +1084,13 @@ def evaluate(
             against_htf_bias_mismatch = bool(htf_side and side != htf_side)
 
             if against_htf_bias_mismatch:
+                # config.AGAINST_HTF_BIAS_EXEMPT_TRIGGERS - a real,
+                # evidence-backed pass-through (not a probe): an exempted
+                # trigger sees no shadow routing here at all, unlike the
+                # probe check just below. Checked first since it's the
+                # cheapest condition, same "cheap check first" ordering
+                # the probe's own comment already establishes.
+                #
                 # config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO - checked in
                 # this exact order so a disabled/inert probe (ratio<=0, the
                 # shipped default) costs nothing beyond the two attribute
@@ -1060,7 +1099,9 @@ def evaluate(
                 # passed. Reject-only-safer, same precedent as every other
                 # probe in this project: this can only ever turn a REJECT
                 # into a SHADOW trade, never the reverse.
-                if (
+                if trigger in config.AGAINST_HTF_BIAS_EXEMPT_TRIGGERS:
+                    pass
+                elif (
                     config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO > 0
                     and trigger not in config.AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS
                     and _against_htf_bias_probe_ratio() >= config.AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO
@@ -1758,6 +1799,10 @@ def evaluate(
             pools = market_structure.find_liquidity_pools(
                 market_structure.find_swing_points(ltf_candles)
             )
+
+            if config.LIQUIDATION_HEATMAP_SWEEP_ENABLED:
+                pools = pools + liquidation_pools
+
             sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
 
         sweep_confluence = bool(sweep and sweep["direction"] == direction)
@@ -1894,6 +1939,10 @@ def evaluate(
             "htf_liquidity_pools": htf_target_pools,
             "htf_stop_pools": htf_stop_pools,
             "htf_atr": htf_atr,
+            # config.LIQUIDATION_HEATMAP_ENABLED - see the hoisted
+            # computation above (once per eval tick). Additive/journaled
+            # only - see signal_journal.py's liquidation_pool_count.
+            "liquidation_pools": liquidation_pools,
             "ema_value": ema_value,
             "ema_alignment_value": ema_alignment_value,
             "ema_aligned": ema_aligned,

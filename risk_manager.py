@@ -525,7 +525,16 @@ def compute_stop_loss(signal, side):
         # than refusing the trade outright - same reasoning that fallback
         # already carries for the DCA leg.
         atr = signal.get("htf_atr") or 0
-        level = _find_dca_level(signal.get("htf_stop_pools"), entry_price, side)
+        stop_pools = list(signal.get("htf_stop_pools") or [])
+
+        # config.LIQUIDATION_HEATMAP_SL_TP_ENABLED - real forced-
+        # liquidation clusters merged alongside the existing pool/OB/FVG
+        # candidates, same shape, same search (_find_dca_level below
+        # doesn't know or care which produced a given candidate).
+        if config.LIQUIDATION_HEATMAP_SL_TP_ENABLED:
+            stop_pools += signal.get("liquidation_pools") or []
+
+        level = _find_dca_level(stop_pools, entry_price, side)
 
         if level is None:
             distance = _dca_fallback_distance(atr)
@@ -965,6 +974,15 @@ def build_trade_plan(signal, balance):
         signal.get("htf_liquidity_pools")
         if config.SL_TP_USE_HTF_STRUCTURE else signal.get("liquidity_pools")
     )
+    pools_for_targets = list(pools_for_targets or [])
+
+    # config.LIQUIDATION_HEATMAP_SL_TP_ENABLED - target search is always
+    # list-based (both branches above already produce a list), so this
+    # merge applies regardless of SL_TP_USE_HTF_STRUCTURE, unlike the
+    # stop-side merge in compute_stop_loss.
+    if config.LIQUIDATION_HEATMAP_SL_TP_ENABLED:
+        pools_for_targets += signal.get("liquidation_pools") or []
+
     atr_for_targets = (
         signal.get("htf_atr")
         if config.SL_TP_USE_HTF_STRUCTURE else signal.get("atr")

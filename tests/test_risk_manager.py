@@ -4,6 +4,35 @@ from unittest.mock import patch
 import config
 import risk_manager
 
+# config.SL_TP_USE_HTF_STRUCTURE - live .env now has this True (operator's
+# own choice, 2026-09-14) but almost every test in this file predates that
+# flag and asserts the original LTF-anchored structure_level/liquidity_pools
+# behavior without patching it - pinned False for the whole module so a live
+# value can't silently switch compute_stop_loss/build_trade_plan onto the
+# HTF branch out from under them, same pattern BuildTradePlanTests.setUp
+# already uses for MAX_ENTRY_EXTENSION_R/MAX_SL_ROI_PCT/etc. The dedicated
+# HTF tests (test_htf_flag_on_*) turn it back on locally, same as those.
+#
+# config.LIQUIDATION_HEATMAP_SL_TP_ENABLED - pinned False here PROACTIVELY,
+# before any live .env value exists for it - the SL_TP_USE_HTF_STRUCTURE
+# gap above (a real regression, caught 2026-09-15 only because a wider
+# test run happened to include it) showed this exact "new flag, old tests
+# never pin it, live .env eventually sets it, tests silently break" cycle
+# is real and will repeat for every new SL/TP-path flag if not guarded
+# here from the start.
+_htf_flag_patcher = patch.object(config, "SL_TP_USE_HTF_STRUCTURE", False)
+_liquidation_sl_tp_patcher = patch.object(config, "LIQUIDATION_HEATMAP_SL_TP_ENABLED", False)
+
+
+def setUpModule():
+    _htf_flag_patcher.start()
+    _liquidation_sl_tp_patcher.start()
+
+
+def tearDownModule():
+    _htf_flag_patcher.stop()
+    _liquidation_sl_tp_patcher.stop()
+
 
 class ComputeStopLossTests(unittest.TestCase):
     def test_buy_stop_is_below_structure_level_minus_atr_buffer(self):
@@ -25,6 +54,40 @@ class ComputeStopLossTests(unittest.TestCase):
     def test_missing_structure_level_returns_none(self):
         sl = risk_manager.compute_stop_loss({"structure_level": None, "atr": 2}, "BUY")
         self.assertIsNone(sl)
+
+    def test_liquidation_heatmap_sl_tp_enabled_merges_into_htf_stop_search(self):
+        # A liquidation cluster (95) sits closer to entry than the real
+        # structure pool (90) - proves it's a genuine MERGE into the same
+        # search, not just presence, since _find_dca_level picks the
+        # NEAREST qualifying candidate.
+        signal = {
+            "structure_level": 100, "atr": 2, "entry_price": 100,
+            "htf_stop_pools": [{"type": "SELL_SIDE", "price": 90, "touches": 0}],
+            "liquidation_pools": [{"type": "SELL_SIDE", "price": 95, "touches": 3}],
+            "htf_atr": 5,
+        }
+
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "LIQUIDATION_HEATMAP_SL_TP_ENABLED", True), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertEqual(sl, 95)  # the nearer liquidation cluster, not the structure pool at 90
+
+    def test_liquidation_heatmap_sl_tp_disabled_ignores_liquidation_pools(self):
+        signal = {
+            "structure_level": 100, "atr": 2, "entry_price": 100,
+            "htf_stop_pools": [{"type": "SELL_SIDE", "price": 90, "touches": 0}],
+            "liquidation_pools": [{"type": "SELL_SIDE", "price": 95, "touches": 3}],
+            "htf_atr": 5,
+        }
+
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "LIQUIDATION_HEATMAP_SL_TP_ENABLED", False), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0):
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+
+        self.assertEqual(sl, 90)  # unaffected by the present-but-ignored liquidation_pools
 
     def test_htf_flag_on_uses_htf_stop_pools_and_htf_atr(self):
         signal = {
@@ -921,6 +984,7 @@ class BuildTradePlanTests(unittest.TestCase):
     def _signal(
         self, side="BUY", entry_price=100, structure_level=98, atr=1,
         htf_stop_pools=None, htf_liquidity_pools=None, htf_atr=None,
+        liquidity_pools=None, liquidation_pools=None,
     ):
         return {
             "signal": side,
@@ -931,6 +995,8 @@ class BuildTradePlanTests(unittest.TestCase):
             "htf_stop_pools": htf_stop_pools,
             "htf_liquidity_pools": htf_liquidity_pools,
             "htf_atr": htf_atr,
+            "liquidity_pools": liquidity_pools,
+            "liquidation_pools": liquidation_pools,
         }
 
     def test_happy_path_produces_a_full_plan(self):
@@ -970,6 +1036,74 @@ class BuildTradePlanTests(unittest.TestCase):
         self.assertEqual(status, "OK")
         self.assertEqual(plan["sl_price"], 90)    # HTF pool, NOT the LTF structure_level=98
         self.assertEqual(plan["tp1_price"], 130)  # HTF pool, NOT LTF liquidity_pools (none given)
+
+    def test_liquidation_heatmap_sl_tp_enabled_merges_into_htf_target_search(self):
+        # A closer liquidation cluster (110, 1.0R) must win over the real
+        # structure pool (130, 3.0R) - proves a genuine merge, since
+        # _find_structure_target picks the NEAREST qualifying candidate.
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "LIQUIDATION_HEATMAP_SL_TP_ENABLED", True), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            signal = self._signal(
+                htf_stop_pools=[{"type": "SELL_SIDE", "price": 90, "touches": 0}],
+                htf_liquidity_pools=[{"type": "BUY_SIDE", "price": 130, "touches": 0}],
+                liquidation_pools=[{"type": "BUY_SIDE", "price": 110, "touches": 5}],
+                htf_atr=1,
+            )
+            plan, status = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(plan["tp1_price"], 110)
+
+    def test_liquidation_heatmap_sl_tp_merges_into_ltf_target_search_too(self):
+        # Target-side merge applies regardless of SL_TP_USE_HTF_STRUCTURE
+        # (unlike the stop-side merge, which is HTF-only) - confirmed
+        # here with the flag OFF, using the LTF liquidity_pools field.
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", False), \
+             patch.object(config, "LIQUIDATION_HEATMAP_SL_TP_ENABLED", True), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            signal = self._signal(
+                structure_level=98,  # LTF stop: risk_distance = 100-98 = 2
+                liquidity_pools=[{"type": "BUY_SIDE", "price": 110, "touches": 0}],
+                liquidation_pools=[{"type": "BUY_SIDE", "price": 104, "touches": 3}],
+            )
+            plan, status = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(status, "OK")
+        self.assertEqual(plan["sl_price"], 98)   # unaffected - LTF stop path, no merge
+        self.assertEqual(plan["tp1_price"], 104)  # nearer liquidation cluster wins over 110
+
+    def test_liquidation_heatmap_sl_tp_disabled_does_not_change_targets(self):
+        with patch.object(config, "SL_TP_USE_HTF_STRUCTURE", True), \
+             patch.object(config, "LIQUIDATION_HEATMAP_SL_TP_ENABLED", False), \
+             patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", 0), \
+             patch.object(config, "STRUCTURE_TARGET_ATR_BUFFER", 0), \
+             patch.object(config, "TP1_R_MULTIPLE", 1.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 6.0), \
+             patch.object(config, "TP2_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_CLOSE_PCT", 50), \
+             patch.object(risk_manager, "calculate_position_size", return_value=10.0):
+            signal = self._signal(
+                htf_stop_pools=[{"type": "SELL_SIDE", "price": 90, "touches": 0}],
+                htf_liquidity_pools=[{"type": "BUY_SIDE", "price": 130, "touches": 0}],
+                liquidation_pools=[{"type": "BUY_SIDE", "price": 110, "touches": 5}],
+                htf_atr=1,
+            )
+            plan, status = risk_manager.build_trade_plan(signal, balance=1000)
+
+        self.assertEqual(plan["tp1_price"], 130)  # unaffected by the present-but-ignored liquidation_pools
 
     def test_static_roi_mode_uses_static_tp1_and_structure_tp2(self):
         # 2026-08-21: revised from a single whole-position target to a

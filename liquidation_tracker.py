@@ -59,7 +59,7 @@ def _order_payload(message):
 class LiquidationEngine:
     def __init__(self):
         self.lock = threading.RLock()
-        self._events = {}  # symbol -> deque[(timestamp, side, notional)]
+        self._events = {}  # symbol -> deque[(timestamp, side, notional, price)]
 
     def _series(self, symbol):
         series = self._events.get(symbol)
@@ -70,30 +70,43 @@ class LiquidationEngine:
 
         return series
 
-    def record_liquidation(self, symbol, side, notional, timestamp=None):
+    def record_liquidation(self, symbol, side, notional, timestamp=None, price=None):
+        """Returns True if the event was accepted, False if dropped
+        (invalid side/notional) - callers that also journal this event
+        durably (see liquidation_journal.py) use this to avoid journaling
+        something this engine itself considers garbage. `price` is kept
+        purely for downstream historical clustering (liquidation_heatmap.py)
+        - this engine's own snapshot() never reads it, unchanged below."""
         side = str(side or "").upper()
 
         if side not in ("BUY", "SELL") or notional is None or notional <= 0:
-            return
+            return False
 
         symbol = symbol.upper()
         timestamp = time.time() if timestamp is None else float(timestamp)
+        price = _safe_float(price, None)
 
         with self.lock:
-            self._series(symbol).append((timestamp, side, float(notional)))
+            self._series(symbol).append((timestamp, side, float(notional), price))
+
+        return True
 
     def handle_message(self, message):
         """Parse one raw `!forceOrder@arr` websocket message and record it.
-        Never raises - a malformed message is simply dropped."""
+        Never raises - a malformed message is simply dropped. Returns the
+        normalized (symbol, side, notional, timestamp, price) tuple when
+        accepted, or None (malformed input, or record_liquidation itself
+        dropped it) - so a caller can durably journal the exact same real
+        event without re-parsing the raw message."""
         order = _order_payload(message)
 
         if not order:
-            return
+            return None
 
         symbol = str(order.get("s") or "")
 
         if not symbol:
-            return
+            return None
 
         side = order.get("S")
         price = _safe_float(order.get("ap")) or _safe_float(order.get("p"))
@@ -101,7 +114,10 @@ class LiquidationEngine:
         notional = abs(price * quantity)
         timestamp = _safe_float(order.get("T") or order.get("E"), time.time() * 1000) / 1000
 
-        self.record_liquidation(symbol, side, notional, timestamp=timestamp)
+        if not self.record_liquidation(symbol, side, notional, timestamp=timestamp, price=price):
+            return None
+
+        return (symbol.upper(), str(side or "").upper(), notional, timestamp, price)
 
     def snapshot(self, symbol, now=None):
         """`net_liquidation_notional` is long-liquidation notional (forced
@@ -129,8 +145,8 @@ class LiquidationEngine:
             }
 
         # SELL-side forced orders close out longs; BUY-side close out shorts.
-        long_notional = sum(notional for _, side, notional in recent if side == "SELL")
-        short_notional = sum(notional for _, side, notional in recent if side == "BUY")
+        long_notional = sum(notional for _, side, notional, _ in recent if side == "SELL")
+        short_notional = sum(notional for _, side, notional, _ in recent if side == "BUY")
 
         return {
             "available": True,

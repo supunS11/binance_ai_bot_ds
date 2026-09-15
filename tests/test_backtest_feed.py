@@ -21,6 +21,9 @@ class BacktestFeedCandleTests(unittest.TestCase):
         self.assertEqual(len(candles), 2)
         self.assertTrue(all(c["closed"] for c in candles))
         self.assertEqual(candles[-1]["close"], 2)
+        # config.EMA_TREND_MIXED_REJECT_ENABLED's own, deeper buffer -
+        # mirrors .candles exactly (see BacktestFeed.__init__).
+        self.assertEqual(feed.trend_candles.get("BTCUSDT"), candles)
 
     def test_seed_htf_is_independent_of_ltf(self):
         feed = BacktestFeed()
@@ -33,6 +36,8 @@ class BacktestFeedCandleTests(unittest.TestCase):
         self.assertEqual(len(feed.candles.get("BTCUSDT")), 1)
         self.assertEqual(len(feed.htf_candles.get("BTCUSDT")), 1)
         self.assertEqual(feed.htf_candles.get("BTCUSDT")[0]["close"], 5)
+        self.assertEqual(feed.htf_trend_candles.get("BTCUSDT")[0]["close"], 5)
+        self.assertEqual(feed.trend_candles.get("BTCUSDT")[0]["close"], 1)
 
     def test_push_ltf_candle_advances_the_rolling_window(self):
         feed = BacktestFeed(ltf_history_limit=10)
@@ -50,6 +55,7 @@ class BacktestFeedCandleTests(unittest.TestCase):
         self.assertEqual(len(candles), 2)
         self.assertEqual(candles[-1]["close"], 2)
         self.assertEqual(feed.candles.latest("BTCUSDT")["open_time"], 2000)
+        self.assertEqual(feed.trend_candles.get("BTCUSDT"), candles)
 
     def test_push_htf_candle_updates_htf_store_only(self):
         feed = BacktestFeed()
@@ -61,6 +67,8 @@ class BacktestFeedCandleTests(unittest.TestCase):
 
         self.assertEqual(len(feed.htf_candles.get("BTCUSDT")), 1)
         self.assertEqual(feed.candles.get("BTCUSDT"), [])
+        self.assertEqual(len(feed.htf_trend_candles.get("BTCUSDT")), 1)
+        self.assertEqual(feed.trend_candles.get("BTCUSDT"), [])
 
 
 class BacktestFeedCvdTests(unittest.TestCase):
@@ -99,12 +107,40 @@ class BacktestFeedCvdTests(unittest.TestCase):
 
 
 class BacktestFeedStubSourceTests(unittest.TestCase):
-    def test_depth_open_interest_liquidations_report_unavailable(self):
+    # Every stub attribute main._evaluate_symbol actually reads off a live
+    # feed - see backtest_feed.py's own module docstring for the full
+    # attribute list this class must duck-type. Real bug found live
+    # (2026-09-15): main.py reads feed.liquidations_bybit/feed.
+    # liquidations_okx unconditionally, but this class never grew those
+    # two attributes when cross_exchange_liquidation.py was added - every
+    # backtest run crashed with AttributeError before ever reaching
+    # signal_engine.evaluate(), and no test caught it because the old
+    # version of this test only checked 3 of the (now) 7 stub attributes.
+    # Enumerated once here so a future new feed attribute that main.py
+    # starts reading gets the same coverage automatically, not just
+    # whichever ones happened to exist when this test was last touched.
+    STUB_ATTRIBUTES = (
+        "depth", "open_interest", "open_interest_bybit", "open_interest_okx",
+        "volume_profile", "liquidations", "liquidations_bybit", "liquidations_okx",
+        "crash_detector",
+    )
+
+    def test_all_stub_sources_report_unavailable(self):
         feed = BacktestFeed()
 
-        self.assertEqual(feed.depth.snapshot("BTCUSDT"), {"available": False})
-        self.assertEqual(feed.open_interest.snapshot("BTCUSDT"), {"available": False})
-        self.assertEqual(feed.liquidations.snapshot("BTCUSDT"), {"available": False})
+        for attribute in self.STUB_ATTRIBUTES:
+            with self.subTest(attribute=attribute):
+                source = getattr(feed, attribute)
+                self.assertEqual(source.snapshot("BTCUSDT"), {"available": False})
+
+    def test_crash_detector_snapshot_accepts_no_symbol(self):
+        """main.py calls feed.crash_detector.snapshot() with zero args,
+        unlike every other stub source (always called with a symbol) -
+        the one caller shape _UnavailableSnapshotSource's optional
+        `symbol` parameter exists for."""
+        feed = BacktestFeed()
+
+        self.assertEqual(feed.crash_detector.snapshot(), {"available": False})
 
     def test_stub_sources_accept_any_extra_args(self):
         """evaluate() calls .snapshot(symbol) with no extra args today, but

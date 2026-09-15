@@ -386,6 +386,20 @@ class SignalJournalTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["quote_volume_usdt"], "12500000")
 
+    def test_append_signal_writes_liquidation_pool_count(self):
+        # config.LIQUIDATION_HEATMAP_ENABLED - additive/informational only.
+        pools = [{"type": "SELL_SIDE", "price": 100.0, "touches": 3}]
+        signal_journal.append_signal(_signal(liquidation_pools=pools), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["liquidation_pool_count"], "1")
+
+    def test_liquidation_pool_count_defaults_to_zero_when_absent(self):
+        signal_journal.append_signal(_signal(), _plan())
+        rows = self._read_rows()
+
+        self.assertEqual(rows[0]["liquidation_pool_count"], "0")
+
     def test_append_signal_writes_the_four_new_data_source_fields(self):
         signal_journal.append_signal(
             _signal(

@@ -5,11 +5,11 @@ discrete events, not a periodically-sampled value, and both venues expose
 this for free over public/unauthenticated WebSocket - no vendor needed.
 
 liquidation_tracker.LiquidationEngine is reused verbatim for both venues
-(it already only ever sees normalized (symbol, side, notional, timestamp)
-tuples, never a raw venue payload) - this module owns only the venue-
-specific transport/parsing plumbing: building the right subscribe frame,
-and turning each venue's raw message shape into the tuple LiquidationEngine.
-record_liquidation expects.
+(it already only ever sees normalized (symbol, side, notional, timestamp,
+price) tuples, never a raw venue payload) - this module owns only the
+venue-specific transport/parsing plumbing: building the right subscribe
+frame, and turning each venue's raw message shape into the tuple
+LiquidationEngine.record_liquidation expects.
 
 Real facts confirmed live (2026-08-29) before writing this, not guessed:
 - Bybit (wss://stream.bybit.com/v5/public/linear, topic `allLiquidation.
@@ -85,10 +85,13 @@ def bybit_parse_rejected_symbol(reply):
 
 def parse_bybit_liquidation(message):
     """message: a parsed (json.loads'd) Bybit `allLiquidation.*` push
-    frame. Returns (symbol, side, notional, timestamp_seconds) or None -
-    never raises on malformed input. Bybit's S:"Sell"/"Buy" already
+    frame. Returns (symbol, side, notional, timestamp_seconds, price) or
+    None - never raises on malformed input. Bybit's S:"Sell"/"Buy" already
     matches LiquidationEngine's SELL/BUY convention directly (Sell = long
-    liquidated, Buy = short liquidated), no remapping needed."""
+    liquidated, Buy = short liquidated), no remapping needed. `price` is
+    the real execution price - kept for liquidation_heatmap.py's
+    historical clustering, LiquidationEngine's own real-time snapshot()
+    never reads it."""
     if not isinstance(message, dict):
         return None
 
@@ -119,7 +122,7 @@ def parse_bybit_liquidation(message):
     timestamp = _safe_float(entry.get("T"), None)
     timestamp = timestamp / 1000 if timestamp is not None else None
 
-    return (symbol, side, notional, timestamp)
+    return (symbol, side, notional, timestamp, price if price else None)
 
 
 def okx_subscribe_frame():
@@ -128,12 +131,14 @@ def okx_subscribe_frame():
 
 def parse_okx_liquidation(message):
     """message: a parsed (json.loads'd) OKX liquidation-orders push frame.
-    Returns a list of (symbol, side, notional, timestamp_seconds) tuples
-    (one frame's `data` can carry multiple instruments, each with multiple
-    `details` fills) - never raises, skips anything malformed rather than
-    failing the whole frame. OKX's side is lowercase ("sell"/"buy") but the
-    same forced-long/forced-short convention as Binance/Bybit - just
-    uppercased here to match LiquidationEngine's expectation."""
+    Returns a list of (symbol, side, notional, timestamp_seconds, price)
+    tuples (one frame's `data` can carry multiple instruments, each with
+    multiple `details` fills) - never raises, skips anything malformed
+    rather than failing the whole frame. OKX's side is lowercase
+    ("sell"/"buy") but the same forced-long/forced-short convention as
+    Binance/Bybit - just uppercased here to match LiquidationEngine's
+    expectation. `price` (bkPx, the real bankruptcy/execution price) is
+    kept for liquidation_heatmap.py's historical clustering."""
     if not isinstance(message, dict):
         return []
 
@@ -169,6 +174,6 @@ def parse_okx_liquidation(message):
             timestamp = _safe_float(detail.get("ts"), None)
             timestamp = timestamp / 1000 if timestamp is not None else None
 
-            results.append((symbol, side, notional, timestamp))
+            results.append((symbol, side, notional, timestamp, price if price else None))
 
     return results

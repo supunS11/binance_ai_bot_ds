@@ -32,6 +32,8 @@ from crash_detector import CrashDetector
 from volume_profile import VolumeProfileEngine
 import cross_exchange_oi
 import cross_exchange_liquidation
+import liquidation_heatmap
+import liquidation_journal
 
 
 FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
@@ -191,6 +193,7 @@ class RealtimeMarketData:
         self.liquidation_thread = None
         self.liquidation_thread_bybit = None
         self.liquidation_thread_okx = None
+        self.liquidation_heatmap_thread = None
         self.volume_poll_thread = None
         self.funding_poll_thread = None
         self.liquidation_websocket = None
@@ -234,6 +237,7 @@ class RealtimeMarketData:
         self._start_liquidation_stream()
         self._start_liquidation_stream_bybit()
         self._start_liquidation_stream_okx()
+        self._start_liquidation_heatmap_recluster()
         self._start_volume_poll()
         self._start_funding_poll()
 
@@ -1017,7 +1021,10 @@ class RealtimeMarketData:
                         except TimeoutError:
                             continue
 
-                        self.liquidations.handle_message(json.loads(message))
+                        parsed = self.liquidations.handle_message(json.loads(message))
+
+                        if parsed is not None:
+                            liquidation_journal.append_event("BINANCE", *parsed)
 
             except Exception as exc:
                 if self._worker_active(generation):
@@ -1118,8 +1125,8 @@ class RealtimeMarketData:
 
                         parsed = cross_exchange_liquidation.parse_bybit_liquidation(json.loads(message))
 
-                        if parsed is not None:
-                            self.liquidations_bybit.record_liquidation(*parsed)
+                        if parsed is not None and self.liquidations_bybit.record_liquidation(*parsed):
+                            liquidation_journal.append_event("BYBIT", *parsed)
 
             except Exception as exc:
                 if self._worker_active(generation):
@@ -1172,7 +1179,8 @@ class RealtimeMarketData:
                             continue
 
                         for parsed in cross_exchange_liquidation.parse_okx_liquidation(json.loads(message)):
-                            self.liquidations_okx.record_liquidation(*parsed)
+                            if self.liquidations_okx.record_liquidation(*parsed):
+                                liquidation_journal.append_event("OKX", *parsed)
 
             except Exception as exc:
                 if self._worker_active(generation):
@@ -1182,3 +1190,39 @@ class RealtimeMarketData:
                 with self.lock:
                     if self.liquidation_websocket_okx is not None:
                         self.liquidation_websocket_okx = None
+
+    # =========================
+    # LIQUIDATION HEATMAP RECLUSTER (see config.LIQUIDATION_HEATMAP_ENABLED)
+    # =========================
+    def _start_liquidation_heatmap_recluster(self):
+        if not config.LIQUIDATION_HEATMAP_ENABLED:
+            return
+
+        with self.lock:
+            generation = self.generation
+
+        thread = threading.Thread(
+            target=self._liquidation_heatmap_recluster_loop,
+            args=(generation,),
+            name="liquidation-heatmap-recluster",
+            daemon=True,
+        )
+        thread.start()
+        self.liquidation_heatmap_thread = thread
+
+    def _liquidation_heatmap_recluster_loop(self, generation):
+        """A multi-day, cross-symbol density map changes slowly - one
+        full journal read + recluster per interval, mirroring _oi_poll_
+        loop's own interval-wait shape (no per-symbol pacing needed here,
+        unlike that loop - this does one global recompute, not one REST
+        call per symbol)."""
+        interval = max(float(config.LIQUIDATION_HEATMAP_RECLUSTER_INTERVAL_SECONDS), 30)
+
+        while self._worker_active(generation):
+            try:
+                liquidation_heatmap.recompute_all()
+            except Exception as exc:
+                log_warning(f"Liquidation heatmap recluster failed (continuing): {exc}")
+
+            if self.stop_event.wait(interval):
+                return

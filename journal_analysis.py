@@ -300,6 +300,64 @@ def _bucket_nearest_sr_r(value):
     return ">=2R (clear past TP1)"
 
 
+_FALLBACK_REACHABILITY_BUCKETS = [
+    (float("-inf"), 2.0, "<2.0R (blocked by the floor - no ceiling change helps)"),
+    (2.0, 2.5, "2.0-2.5R (inside today's ceiling on raw distance - the ATR "
+               "buffer may still have excluded it)"),
+    (2.5, 4.0, "2.5-4.0R (would flip to POOL if the ceiling were raised)"),
+    (4.0, float("inf"), "4.0R+ (still FALLBACK even at a wide ceiling)"),
+]
+
+
+def _bucket_fallback_reachability(value):
+    """Where the nearest REAL pool actually sits for a trade whose TP1
+    fell through to the flat fallback - see _fallback_reachability_
+    breakdown below for why this has to be checked before raising
+    config.TP1_MAX_R_MULTIPLE: the ceiling can only ever rescue trades
+    whose nearest pool already sits between the floor and a sane
+    ceiling, never one below the floor or one with no real pool at all."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "no real pool at all in that direction"
+
+    for low, high, label in _FALLBACK_REACHABILITY_BUCKETS:
+        if low <= value < high:
+            return label
+
+    return "no real pool at all in that direction"
+
+
+def _fallback_reachability_breakdown(resolved):
+    """config.TP1_MAX_R_MULTIPLE only ever affects trades whose nearest
+    real pool sits BETWEEN the floor (TP1_R_MULTIPLE) and the ceiling
+    (risk_manager._find_structure_target) - it can never help a trade
+    whose nearest real pool sits below the floor (a real level exists,
+    just too close to qualify as a >=2:1 target) or one with no real
+    pool anywhere near a sane ceiling. Answers "is raising the ceiling
+    even the right lever" cheaply, before running any ceiling A/B."""
+    lines = ["\nFALLBACK-sourced TP1 - where the nearest real pool actually "
+             "sits (nearest_favorable_sr_r, informational, no ATR buffer):"]
+    counts = defaultdict(int)
+    total = 0
+
+    for trade in resolved.values():
+        if trade.get("tp1_source") != "FALLBACK":
+            continue
+
+        counts[_bucket_fallback_reachability(trade.get("nearest_favorable_sr_r"))] += 1
+        total += 1
+
+    if total == 0:
+        lines.append("  (no FALLBACK-sourced TP1 trades recorded yet)")
+        return lines
+
+    for label, count in sorted(counts.items(), key=lambda kv: -kv[1]):
+        lines.append(f"  {label}: n={count} ({count / total * 100:.0f}%)")
+
+    return lines
+
+
 def _bucket_setup_age(value):
     """How many candles old the underlying setup (CHoCH/FVG/order block/
     divergence) was at entry - see signal_journal.py's setup_age_candles
@@ -464,6 +522,95 @@ def _loss_mfe_distribution(resolved, sanity_bound=_MAE_MFE_SANITY_BOUND):
     return lines
 
 
+_TP1_CAPTURE_BUCKETS = [
+    (0.0, 0.25, "0-25% of the way to TP1"),
+    (0.25, 0.5, "25-50%"),
+    (0.5, 0.75, "50-75%"),
+    (0.75, 0.9, "75-90%"),
+    (0.9, float("inf"), "90%+ (a genuine near-miss)"),
+]
+
+
+def _bucket_tp1_capture_fraction(value):
+    for low, high, label in _TP1_CAPTURE_BUCKETS:
+        if low <= value < high:
+            return label
+
+    return "90%+ (a genuine near-miss)"
+
+
+def _tp1_reachability_by_source(resolved, sanity_bound=_MAE_MFE_SANITY_BOUND):
+    """The direct test of "is TP1 grounded in real structure actually more
+    reachable than an arbitrary flat distance at the same R" - independent
+    of any specific config.TP1_MAX_R_MULTIPLE ceiling value.
+
+    Computes the trade's OWN actual TP1 distance in R from entry_price/
+    sl_price/tp1_price (already journaled) - deliberately NOT the
+    tp1_r_multiple column, which is only ever config.TP1_R_MULTIPLE, the
+    same constant on every row (signal_journal.append_signal), not the
+    trade's real resolved distance. Buckets LOSS trades by how much of
+    that real distance mfe_r_multiple actually covered before the trade
+    reversed, split by tp1_source (POOL = a real liquidity level;
+    FALLBACK = the flat, structure-blind projection). If POOL-sourced
+    losses cluster at a materially higher capture fraction than FALLBACK-
+    sourced ones, that is real evidence a structure-anchored target is
+    more reachable - the actual mechanism behind "TP feels too wide," not
+    just a specific threshold pick."""
+    lines = ["\nTP1 reachability (LOSS trades only) - how much of the ACTUAL "
+             "planned TP1 distance did price cover before reversing, by "
+             "tp1_source (POOL=real liquidity level, FALLBACK=flat projection):"]
+    buckets = defaultdict(lambda: defaultdict(int))
+
+    for trade in resolved.values():
+        if classify(trade.get("outcome", "")) != "LOSS":
+            continue
+
+        source = trade.get("tp1_source")
+
+        if source not in ("POOL", "FALLBACK"):
+            continue
+
+        try:
+            entry_price = float(trade.get("entry_price"))
+            sl_price = float(trade.get("sl_price"))
+            tp1_price = float(trade.get("tp1_price"))
+            mfe = float(trade.get("mfe_r_multiple"))
+        except (TypeError, ValueError):
+            continue
+
+        risk_distance = abs(entry_price - sl_price)
+
+        if risk_distance <= 0 or mfe < 0 or mfe > sanity_bound:
+            continue
+
+        actual_tp1_r = abs(tp1_price - entry_price) / risk_distance
+
+        if actual_tp1_r <= 0:
+            continue
+
+        capture_fraction = mfe / actual_tp1_r
+        buckets[source][_bucket_tp1_capture_fraction(capture_fraction)] += 1
+
+    if not buckets:
+        lines.append("  (no LOSS trades with a usable entry/sl/tp1/mfe set recorded yet)")
+        return lines
+
+    for source in ("POOL", "FALLBACK"):
+        if source not in buckets:
+            continue
+
+        total = sum(buckets[source].values())
+        lines.append(f"  {source} (n={total}):")
+
+        for _low, _high, label in _TP1_CAPTURE_BUCKETS:
+            count = buckets[source][label]
+
+            if count:
+                lines.append(f"    {label}: n={count} ({count / total * 100:.0f}%)")
+
+    return lines
+
+
 _NEAR_ZERO_MFE_THRESHOLD = _LOSS_MFE_BUCKETS[0][1]  # matches the first bucket above
 
 
@@ -591,6 +738,8 @@ def summarize(journal_path=None, since_timestamp=None):
     lines += _average_by_outcome(resolved, "MAE (adverse excursion)", "mae_r_multiple")
     lines += _average_by_outcome(resolved, "MFE (favorable excursion)", "mfe_r_multiple")
     lines += _loss_mfe_distribution(resolved)
+    lines += _fallback_reachability_breakdown(resolved)
+    lines += _tp1_reachability_by_source(resolved)
 
     near_zero_mfe_losses = _near_zero_mfe_losses(resolved)
 

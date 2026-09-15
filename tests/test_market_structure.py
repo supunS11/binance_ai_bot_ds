@@ -739,6 +739,60 @@ class FindOrderBlockRetestRequireClosedCandleTests(unittest.TestCase):
         self.assertIsNotNone(result)
 
 
+class DetectLevelPullbackTests(unittest.TestCase):
+    def test_bullish_pullback_wicks_to_level_then_reclaims(self):
+        candles = [_candle(0, high=103, low=99, open_=99.5, close=101)]
+
+        result = ms.detect_level_pullback(candles, level=100)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertEqual(result["level"], 100)
+
+    def test_bearish_pullback_wicks_to_level_then_reclaims(self):
+        candles = [_candle(0, high=101, low=97, open_=100.5, close=99)]
+
+        result = ms.detect_level_pullback(candles, level=100)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertEqual(result["level"], 100)
+
+    def test_no_touch_of_the_level_is_not_a_pullback(self):
+        candles = [_candle(0, high=110, low=105, open_=106, close=108)]
+
+        self.assertIsNone(ms.detect_level_pullback(candles, level=100))
+
+    def test_touch_without_a_reclaim_is_a_breakdown_not_a_pullback(self):
+        # Wicks below the level but closes below it too - a real break,
+        # not a held pullback.
+        candles = [_candle(0, high=99, low=95, open_=98.5, close=97)]
+
+        self.assertIsNone(ms.detect_level_pullback(candles, level=100))
+
+    def test_none_level_is_none(self):
+        candles = [_candle(0, high=103, low=99, close=101)]
+        self.assertIsNone(ms.detect_level_pullback(candles, level=None))
+
+    def test_empty_candles_is_none(self):
+        self.assertIsNone(ms.detect_level_pullback([], level=100))
+
+    def test_result_includes_the_tested_candles_open_time(self):
+        candles = [_candle(5, high=103, low=99, open_=99.5, close=101)]
+
+        result = ms.detect_level_pullback(candles, level=100)
+
+        self.assertEqual(result["open_time"], 5)
+
+    def test_require_closed_candle_true_scans_back_to_last_closed(self):
+        candles = [
+            _candle(0, high=106, low=104, close=105),  # well above the level - not a pullback
+            _candle(1, high=103, low=99, open_=99.5, close=101, closed=False),
+        ]
+        result = ms.detect_level_pullback(candles, level=100, require_closed_candle=True)
+        self.assertIsNone(result)
+
+
 class DetectEmaPullbackTests(unittest.TestCase):
     def test_bullish_pullback_wicks_to_ema_then_reclaims(self):
         candles = [_candle(0, high=103, low=99, open_=99.5, close=101)]

@@ -1078,6 +1078,69 @@ LIQUIDATION_WINDOW_SECONDS = env_int("LIQUIDATION_WINDOW_SECONDS", 120)
 # no new mechanism, no new evidence being invented here.
 LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT = env_float("LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT", 6000)
 LIQUIDATION_MAX_EVENTS_PER_SYMBOL = env_int("LIQUIDATION_MAX_EVENTS_PER_SYMBOL", 200)
+# 2026-09-15, real free alternative to a paid liquidation-heatmap API: the
+# 3 LiquidationEngine instances above already ingest real, exchange-wide
+# forced-liquidation events for free (Binance/Bybit/OKX), but only ever
+# retained aggregated notional in a 200-event/2-minute ring buffer built
+# for LIQUIDATION_SWEEP_CONFIRMED's own real-time purpose - never price,
+# never durably. This section adds real price retention (liquidation_
+# tracker.py/cross_exchange_liquidation.py), a durable event journal
+# (liquidation_journal.py), and clustering into the same {"type","price",
+# "touches"} shape find_liquidity_pools already produces (liquidation_
+# heatmap.py) - real historical liquidation density, not a third party's
+# modeled estimate.
+#
+# Ships additive/journal-only: LIQUIDATION_HEATMAP_ENABLED populates
+# signal["liquidation_pools"]/liquidation_pool_count for real evidence to
+# accumulate, but nothing merges this into any live trade's SL/TP or the
+# LIQUIDITY_SWEEP trigger yet - zero evidence exists yet that liquidation-
+# derived levels predict anything better than the existing structure-
+# derived ones. Same "log it before gating on it" rollout as every other
+# new data source this session.
+LIQUIDATION_EVENT_JOURNAL_ENABLED = env_bool("LIQUIDATION_EVENT_JOURNAL_ENABLED", "True")
+# How far back real events are retained for clustering - long enough for
+# real per-symbol sample counts to build up, short enough that stale
+# levels from a since-repriced symbol don't dominate forever. Explicitly
+# unvalidated - revisit once real cluster counts are observed.
+LIQUIDATION_HEATMAP_RETENTION_SECONDS = env_int("LIQUIDATION_HEATMAP_RETENTION_SECONDS", 1209600)  # 14 days
+# A multi-day density map changes slowly - keeps the one-full-journal-read
+# recompute cost infrequent.
+LIQUIDATION_HEATMAP_RECLUSTER_INTERVAL_SECONDS = env_int(
+    "LIQUIDATION_HEATMAP_RECLUSTER_INTERVAL_SECONDS", 900
+)
+# Same starting value as LIQUIDITY_POOL_TOLERANCE_PCT - independently
+# tunable (different source data entirely), not a reuse.
+LIQUIDATION_HEATMAP_CLUSTER_TOLERANCE_PCT = env_float(
+    "LIQUIDATION_HEATMAP_CLUSTER_TOLERANCE_PCT", 0.001
+)
+# Deliberately NOT a reuse of LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT above -
+# that number is an already-evidenced real-time SINGLE-WINDOW (2-minute)
+# threshold; this one is a COMBINED-notional floor across a cluster built
+# from up to 14 days of events, a fundamentally different scale. ~3x the
+# real measured single-event p95 ($6,039, see that same flag's own comment
+# above) - "meaningfully more than one large real event, not noise from
+# the >=2-touches floor alone." A reasoned starting point grounded in a
+# real measured distribution, not a guess presented as calibrated -
+# revisit once real cluster counts are observed.
+LIQUIDATION_HEATMAP_CLUSTER_MIN_NOTIONAL_USDT = env_float(
+    "LIQUIDATION_HEATMAP_CLUSTER_MIN_NOTIONAL_USDT", 20000
+)
+# Turns on the periodic recluster thread and populates signal[
+# "liquidation_pools"]/liquidation_pool_count. Brand new, zero real
+# evidence yet - ships inert, same rollout as SL_TP_USE_HTF_STRUCTURE/
+# CROSS_EXCHANGE_OI_TRACKING_ENABLED before it.
+LIQUIDATION_HEATMAP_ENABLED = env_bool("LIQUIDATION_HEATMAP_ENABLED", "False")
+# Both default False - ships inert, same rollout as LIQUIDATION_HEATMAP_
+# ENABLED itself. Operator-requested merge (2026-09-15) made with
+# explicit, informed acknowledgement that zero real evidence exists yet
+# for either - accepted as a live trial on real capital, not a gap in
+# process. Split into two independent flags (not one) so either can be
+# turned on/off independently once real outcomes start distinguishing
+# them. Both require LIQUIDATION_HEATMAP_ENABLED=True to have any real
+# candidates to merge in the first place - no explicit dependency check
+# needed in code, signal["liquidation_pools"] is just [] otherwise.
+LIQUIDATION_HEATMAP_SL_TP_ENABLED = env_bool("LIQUIDATION_HEATMAP_SL_TP_ENABLED", "False")
+LIQUIDATION_HEATMAP_SWEEP_ENABLED = env_bool("LIQUIDATION_HEATMAP_SWEEP_ENABLED", "False")
 # Funding rate - reflects how crowded long vs short positioning is
 # market-wide for a symbol (strongly positive = longs paying heavily to
 # stay long, a crowded trade more prone to a squeeze/reversal). Free:
@@ -1633,6 +1696,27 @@ AGAINST_HTF_BIAS_SHADOW_PROBE_RATIO = env_float("AGAINST_HTF_BIAS_SHADOW_PROBE_R
 AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS = env_str_list(
     "AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS", []
 )
+# config.AGAINST_HTF_BIAS_EXEMPT_TRIGGERS (2026-09-15) - real, evidence-
+# backed pass-through (not a probe/shadow): reject-journal replay of
+# this gate's own blocked population, strict exact-match only
+# (signal_trigger column literally "ORDER_BLOCK_RETEST", no comma-
+# joined multi-trigger rows - the same stricter grouping that caught
+# the earlier NOT_IN_PREMIUM false positive on STRUCTURE_BREAK/
+# LIQUIDITY_SWEEP):
+#   ORDER_BLOCK_RETEST  n=431 resolved  win=40.8%  avg_r=+0.2251
+#     split-half STABLE positive: H1(n=215)=+0.158  H2(n=216)=+0.292
+# STRUCTURE_BREAK/OB_FVG_RETEST/LIQUIDITY_SWEEP were also checked
+# (same replay, same window) and all remain genuinely protective under
+# this gate (avg_r -0.144 to -0.317, both halves negative) - stay
+# gated. Deliberately a NEW, DEDICATED list rather than folded into
+# _TREND_AGREEMENT_EXEMPT_TRIGGERS below, which would also exempt
+# HTF_TREND_STALE/DEPTH_TREND_MIN_CONSISTENCY with no evidence for
+# those two gates specifically - same one-gate-at-a-time precedent as
+# EMA_TREND_MIXED_EXEMPT_TRIGGERS/ZONE_DIRECTION_EXEMPT_TRIGGERS/
+# NOT_IN_PREMIUM_EXEMPT_TRIGGERS. Reject-only-safer: can only ever let
+# MORE trades through, never fewer. Default empty, so this is a no-op
+# until the operator opts specific triggers in.
+AGAINST_HTF_BIAS_EXEMPT_TRIGGERS = env_str_list("AGAINST_HTF_BIAS_EXEMPT_TRIGGERS", [])
 # Same reasoning and same exempt-trigger group as AGAINST_HTF_BIAS above -
 # HTF_TREND_STALE is just a second, faster-updating measure of the same
 # "does this agree with the broader trend" question.

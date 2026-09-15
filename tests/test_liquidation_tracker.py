@@ -63,6 +63,48 @@ class LiquidationEngineTests(unittest.TestCase):
             self.assertFalse(engine.snapshot("BTCUSDT", now=1010)["available"])
             self.assertTrue(engine.snapshot("ETHUSDT", now=1010)["available"])
 
+    # config.LIQUIDATION_HEATMAP_ENABLED (2026-09-15) - price is now
+    # retained alongside the existing fields, purely for liquidation_
+    # heatmap.py's historical clustering; this engine's own real-time
+    # snapshot() must stay byte-identical regardless.
+
+    def test_record_liquidation_stores_price(self):
+        engine = LiquidationEngine()
+        engine.record_liquidation("BTCUSDT", "SELL", 10000, timestamp=1000, price=50000)
+
+        self.assertEqual(list(engine._events["BTCUSDT"])[0], (1000.0, "SELL", 10000.0, 50000.0))
+
+    def test_record_liquidation_without_price_defaults_to_none(self):
+        engine = LiquidationEngine()
+        engine.record_liquidation("BTCUSDT", "SELL", 10000, timestamp=1000)
+
+        self.assertEqual(list(engine._events["BTCUSDT"])[0], (1000.0, "SELL", 10000.0, None))
+
+    def test_record_liquidation_returns_true_when_accepted(self):
+        engine = LiquidationEngine()
+        self.assertTrue(engine.record_liquidation("BTCUSDT", "SELL", 10000, timestamp=1000))
+
+    def test_record_liquidation_returns_false_when_invalid(self):
+        engine = LiquidationEngine()
+        self.assertFalse(engine.record_liquidation("BTCUSDT", "HOLD", 10000, timestamp=1000))
+        self.assertFalse(engine.record_liquidation("BTCUSDT", "SELL", 0, timestamp=1000))
+
+    def test_snapshot_output_unchanged_by_the_new_price_field(self):
+        engine = LiquidationEngine()
+        engine.record_liquidation("BTCUSDT", "SELL", 10000, timestamp=1000, price=50000)
+
+        with patch.object(config, "LIQUIDATION_WINDOW_SECONDS", 300):
+            snapshot = engine.snapshot("BTCUSDT", now=1010)
+
+        self.assertEqual(
+            snapshot,
+            {
+                "available": True, "symbol": "BTCUSDT", "sample_count": 1,
+                "long_liquidation_notional": 10000, "short_liquidation_notional": 0,
+                "net_liquidation_notional": 10000,
+            },
+        )
+
 
 class OrderPayloadParsingTests(unittest.TestCase):
     def test_extracts_order_from_combined_stream_wrapper(self):
@@ -97,11 +139,32 @@ class HandleMessageTests(unittest.TestCase):
     def test_handle_message_never_raises_on_garbage_input(self):
         engine = LiquidationEngine()
         try:
-            engine.handle_message(None)
-            engine.handle_message({"data": {}})
-            engine.handle_message({"data": {"o": {"s": "", "S": "SELL"}}})
+            self.assertIsNone(engine.handle_message(None))
+            self.assertIsNone(engine.handle_message({"data": {}}))
+            self.assertIsNone(engine.handle_message({"data": {"o": {"s": "", "S": "SELL"}}}))
         except Exception as exc:  # pragma: no cover - failure path
             self.fail(f"handle_message raised unexpectedly: {exc}")
+
+    def test_handle_message_returns_the_parsed_tuple_with_price(self):
+        engine = LiquidationEngine()
+        result = engine.handle_message({
+            "data": {"o": {
+                "s": "BTCUSDT", "S": "SELL", "ap": "100", "z": "2", "T": 1000000,
+            }}
+        })
+
+        self.assertEqual(result, ("BTCUSDT", "SELL", 200.0, 1000.0, 100.0))
+
+    def test_handle_message_returns_none_when_the_event_is_dropped(self):
+        # A real symbol/side but non-positive notional (price*quantity=0) -
+        # record_liquidation itself rejects it, so nothing should be
+        # journaled for it either.
+        engine = LiquidationEngine()
+        result = engine.handle_message({
+            "data": {"o": {"s": "BTCUSDT", "S": "SELL", "ap": "0", "z": "2", "T": 1000000}}
+        })
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

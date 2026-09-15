@@ -72,11 +72,12 @@ class ParseBybitLiquidationTests(unittest.TestCase):
 
     def test_sell_side_maps_to_sell_long_liquidation(self):
         result = cxl.parse_bybit_liquidation(self._message(side="Sell"))
-        symbol, side, notional, timestamp = result
+        symbol, side, notional, timestamp, price = result
         self.assertEqual(symbol, "ROSEUSDT")
         self.assertEqual(side, "SELL")
         self.assertAlmostEqual(notional, 0.04499 * 20000)
         self.assertAlmostEqual(timestamp, 1739502302.929)
+        self.assertAlmostEqual(price, 0.04499)
 
     def test_buy_side_maps_to_buy_short_liquidation(self):
         result = cxl.parse_bybit_liquidation(self._message(side="Buy"))
@@ -127,11 +128,12 @@ class ParseOkxLiquidationTests(unittest.TestCase):
     def test_parses_a_single_liquidation_and_reverse_maps_the_symbol(self):
         result = cxl.parse_okx_liquidation(self._message())
         self.assertEqual(len(result), 1)
-        symbol, side, notional, timestamp = result[0]
+        symbol, side, notional, timestamp, price = result[0]
         self.assertEqual(symbol, "XPLUSDT")
         self.assertEqual(side, "SELL")
         self.assertAlmostEqual(notional, 0.0825 * 467)
         self.assertAlmostEqual(timestamp, 1787990018.113)
+        self.assertAlmostEqual(price, 0.0825)
 
     def test_buy_side_is_uppercased_to_buy(self):
         result = cxl.parse_okx_liquidation(self._message(side="buy"))
