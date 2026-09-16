@@ -203,47 +203,92 @@ def _resolve_real_entry(plan, execution_result, side):
     return entry_price, breakeven_price, risk_distance
 
 
-def _resolve_tp1_price(plan, entry_price, side):
-    """plan["tp1_price"] as risk_manager originally computed it, UNLESS
-    config.TP_STATIC_ROI_ENABLED was on for this plan (plan["tp1_static_
-    roi_pct"] is then the ROI% used, not None) - a static-ROI TP1 is a
-    pure function of entry_price, not a real structure level, so unlike
-    sl_price/tp2_price (deliberately left alone by _resolve_real_entry
-    above) it must be recomputed against whatever entry_price actually
-    turned out to be, or the position's real target silently drifts by
-    however much the real fill differed from the planned one.
+def _resolve_tp1_price(plan, entry_price, sl_price, side):
+    """plan["tp1_price"] as risk_manager originally computed it, UNLESS a
+    real retracement fill changed entry_price enough to drift the R-
+    multiple/ROI% it represents - re-anchors it to the REAL settled
+    entry_price/sl_price instead of the stale signal-time ones. Two
+    independent cases, both real bugs found live under config.
+    RETRACEMENT_ENTRY_ENABLED:
 
-    Real bug found live (2026-08-21, SLXUSDT under config.RETRACEMENT_
-    ENTRY_ENABLED): a limit fill landed noticeably better than the
-    planned trigger price (that's the whole point of retracement entry),
-    but TP1 stayed computed off the STALE trigger price - closer than the
-    intended TP_TARGET_ROI_PCT, not the 10% ROI the setting promised.
+    1. config.TP_STATIC_ROI_ENABLED (plan["tp1_static_roi_pct"] is not
+       None) - a static-ROI TP1 is a pure function of entry_price, not a
+       real structure level, so unlike sl_price's structure case/
+       tp2_price (deliberately left alone by _resolve_real_entry above)
+       it must be recomputed. Real bug found live (2026-08-21, SLXUSDT): a
+       limit fill landed noticeably better than the planned trigger price
+       (that's the whole point of retracement entry), but TP1 stayed
+       computed off the STALE trigger price - closer than the intended
+       TP_TARGET_ROI_PCT, not the % the setting promised.
+
+    2. plan["tp1_source"] == "FALLBACK" (or missing/unrecognized - treated
+       as fallback-shaped, the safer default since every real live plan
+       actually sets this field) - a flat entry +/- TP1_R_MULTIPLE *
+       risk_distance target is exactly as entry-price-dependent as a
+       static-ROI one. Real bug found live (2026-09-15/16, AEROUSDT): a
+       retracement fill landed notably better than planned, but tp_price
+       stayed anchored to the stale absolute price - it silently
+       represented 4.28R off the real entry instead of the intended
+       TP1_R_MULTIPLE=2.0/TP1_MAX_R_MULTIPLE=2.5 ceiling. Real price
+       action confirmed the cost: it reached ~2.0R (+32% ROI) then fully
+       reversed to a large loss, never approaching the stale 4.28R
+       target. Recomputed via risk_manager._resolve_target with pools=
+       None, which collapses straight to its own flat-fallback branch -
+       reuses the exact existing formula instead of duplicating it.
+
+    Deliberately NOT extended to plan["tp1_source"] == "POOL": a real
+    structure level's absolute price doesn't move just because the fill
+    did - same principle sl_price's structure case/tp2_price/dca_price
+    already follow. Re-running a pool search against the real (usually
+    smaller, retracement fills land CLOSER to the stop by design) risk_
+    distance would routinely disqualify an already-correct pool-sourced
+    target on an ordinary retracement improvement, not just an extreme
+    one - so this only ever touches the two provably entry-price-
+    dependent shapes above, never a real level.
 
     ONLY safe to call from a settle path that places protection orders
     AFTER the real entry_price is already known - _finalize_retracement_
     entry (the caller this was built for) recomputes settled_plan["tp1_
-    price"] with this BEFORE execution.place_protection_orders/place_dca_
-    protection_orders ever run, so the real exchange order and the
-    tracked value always agree. NOT called from register()/register_dca_
-    pending() themselves - enter_trade/enter_trade_dca_pending place the
-    real TP1 order synchronously, before real_entry_price is even
-    resolved, so correcting only the tracked value there would make the
-    bot's own bookkeeping disagree with what's actually resting on the
-    exchange - see _resolve_real_entry's own docstring for that residual,
-    accepted gap (ordinary slippage only, much smaller than retracement's
-    deliberate price difference).
+    price"]/["tp_price"] with this BEFORE execution.place_protection_
+    orders/place_dca_protection_orders ever run, so the real exchange
+    order and the tracked value always agree. NOT called from register()/
+    register_dca_pending() themselves - enter_trade/enter_trade_dca_
+    pending place the real TP1 order synchronously, before real_entry_
+    price is even resolved, so correcting only the tracked value there
+    would make the bot's own bookkeeping disagree with what's actually
+    resting on the exchange - see _resolve_real_entry's own docstring for
+    that residual, accepted gap (ordinary slippage only, much smaller
+    than retracement's deliberate price difference).
 
-    Falls back to the original plan value if the recompute itself fails
-    (entry_price<=0/LEVERAGE<=0) - same "never fail an entry over a
-    bookkeeping accuracy improvement" principle _resolve_real_entry
-    already follows."""
+    Falls back to the original plan value if either recompute itself
+    fails (entry_price<=0/LEVERAGE<=0 for case 1; risk_distance<=0 for
+    case 2) - same "never fail an entry over a bookkeeping accuracy
+    improvement" principle _resolve_real_entry already follows. That
+    "original value" is plan["tp_price"] for a single_tp plan, not
+    plan["tp1_price"] (always None there, per build_trade_plan/register_
+    dca_pending's own single_tp shape) - both callers below assign this
+    return value to whichever of those two fields actually applies, so
+    the fallback must read the same one or a POOL-sourced/failed-
+    recompute single_tp plan would silently collapse to None."""
+    original = plan["tp_price"] if plan.get("single_tp") else plan["tp1_price"]
     roi_pct = plan.get("tp1_static_roi_pct")
 
-    if roi_pct is None:
-        return plan["tp1_price"]
+    if roi_pct is not None:
+        recomputed = risk_manager.price_at_roi_pct(entry_price, side, roi_pct)
+        return original if recomputed is None else recomputed
 
-    recomputed = risk_manager.price_at_roi_pct(entry_price, side, roi_pct)
-    return plan["tp1_price"] if recomputed is None else recomputed
+    if plan.get("tp1_source") == "POOL":
+        return original
+
+    risk_distance = abs(entry_price - sl_price)
+
+    if risk_distance <= 0:
+        return original
+
+    recomputed = risk_manager._resolve_target(
+        None, entry_price, side, config.TP1_R_MULTIPLE, config.TP1_MAX_R_MULTIPLE, risk_distance,
+    )
+    return original if recomputed is None else recomputed
 
 
 class PositionManager:
@@ -5037,19 +5082,21 @@ class PositionManager:
         )
 
         if not plan.get("single_tp"):
-            settled_plan["tp1_price"] = _resolve_tp1_price(plan, entry_price, side)
-        elif plan.get("tp1_static_roi_pct") is not None:
-            # config.TP2_ENABLED=False - a single_tp plan built from a
-            # static-ROI TP1 (config.TP_STATIC_ROI_ENABLED) has that same
-            # "pure function of entry_price" drift problem the non-
-            # single_tp branch above already handles - a retracement fill
-            # settles at a different price than the original signal
-            # estimate, so tp_price needs the same real-price recompute,
-            # not just tp1_price. _resolve_tp1_price itself doesn't care
-            # about single_tp - it only reads plan["tp1_price"]/plan.get
-            # ("tp1_static_roi_pct"), both still populated in this plan
-            # shape, so it's safe to reuse verbatim here.
-            settled_plan["tp_price"] = _resolve_tp1_price(plan, entry_price, side)
+            settled_plan["tp1_price"] = _resolve_tp1_price(plan, entry_price, settled_plan["sl_price"], side)
+        else:
+            # config.TP2_ENABLED=False - a single_tp plan has the exact
+            # same entry-price-dependent-target problem the non-single_tp
+            # branch above already handles (static-ROI, or - the AEROUSDT
+            # incident - a flat FALLBACK distance), just landing on
+            # tp_price instead of tp1_price. _resolve_tp1_price itself
+            # doesn't care about single_tp - it only reads plan["tp1_
+            # price"]/plan.get("tp1_static_roi_pct")/plan.get("tp1_
+            # source"), all still populated in this plan shape - safe to
+            # reuse verbatim here. Passes the SETTLED (possibly
+            # revalidated) sl_price, not the stale plan one, so the
+            # FALLBACK-shaped recompute's risk_distance matches whatever
+            # the real resting stop actually ends up being.
+            settled_plan["tp_price"] = _resolve_tp1_price(plan, entry_price, settled_plan["sl_price"], side)
 
         # config.RETRACEMENT_ENTRY_ENABLED observability (2026-08-25) -
         # journaled here (entry_price/quantity/fill_type all already

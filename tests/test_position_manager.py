@@ -4937,22 +4937,56 @@ class ResolveRetracementMarketFallbackTests(unittest.TestCase):
 
 
 class ResolveTp1PriceTests(unittest.TestCase):
-    """config.TP_STATIC_ROI_ENABLED - a static TP1 is a pure function of
-    entry_price, so unlike a structure-resolved one it must be recomputed
-    when the real entry_price differs from the plan's own (real bug found
-    live, 2026-08-21: a retracement fill better than the trigger price
-    left TP1 computed off the stale trigger)."""
+    """A static-ROI TP1 (config.TP_STATIC_ROI_ENABLED) and a flat FALLBACK-
+    sourced one are both pure functions of entry_price, so unlike a real
+    POOL-sourced level, both must be recomputed when the real entry_price
+    differs from the plan's own (real bugs found live under config.
+    RETRACEMENT_ENTRY_ENABLED, 2026-08-21/2026-09-15 - see _resolve_tp1_
+    price's own docstring for both incidents)."""
 
-    def test_non_static_plan_returns_the_original_tp1_unchanged(self):
-        plan = {"tp1_price": 102, "tp1_static_roi_pct": None}
-        result = _resolve_tp1_price(plan, entry_price=99, side="BUY")
+    def test_pool_sourced_plan_returns_the_original_tp1_unchanged(self):
+        plan = {"tp1_price": 102, "tp1_static_roi_pct": None, "tp1_source": "POOL"}
+        result = _resolve_tp1_price(plan, entry_price=99, sl_price=97, side="BUY")
         self.assertEqual(result, 102)
+
+    def test_fallback_sourced_plan_recomputes_from_the_real_entry_and_sl(self):
+        # AEROUSDT shape: tp1_source="FALLBACK", no static ROI - the
+        # original tp1_price (whatever it was) is discarded in favor of
+        # TP1_R_MULTIPLE off the REAL settled entry/sl, not the stale
+        # planned ones.
+        plan = {"tp1_price": 999, "tp1_static_roi_pct": None, "tp1_source": "FALLBACK"}
+
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 2.5):
+            result = _resolve_tp1_price(plan, entry_price=99, sl_price=98, side="BUY")
+
+        # risk_distance=1, 2.0R above the real entry=99 -> 101.0.
+        self.assertAlmostEqual(result, 101.0)
+
+    def test_missing_tp1_source_is_treated_as_fallback_shaped(self):
+        # Every real live plan sets tp1_source - a missing/unrecognized
+        # value defaults to the recompute (the safer direction: never
+        # silently leave a stale price uncorrected) rather than to POOL's
+        # untouched behavior.
+        plan = {"tp1_price": 999, "tp1_static_roi_pct": None}
+
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 2.5):
+            result = _resolve_tp1_price(plan, entry_price=99, sl_price=100, side="SELL")
+
+        # risk_distance=1, 2.0R below the real entry=99 -> 97.0.
+        self.assertAlmostEqual(result, 97.0)
+
+    def test_fallback_sourced_recompute_uses_zero_risk_distance_guard(self):
+        plan = {"tp1_price": 104.0, "tp1_static_roi_pct": None, "tp1_source": "FALLBACK"}
+        result = _resolve_tp1_price(plan, entry_price=99, sl_price=99, side="BUY")
+        self.assertEqual(result, 104.0)
 
     def test_static_plan_recomputes_from_the_real_entry_price(self):
         plan = {"tp1_price": 104.0, "tp1_static_roi_pct": 40}  # originally computed off entry=100
 
         with patch.object(config, "LEVERAGE", 10):
-            result = _resolve_tp1_price(plan, entry_price=99, side="BUY")
+            result = _resolve_tp1_price(plan, entry_price=99, sl_price=90, side="BUY")
 
         # 40% ROI / 10x leverage = 4% price move, off the REAL entry (99),
         # not the plan's original one (100, which gave 104.0).
@@ -4962,7 +4996,7 @@ class ResolveTp1PriceTests(unittest.TestCase):
         plan = {"tp1_price": 96.0, "tp1_static_roi_pct": 40}
 
         with patch.object(config, "LEVERAGE", 10):
-            result = _resolve_tp1_price(plan, entry_price=101, side="SELL")
+            result = _resolve_tp1_price(plan, entry_price=101, sl_price=110, side="SELL")
 
         self.assertAlmostEqual(result, 101 * 0.96)
 
@@ -4970,7 +5004,7 @@ class ResolveTp1PriceTests(unittest.TestCase):
         plan = {"tp1_price": 104.0, "tp1_static_roi_pct": 40}
 
         with patch.object(config, "LEVERAGE", 0):  # makes price_at_roi_pct fail
-            result = _resolve_tp1_price(plan, entry_price=99, side="BUY")
+            result = _resolve_tp1_price(plan, entry_price=99, sl_price=90, side="BUY")
 
         self.assertEqual(result, 104.0)
 
@@ -5089,13 +5123,14 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         tp_full.assert_called_once()
         self.assertAlmostEqual(tp_full.call_args.args[2], 99.0 * 1.04)  # the REAL order uses the same price
 
-    def test_single_tp_structure_price_is_unaffected_by_retracement_fill(self):
-        # Mirrors compute_targets' own structure-anchored TP2/SL - a real
-        # level, not a pure function of entry_price, so unlike the static-
-        # ROI case above it must NOT drift with the real fill price.
+    def test_single_tp_pool_sourced_price_is_unaffected_by_retracement_fill(self):
+        # A real structure level - not a pure function of entry_price, so
+        # unlike the static-ROI case above (and the FALLBACK case below)
+        # it must NOT drift with the real fill price.
         manager = PositionManager()
         execution_result = {"shadow": False, "entry_order": {"orderId": "limit1"}, "retracement_price": 99.8}
-        plan = _retracement_plan(dca=True, single_tp=True)  # tp1_static_roi_pct left unset (None)
+        plan = _retracement_plan(dca=True, single_tp=True)
+        plan["tp1_source"] = "POOL"
 
         with patch.object(config, "DCA_ENABLED", True):
             manager.register_retracement_pending(plan, execution_result, trade_id="BTCUSDT_1")
@@ -5107,6 +5142,36 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
 
         final = manager.positions["BTCUSDT"]
         self.assertEqual(final["tp_price"], 106)  # unchanged from _retracement_plan's own default
+
+    def test_single_tp_fallback_price_is_recomputed_from_the_real_fill(self):
+        # Real bug found live (2026-09-15/16, AEROUSDT): a FALLBACK-
+        # sourced tp_price (a flat TP1_R_MULTIPLE distance from entry) is
+        # exactly as entry-price-dependent as a static-ROI one, but stayed
+        # anchored to the stale planned entry - it silently represented
+        # 4.28R off the real entry instead of the intended 2.0R floor.
+        # Real price action confirmed the cost: reached ~2.0R then fully
+        # reversed to a large loss, never approaching the stale target.
+        manager = PositionManager()
+        execution_result = {"shadow": False, "entry_order": {"orderId": "limit1"}, "retracement_price": 99.8}
+        plan = _retracement_plan(dca=True, single_tp=True)
+        plan["tp1_source"] = "FALLBACK"
+        plan["tp_price"] = 106  # as originally computed off the planned entry_price=100
+
+        with patch.object(config, "DCA_ENABLED", True):
+            manager.register_retracement_pending(plan, execution_result, trade_id="BTCUSDT_1")
+
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(config, "TP1_R_MULTIPLE", 2.0), \
+             patch.object(config, "TP1_MAX_R_MULTIPLE", 2.5), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}) as tp_full:
+            manager._finalize_retracement_entry(position, 99.0, 1.0, "LIMIT")  # real fill: 99.0, sl stays 98
+
+        final = manager.positions["BTCUSDT"]
+        # risk_distance = 99.0 - 98 = 1.0, 2.0R above the REAL entry -> 101.0, not the stale 106.
+        self.assertAlmostEqual(final["tp_price"], 101.0)
+        tp_full.assert_called_once()
+        self.assertAlmostEqual(tp_full.call_args.args[2], 101.0)  # the REAL order uses the same price
 
     def test_dca_single_tp_places_only_the_full_tp(self):
         manager = _retracement_manager(dca=True, single_tp=True)
@@ -5158,6 +5223,7 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         # TP1/TP2 must size off THAT, not silently reuse the plan's own.
         manager = _retracement_manager(dca=False, single_tp=False)
         position = manager.positions["BTCUSDT"]
+        position["plan"]["tp1_source"] = "POOL"  # not the focus of this test - a real level, unaffected by the fill
 
         with patch.object(config, "TP1_CLOSE_PCT", 50), \
              patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}), \
