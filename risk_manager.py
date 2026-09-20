@@ -395,6 +395,21 @@ def price_at_roi_pct(entry_price, side, roi_pct):
     return entry_price + distance if side == "BUY" else entry_price - distance
 
 
+def stop_price_at_roi_pct(entry_price, side, roi_pct):
+    """price_at_roi_pct's LOSS-side mirror - the price at which unrealized
+    ROI (at LEVERAGE) is MINUS roi_pct% of margin, i.e. a stop that loses
+    exactly roi_pct% if hit. Same relationship _stop_roi_too_high measures
+    in the other direction (distance -> ROI%); this solves it for the
+    price.
+
+    Implemented by handing price_at_roi_pct the INVERTED side rather than
+    duplicating the arithmetic, so the entry_price<=0 / LEVERAGE<=0 ->
+    None behaviour (and any future change to it) is inherited, not
+    re-derived. Built for config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED -
+    see position_manager._static_roi_cap_levels."""
+    return price_at_roi_pct(entry_price, "SELL" if side == "BUY" else "BUY", roi_pct)
+
+
 def compute_dca_target(new_entry_price, sl_price, side, pools, atr=None):
     """The single post-DCA take-profit target that replaces TP1+TP2 once
     a DCA has fired. `atr` only feeds config.STRUCTURE_TARGET_ATR_BUFFER,

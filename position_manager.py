@@ -291,6 +291,81 @@ def _resolve_tp1_price(plan, entry_price, sl_price, side):
     return original if recomputed is None else recomputed
 
 
+def _static_roi_cap_levels(entry_price, side, plan):
+    """config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED - the flat SL/TP pair
+    that replaces an oversized structure stop at settle time, instead of
+    force-closing the already-filled position (see _finalize_retracement_
+    entry's own MAX_SL_ROI_PCT branch and config.py for the evidence).
+
+    Returns {"sl_price", "tp1_price", "tp2_price"} - tp2_price is None for
+    a single_tp plan, which doesn't have one - or None, which means "don't
+    apply this, keep the existing force-close". Every guard below returns
+    None rather than shipping a level it isn't sure about: this path exists
+    to rescue a trade that would otherwise be thrown away, so declining to
+    act always lands on the exact behaviour that ran before the flag
+    existed - never on something worse.
+
+    The MAX_SL_ROI_PCT guard is the one worth spelling out: a static stop
+    configured WIDER than the cap would have this mechanism ship precisely
+    the thing the cap exists to forbid, turning a risk-reducing setting
+    into a risk-increasing one by config alone. It declines instead."""
+    if not config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED:
+        return None
+
+    sl_roi_pct = float(config.RETRACEMENT_SL_ROI_CAP_STATIC_SL_ROI_PCT)
+    tp_roi_pct = float(config.RETRACEMENT_SL_ROI_CAP_STATIC_TP_ROI_PCT)
+
+    if sl_roi_pct <= 0 or tp_roi_pct <= 0:
+        return None
+
+    max_sl_roi_pct = max(float(config.MAX_SL_ROI_PCT), 0)
+
+    if max_sl_roi_pct > 0 and sl_roi_pct > max_sl_roi_pct:
+        log_warning(
+            f"{plan.get('symbol')} static SL-ROI cap not applied - "
+            f"RETRACEMENT_SL_ROI_CAP_STATIC_SL_ROI_PCT={sl_roi_pct} is wider "
+            f"than MAX_SL_ROI_PCT={max_sl_roi_pct}"
+        )
+        return None
+
+    sl_price = risk_manager.stop_price_at_roi_pct(entry_price, side, sl_roi_pct)
+    tp1_price = risk_manager.price_at_roi_pct(entry_price, side, tp_roi_pct)
+
+    if sl_price is None or tp1_price is None:
+        return None
+
+    # Both are entry +/- a strictly positive distance by construction
+    # above, so this can only fail on a degenerate entry_price - but an
+    # inverted stop would be placed on the wrong side of the market and
+    # trigger instantly, which is worth one cheap check to never do.
+    if side == "BUY":
+        correct_side = sl_price < entry_price < tp1_price
+    else:
+        correct_side = tp1_price < entry_price < sl_price
+
+    if not correct_side:
+        return None
+
+    tp2_price = None
+
+    if not plan.get("single_tp"):
+        # config.TP2_ENABLED=False makes this unreachable live today, but a
+        # dual-TP plan still needs a TP2 that clears the new (static, and
+        # usually much smaller) risk distance by the same "at least 1R
+        # beyond wherever TP1 landed" rule compute_targets uses - reusing
+        # risk_manager's own resolver rather than leaving tp2_price on a
+        # structure level that could now sit INSIDE the static TP1.
+        _, tp2_price = risk_manager.compute_static_tp1_structure_tp2(
+            entry_price, sl_price, side, tp_roi_pct,
+            pools=plan.get("liquidity_pools"), atr=plan.get("atr"),
+        )
+
+        if tp2_price is None:
+            return None
+
+    return {"sl_price": sl_price, "tp1_price": tp1_price, "tp2_price": tp2_price}
+
+
 class PositionManager:
     def __init__(self):
         self.positions = {}
@@ -5049,7 +5124,16 @@ class PositionManager:
         Deliberately NOT extended to dca_price (same stale-anchor shape
         exists there) - config.DCA_ENABLED is False live, making it
         currently inert; revisit only if DCA_ENABLED is ever turned back
-        on."""
+        on.
+
+        config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED - when that
+        revalidated stop DOES breach MAX_SL_ROI_PCT, the oversized
+        structure stop is replaced by a flat ROI%-derived SL/TP pair
+        (_static_roi_cap_levels) and the position is kept, instead of being
+        closed at market. That makes RETRACEMENT_SL_ROI_TOO_HIGH reachable
+        only when the flag is off or one of that helper's guards declines -
+        see config.py for the evidence and for why every guard falls back
+        to the original close rather than to something else."""
         plan = position["plan"]
         symbol = position["symbol"]
         side = position["side"]
@@ -5071,6 +5155,45 @@ class PositionManager:
             )
 
         risk_distance = abs(entry_price - settled_plan["sl_price"])
+
+        # config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - evaluated here,
+        # ONCE, against the pre-override risk distance, because both of the
+        # two things that can now happen on a breach need the same answer:
+        # the static-ROI replacement immediately below, and (when that
+        # declines) the original force-close further down. Still gated on
+        # sl_widen_reason, so a settle the revalidation never touched
+        # cannot reach either branch - all 17 real occurrences of this were
+        # POOL widens, so the gate costs nothing.
+        roi_breached = bool(sl_widen_reason) and risk_manager._stop_roi_too_high(
+            risk_distance, entry_price
+        )
+        # config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED - replace the
+        # oversized structure stop with a flat ROI%-derived SL/TP pair and
+        # KEEP the position, rather than throwing away capital that has
+        # already landed on the exchange. None (flag off, or any guard
+        # declined) leaves everything below byte-identical to the original
+        # force-close path. See _static_roi_cap_levels and config.py.
+        static_cap = _static_roi_cap_levels(entry_price, side, plan) if roi_breached else None
+
+        if static_cap is not None:
+            settled_plan["sl_price"] = static_cap["sl_price"]
+            risk_distance = abs(entry_price - static_cap["sl_price"])
+            # The target is now a pure function of entry_price, exactly
+            # like config.TP_STATIC_ROI_ENABLED's own TP1 - recorded so the
+            # settled plan describes itself honestly to anything that reads
+            # it later (see _resolve_tp1_price's case 1).
+            settled_plan["tp1_static_roi_pct"] = float(
+                config.RETRACEMENT_SL_ROI_CAP_STATIC_TP_ROI_PCT
+            )
+            log_info(
+                f"{symbol}{' [SHADOW]' if shadow else ''} retracement settle kept on static "
+                f"ROI levels - revalidated stop ({sl_widen_reason}) breached MAX_SL_ROI_PCT, "
+                f"SL {static_cap['sl_price']} "
+                f"({config.RETRACEMENT_SL_ROI_CAP_STATIC_SL_ROI_PCT}% ROI) / "
+                f"TP {static_cap['tp1_price']} "
+                f"({config.RETRACEMENT_SL_ROI_CAP_STATIC_TP_ROI_PCT}% ROI)"
+            )
+
         settled_plan["risk_distance"] = risk_distance if risk_distance > 0 else plan.get("risk_distance")
         # config.BTC_ADVERSE_MOVE_TRACKING_ENABLED - real fill-time anchor
         # overriding the stale signal-time snapshot, same "resting order
@@ -5081,7 +5204,24 @@ class PositionManager:
             btc_price if btc_price is not None else plan.get("btc_entry_price")
         )
 
-        if not plan.get("single_tp"):
+        # config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED - the static pair
+        # replaces the structure-derived target outright, so
+        # _resolve_tp1_price (which re-anchors the ORIGINAL target to the
+        # real fill) has nothing left to do on this branch and is skipped.
+        # tp1_source records that this trade's TP came from here and not
+        # from a pool/fallback/plain-static resolution, so the mechanism
+        # stays measurable in the journal afterwards.
+        settled_tp1_source = None
+
+        if static_cap is not None:
+            settled_tp1_source = "STATIC_ROI_CAP"
+
+            if plan.get("single_tp"):
+                settled_plan["tp_price"] = static_cap["tp1_price"]
+            else:
+                settled_plan["tp1_price"] = static_cap["tp1_price"]
+                settled_plan["tp2_price"] = static_cap["tp2_price"]
+        elif not plan.get("single_tp"):
             settled_plan["tp1_price"] = _resolve_tp1_price(plan, entry_price, settled_plan["sl_price"], side)
         else:
             # config.TP2_ENABLED=False - a single_tp plan has the exact
@@ -5107,6 +5247,15 @@ class PositionManager:
             symbol, trade_id, entry_price, fill_type, fill_lag_seconds,
             used_deep_retracement=position.get("used_deep_retracement", False),
             sl_price=settled_plan["sl_price"], sl_widen_reason=sl_widen_reason,
+            # The REAL settled target, whichever field this plan shape
+            # keeps it in - previously never journaled at all, so every
+            # retracement-settled row kept the stale signal-time tp1_price
+            # even when _resolve_tp1_price had already re-anchored it. Same
+            # stale-forever gap sl_price above was fixed for.
+            tp_price=(
+                settled_plan["tp_price"] if plan.get("single_tp") else settled_plan["tp1_price"]
+            ),
+            tp1_source=settled_tp1_source,
         )
 
         # config.RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED - only reachable
@@ -5117,7 +5266,11 @@ class PositionManager:
         # is to reject an oversized stop outright, at any size - that
         # shouldn't quietly stop applying just because capital already
         # landed on the exchange moments before this check runs.
-        if sl_widen_reason and risk_manager._stop_roi_too_high(risk_distance, entry_price):
+        #
+        # config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED - unless the static
+        # pair above already rescued this fill, in which case the stop that
+        # breached the cap no longer exists and there is nothing to reject.
+        if roi_breached and static_cap is None:
             self.positions.pop(symbol, None)
             self._closed_at[symbol] = time.time()
             log_error(

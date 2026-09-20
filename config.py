@@ -2236,6 +2236,63 @@ ENTRY_RANGE_LOOKBACK_CANDLES = env_int("ENTRY_RANGE_LOOKBACK_CANDLES", 12)
 # leverage), just not one that fights an already-proven mechanism by
 # default.
 MAX_SL_ROI_PCT = env_float("MAX_SL_ROI_PCT", 30)
+# What happens when MAX_SL_ROI_PCT is breached AFTER capital has already
+# landed on the exchange - i.e. position_manager._finalize_retracement_
+# entry's settle path, where RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED has
+# just re-anchored the stop to a real liquidity pool that turns out to sit
+# far past the cap. The original behaviour (still what runs with this off)
+# is to close the already-filled position at market and journal
+# RETRACEMENT_SL_ROI_TOO_HIGH. That is a GUARANTEED small loss every time -
+# round-trip taker fees plus slippage, ~0.8% of margin at MARGIN_PER_TRADE=
+# 100/LEVERAGE=10 - with no upside at all, which is what prompted this
+# (2026-09-20, operator).
+#
+# On: the oversized structure stop is replaced by a flat pair of ROI%-
+# derived levels (..._SL_ROI_PCT / ..._TP_ROI_PCT below) and the position is
+# kept. Deliberately NOT extended to build_trade_plan's pre-entry
+# SL_ROI_TOO_HIGH reject - nothing is open there, so there is no fee and
+# nothing to rescue.
+#
+# Real evidence (2026-09-20): all 17 RETRACEMENT_SL_ROI_TOO_HIGH rows in
+# the journal (8 LIVE, 9 SHADOW), replayed from their REAL fill price on
+# real 5m klines, first touch wins, an ambiguous bar scored AGAINST us -
+# static 30/15 gives 13 TP / 3 SL / 1 still-undecided = 81% TP-first,
+# +1.44R per decided trade at a fixed 2:1. LIVE-only subset 6 TP / 1 SL.
+# Every one of the 17 was a POOL widen (never FLOOR_FALLBACK), with the
+# re-anchored stop landing between 30.6% and 293.4% ROI.
+#
+# That replay models live mechanics faithfully rather than idealising
+# them: TP2_ENABLED=False makes every live plan single_tp, and both
+# position_manager._is_early_breakeven_candidate and _is_profit_protection_
+# candidate return False for single_tp, with STRUCTURE_STOP_MANAGEMENT_
+# ENABLED=False - a live trade really does just race SL against TP with
+# nothing in between.
+#
+# READ THIS BEFORE GENERALISING: this cohort is SELECTED for trades whose
+# stop widened unusually far, which flatters a tight fixed stop. It is
+# evidence about this rescue path only, NOT evidence that static stops beat
+# structure stops anywhere else. n=17, 24h replay window, funding not
+# modelled.
+#
+# A floor clamp was considered and rejected on evidence. For 7 of the 17 a
+# 15%-ROI stop sits INSIDE the max(entry*MIN_STOP_DISTANCE_PCT, atr*MIN_
+# STOP_DISTANCE_ATR_MULTIPLE) noise floor that the revalidation exists to
+# enforce - the exact hazard that mechanism was built for. Replaying two
+# clamped variants (stop floored with TP fixed at 30%; stop floored with TP
+# held at 2x the stop) changed ZERO outcomes across all 17, including all 7
+# of that sub-floor cohort (5 TP / 2 SL under every variant). The clamp buys
+# nothing here and costs the fixed 2:1, so the plain levels ship instead.
+RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED = env_bool("RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED", "False")
+# The replacement stop, as ROI% of margin at LEVERAGE (risk_manager.
+# stop_price_at_roi_pct). Hard-capped by MAX_SL_ROI_PCT itself: set this
+# above the cap and the whole mechanism declines to fire rather than ship a
+# stop the cap forbids - see position_manager._static_roi_cap_levels.
+RETRACEMENT_SL_ROI_CAP_STATIC_SL_ROI_PCT = env_float("RETRACEMENT_SL_ROI_CAP_STATIC_SL_ROI_PCT", 15)
+# The replacement target, same ROI% units (risk_manager.price_at_roi_pct).
+# These two together are what set the realized RR - 30/15 is exactly 2:1,
+# matching TP1_R_MULTIPLE=2.0. Change one without the other and the R
+# multiple this path trades at moves with it.
+RETRACEMENT_SL_ROI_CAP_STATIC_TP_ROI_PCT = env_float("RETRACEMENT_SL_ROI_CAP_STATIC_TP_ROI_PCT", 30)
 # 2026-08-31: confluence-weighted position sizing (and the confluence_
 # score/total/ratio journal fields it was built on) removed entirely.
 # DISABLED since 2026-08-09 on real evidence (a 54-trade pull showed

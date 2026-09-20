@@ -2097,6 +2097,54 @@ class PriceAtRoiPctTests(unittest.TestCase):
         self.assertIsNone(price)
 
 
+class StopPriceAtRoiPctTests(unittest.TestCase):
+    """price_at_roi_pct's loss-side mirror - config.RETRACEMENT_SL_ROI_CAP_
+    STATIC_ENABLED's static stop. Same arithmetic, opposite direction, so
+    these mirror PriceAtRoiPctTests above case for case."""
+
+    def test_buy_stop_sits_below_entry(self):
+        with patch.object(config, "LEVERAGE", 10):
+            price = risk_manager.stop_price_at_roi_pct(100, "BUY", 15)
+
+        self.assertAlmostEqual(price, 98.5)  # 15% ROI / 10x = 1.5% price move
+
+    def test_sell_stop_sits_above_entry(self):
+        with patch.object(config, "LEVERAGE", 10):
+            price = risk_manager.stop_price_at_roi_pct(100, "SELL", 15)
+
+        self.assertAlmostEqual(price, 101.5)
+
+    def test_it_is_the_exact_inverse_of_the_profit_side(self):
+        # The one property everything downstream relies on: a stop and a
+        # target at the same ROI% are equidistant from entry.
+        with patch.object(config, "LEVERAGE", 10):
+            stop = risk_manager.stop_price_at_roi_pct(100, "BUY", 30)
+            target = risk_manager.price_at_roi_pct(100, "BUY", 30)
+
+        self.assertAlmostEqual(100 - stop, target - 100)
+
+    def test_higher_leverage_needs_a_smaller_price_move_for_the_same_roi(self):
+        with patch.object(config, "LEVERAGE", 20):
+            price = risk_manager.stop_price_at_roi_pct(100, "BUY", 30)
+
+        self.assertAlmostEqual(price, 98.5)  # 30% / 20x = 1.5% price move
+
+    def test_negative_roi_is_clamped_to_zero(self):
+        with patch.object(config, "LEVERAGE", 10):
+            price = risk_manager.stop_price_at_roi_pct(100, "BUY", -20)
+
+        self.assertAlmostEqual(price, 100.0)
+
+    def test_zero_entry_price_returns_none(self):
+        self.assertIsNone(risk_manager.stop_price_at_roi_pct(0, "BUY", 15))
+
+    def test_zero_leverage_returns_none(self):
+        with patch.object(config, "LEVERAGE", 0):
+            price = risk_manager.stop_price_at_roi_pct(100, "BUY", 15)
+
+        self.assertIsNone(price)
+
+
 class BuildDcaPlanTests(unittest.TestCase):
     def setUp(self):
         for name, value in (

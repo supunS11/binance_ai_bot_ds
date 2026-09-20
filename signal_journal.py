@@ -29,8 +29,10 @@ FIELDNAMES = [
     "structure_level", "entry_extension_r", "nearest_favorable_sr_r",
     # config.TP1_R_MULTIPLE / TP1_MAX_R_MULTIPLE - risk_manager.tp1_pool_
     # touches' own docstring has the full rationale. tp1_source is one of
-    # POOL/FALLBACK/STATIC_ROI; tp1_pool_touches is only non-blank when
-    # tp1_source is POOL.
+    # POOL/FALLBACK/STATIC_ROI, or STATIC_ROI_CAP when a settle replaced
+    # the target outright (config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED -
+    # see append_retracement_settle); tp1_pool_touches is only non-blank
+    # when tp1_source is POOL.
     "tp1_source", "tp1_pool_touches",
     # config.LIQUIDATION_HEATMAP_ENABLED - how many real historical
     # liquidation clusters existed for this symbol at signal time.
@@ -422,7 +424,7 @@ def append_signal(signal, plan, execution_result=None):
 
 def append_retracement_settle(
     symbol, trade_id, entry_price, fill_type, fill_lag_seconds, used_deep_retracement=False,
-    sl_price=None, sl_widen_reason=None,
+    sl_price=None, sl_widen_reason=None, tp_price=None, tp1_source=None,
 ):
     """config.RETRACEMENT_ENTRY_ENABLED - a second, partial row for the
     same trade_id, appended once a retracement-pending signal actually
@@ -462,7 +464,23 @@ def append_retracement_settle(
     on the stale pre-fill sl_price forever). `sl_widen_reason`
     ("POOL"/"FLOOR_FALLBACK") is only non-blank when this settle actually
     widened the stop; blank means either the flag was off or the real
-    fill still cleared the floor on its own."""
+    fill still cleared the floor on its own.
+
+    `tp_price` is the REAL settled target (position_manager._finalize_
+    retracement_entry picks tp_price or tp1_price per the plan's own
+    shape), written to the tp1_price column. Closes the exact same
+    stale-forever gap sl_price above closes, one field over: position_
+    manager._resolve_tp1_price re-anchors an entry-price-dependent target
+    to the real fill, but that corrected value was never journaled, so
+    every retracement-settled row kept its stale signal-time tp1_price.
+
+    `tp1_source` overrides the signal row's own POOL/FALLBACK/STATIC_ROI
+    value, and is only non-blank when the settle actually replaced the
+    target rather than re-anchoring it - today that means "STATIC_ROI_CAP"
+    (config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED). Without it those trades
+    would be indistinguishable in the journal from ordinary settles, and
+    measuring that mechanism afterwards is the whole point of having it
+    behind a flag."""
     row = {field: "" for field in FIELDNAMES}
     row["timestamp"] = time.time()
     row["trade_id"] = trade_id or ""
@@ -477,6 +495,12 @@ def append_retracement_settle(
 
     if sl_widen_reason is not None:
         row["retracement_sl_widen_reason"] = sl_widen_reason
+
+    if tp_price is not None:
+        row["tp1_price"] = tp_price
+
+    if tp1_source is not None:
+        row["tp1_source"] = tp1_source
 
     _append_row(row)
 

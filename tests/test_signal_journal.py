@@ -380,6 +380,45 @@ class SignalJournalTests(unittest.TestCase):
         self.assertEqual(rows[1]["sl_price"], "")
         self.assertEqual(rows[1]["retracement_sl_widen_reason"], "")
 
+    # The same stale-forever gap one field over: position_manager re-anchors
+    # an entry-price-dependent target to the real fill, but that corrected
+    # value was never journaled. tp1_source is only overridden when the
+    # settle REPLACED the target rather than re-anchoring it - config.
+    # RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED's "STATIC_ROI_CAP".
+
+    def test_append_retracement_settle_writes_the_settled_tp_price(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())  # planned tp1_price=102
+        signal_journal.append_retracement_settle(
+            "BTCUSDT", trade_id, 99.9, "LIMIT", 12.0, tp_price=102.897,
+        )
+
+        rows = self._read_rows()
+        self.assertEqual(rows[0]["tp1_price"], "102.0")  # original row untouched
+        self.assertEqual(rows[1]["tp1_price"], "102.897")  # real, settled target
+        self.assertEqual(rows[1]["tp1_source"], "")  # re-anchored, not replaced
+
+    def test_append_retracement_settle_writes_the_static_cap_tp1_source(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_retracement_settle(
+            "BTCUSDT", trade_id, 99.9, "LIMIT", 12.0,
+            sl_price=98.4015, sl_widen_reason="POOL",
+            tp_price=102.897, tp1_source="STATIC_ROI_CAP",
+        )
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["tp1_source"], "STATIC_ROI_CAP")
+        self.assertEqual(rows[1]["sl_price"], "98.4015")
+        # The widen that triggered the replacement is still recorded as itself.
+        self.assertEqual(rows[1]["retracement_sl_widen_reason"], "POOL")
+
+    def test_append_retracement_settle_leaves_tp_fields_blank_when_not_given(self):
+        trade_id = signal_journal.append_signal(_signal(), _plan())
+        signal_journal.append_retracement_settle("BTCUSDT", trade_id, 99.5, "LIMIT", 184.2)
+
+        rows = self._read_rows()
+        self.assertEqual(rows[1]["tp1_price"], "")
+        self.assertEqual(rows[1]["tp1_source"], "")
+
     def test_append_signal_writes_quote_volume_usdt(self):
         signal_journal.append_signal(_signal(quote_volume_usdt=12_500_000), _plan())
         rows = self._read_rows()

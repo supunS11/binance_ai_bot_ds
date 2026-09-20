@@ -22,6 +22,16 @@ from position_manager import (
 # (signal_journal.append_retracement_settle) - neither side effect is
 # something these tests care about, so both are patched out for the whole
 # module rather than in every single test that reaches one.
+#
+# config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED is pinned OFF for the same
+# module-wide reason, but a different hazard: it changes what happens to a
+# settle whose revalidated stop breaches MAX_SL_ROI_PCT (keep the position
+# on static levels instead of force-closing it), which several tests here
+# assert the OLD behaviour of. Its config.py default is already False, but
+# .env is what actually runs, and a flag enabled there has silently broken
+# pre-existing tests four times now - only an explicit patch.object
+# isolates them, since config calls load_dotenv() at import. Tests that
+# want the mechanism turn it on locally.
 _journal_patchers = []
 
 
@@ -30,6 +40,7 @@ def setUpModule():
     _journal_patchers = [
         patch("position_manager.signal_journal.append_outcome"),
         patch("position_manager.signal_journal.append_retracement_settle"),
+        patch.object(config, "RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED", False),
     ]
     for patcher in _journal_patchers:
         patcher.start()
@@ -5428,6 +5439,233 @@ class FinalizeRetracementEntryTests(unittest.TestCase):
         self.assertEqual(outcome, "RETRACEMENT_SL_ROI_TOO_HIGH")
         self.assertFalse(manager.has_open_position("BTCUSDT"))
         close_market.assert_not_called()
+
+    # config.RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED (2026-09-20) - the same
+    # breaching fixture the two tests above use (fill 99.9, pool at 95,
+    # atr=2 -> widened stop 94.0, a 590.6% ROI stop at LEVERAGE=10), but
+    # with a realistic MAX_SL_ROI_PCT=30 so the widened stop breaches the
+    # cap while the 15% static stop sits comfortably under it. Static
+    # levels off a 99.9 fill: SL 99.9*(1-0.15/10), TP 99.9*(1+0.30/10).
+    STATIC_SL_PRICE = 98.4015
+    STATIC_TP_PRICE = 102.897
+    STATIC_RISK_DISTANCE = 1.4985
+
+    def _pin_static_cap(self, **overrides):
+        values = {
+            "RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED": True,
+            "MIN_STOP_DISTANCE_PCT": 0.6,
+            "MIN_STOP_DISTANCE_ATR_MULTIPLE": 1.0,
+            "STRUCTURE_STOP_ATR_BUFFER": 0.5,
+            "MAX_SL_ROI_PCT": 30,
+            "LEVERAGE": 10,
+            "RETRACEMENT_SL_ROI_CAP_STATIC_ENABLED": True,
+            "RETRACEMENT_SL_ROI_CAP_STATIC_SL_ROI_PCT": 15,
+            "RETRACEMENT_SL_ROI_CAP_STATIC_TP_ROI_PCT": 30,
+        }
+        values.update(overrides)
+
+        for name, value in values.items():
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _breaching_position(self, single_tp=True, shadow=False):
+        manager = _retracement_manager(dca=False, single_tp=single_tp, shadow=shadow)
+        position = manager.positions["BTCUSDT"]
+        position["plan"]["atr"] = 2
+        position["plan"]["liquidity_pools"] = [{"type": "SELL_SIDE", "price": 95}]
+        return manager, position
+
+    def test_static_cap_keeps_the_position_on_flat_roi_levels(self):
+        manager, position = self._breaching_position()
+        self._pin_static_cap()
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}) as tp, \
+             patch.object(exchange, "close_position_market") as close_market:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertIsNone(outcome)  # no longer a closed-trade outcome at all
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+        close_market.assert_not_called()
+
+        final = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(final["sl_price"], self.STATIC_SL_PRICE)
+        self.assertAlmostEqual(final["tp_price"], self.STATIC_TP_PRICE)
+        self.assertAlmostEqual(sl.call_args.args[2], self.STATIC_SL_PRICE)
+        self.assertAlmostEqual(tp.call_args.args[2], self.STATIC_TP_PRICE)
+
+    def test_static_cap_risk_distance_follows_the_static_stop(self):
+        # Fixed at entry and never re-derived afterwards (see register's own
+        # note on risk_distance) - every later R-multiple, MAE and MFE for
+        # this trade is denominated in it, so it must be the STATIC stop's
+        # distance, not the discarded structure stop's.
+        manager, position = self._breaching_position()
+        self._pin_static_cap()
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}):
+            manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        final = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(final["risk_distance"], self.STATIC_RISK_DISTANCE)
+        # 30%/15% ROI is exactly 2:1 - the whole point of the pair.
+        self.assertAlmostEqual(
+            (final["tp_price"] - final["entry_price"]) / final["risk_distance"], 2.0
+        )
+
+    def test_static_cap_in_shadow_places_no_real_orders(self):
+        manager, position = self._breaching_position(shadow=True)
+        self._pin_static_cap()
+
+        with patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "place_stop_loss") as sl:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertIsNone(outcome)
+        self.assertTrue(manager.has_open_position("BTCUSDT"))
+        close_market.assert_not_called()
+        sl.assert_not_called()
+        self.assertAlmostEqual(manager.positions["BTCUSDT"]["sl_price"], self.STATIC_SL_PRICE)
+
+    def test_static_cap_journals_its_levels_and_its_own_tp1_source(self):
+        # Without tp1_source these trades would be indistinguishable from
+        # ordinary settles in the journal, and the mechanism could never be
+        # measured afterwards.
+        manager, position = self._breaching_position()
+        self._pin_static_cap()
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        kwargs = append_settle.call_args.kwargs
+        self.assertAlmostEqual(kwargs["sl_price"], self.STATIC_SL_PRICE)
+        self.assertAlmostEqual(kwargs["tp_price"], self.STATIC_TP_PRICE)
+        self.assertEqual(kwargs["tp1_source"], "STATIC_ROI_CAP")
+        # The widen that triggered all this is still recorded as what it was.
+        self.assertEqual(kwargs["sl_widen_reason"], "POOL")
+
+    def test_ordinary_settle_journals_its_real_tp_with_no_static_source(self):
+        # The other half of the journaling change: every settle now records
+        # its REAL settled target (previously never journaled, leaving each
+        # row on its stale signal-time tp1_price), but only a static-cap
+        # settle overrides tp1_source.
+        manager = _retracement_manager(dca=False, single_tp=True)
+        position = manager.positions["BTCUSDT"]
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp_1"}), \
+             patch("position_manager.signal_journal.append_retracement_settle") as append_settle:
+            manager._finalize_retracement_entry(position, 99.8, 1.0, "LIMIT")
+
+        kwargs = append_settle.call_args.kwargs
+        self.assertIsNone(kwargs["tp1_source"])
+        self.assertEqual(kwargs["tp_price"], manager.positions["BTCUSDT"]["tp_price"])
+
+    def test_static_sl_wider_than_max_sl_roi_falls_back_to_the_force_close(self):
+        # A static stop configured wider than the cap would have this
+        # mechanism ship exactly what the cap exists to forbid. It declines.
+        manager, position = self._breaching_position()
+        self._pin_static_cap(RETRACEMENT_SL_ROI_CAP_STATIC_SL_ROI_PCT=45)
+
+        with patch.object(exchange, "close_position_market") as close_market, \
+             patch.object(exchange, "place_stop_loss") as sl:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertEqual(outcome, "RETRACEMENT_SL_ROI_TOO_HIGH")
+        self.assertFalse(manager.has_open_position("BTCUSDT"))
+        close_market.assert_called_once_with("BTCUSDT", "BUY", 1.0)
+        sl.assert_not_called()
+
+    def test_zero_static_roi_setting_falls_back_to_the_force_close(self):
+        manager, position = self._breaching_position()
+        self._pin_static_cap(RETRACEMENT_SL_ROI_CAP_STATIC_TP_ROI_PCT=0)
+
+        with patch.object(exchange, "close_position_market") as close_market:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertEqual(outcome, "RETRACEMENT_SL_ROI_TOO_HIGH")
+        close_market.assert_called_once()
+
+    def test_unresolvable_static_price_falls_back_to_the_force_close(self):
+        manager, position = self._breaching_position()
+        self._pin_static_cap()
+
+        with patch.object(risk_manager, "price_at_roi_pct", return_value=None), \
+             patch.object(exchange, "close_position_market") as close_market:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertEqual(outcome, "RETRACEMENT_SL_ROI_TOO_HIGH")
+        close_market.assert_called_once()
+
+    def test_static_cap_dual_tp_resolves_tp2_beyond_the_static_tp1(self):
+        # config.TP2_ENABLED=False makes this shape unreachable live today,
+        # but TP2 must still clear the NEW (static, much smaller) risk
+        # distance rather than stay on a structure level that could now sit
+        # inside the static TP1.
+        manager, position = self._breaching_position(single_tp=False)
+        self._pin_static_cap(TP2_R_MULTIPLE=3.0, TP2_MAX_R_MULTIPLE=4.0)
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}), \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertIsNone(outcome)
+        final = manager.positions["BTCUSDT"]
+        self.assertAlmostEqual(final["tp1_price"], self.STATIC_TP_PRICE)
+        # No BUY_SIDE pool qualifies, so TP2 takes the flat 3.0R fallback.
+        self.assertAlmostEqual(final["tp2_price"], 99.9 + 3.0 * self.STATIC_RISK_DISTANCE)
+        self.assertGreater(final["tp2_price"], final["tp1_price"])
+
+    def test_static_cap_dual_tp_falls_back_when_tp2_cannot_resolve(self):
+        manager, position = self._breaching_position(single_tp=False)
+        self._pin_static_cap()
+
+        with patch.object(
+            risk_manager, "compute_static_tp1_structure_tp2",
+            return_value=(self.STATIC_TP_PRICE, None),
+        ), patch.object(exchange, "close_position_market") as close_market:
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertEqual(outcome, "RETRACEMENT_SL_ROI_TOO_HIGH")
+        close_market.assert_called_once()
+
+    def test_widened_stop_under_the_cap_is_untouched_with_the_flag_on(self):
+        # Zero blast radius: the static pair only ever replaces a stop that
+        # actually breached MAX_SL_ROI_PCT. A widen that stays under it keeps
+        # its real structure stop.
+        manager, position = self._breaching_position(single_tp=False)
+        self._pin_static_cap(MAX_SL_ROI_PCT=0)  # 0 disables the cap entirely
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            outcome = manager._finalize_retracement_entry(position, 99.9, 1.0, "LIMIT")
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 94.0)  # 95 - (2 * 0.5)
+        sl.assert_called_once_with("BTCUSDT", "BUY", 94.0)
+
+    def test_settle_that_never_widens_is_untouched_with_the_flag_on(self):
+        # The default fixture sets no atr/pools, so the floor never binds and
+        # sl_widen_reason stays None - the static path can't be reached at
+        # all, whatever the cap says.
+        manager = _retracement_manager(dca=False, single_tp=False)
+        self._pin_static_cap(MAX_SL_ROI_PCT=1)
+
+        with patch.object(exchange, "place_stop_loss", return_value={"algoId": "sl_1"}) as sl, \
+             patch.object(exchange, "place_take_profit_partial", return_value={"algoId": "tp1_1"}), \
+             patch.object(exchange, "place_take_profit_full", return_value={"algoId": "tp2_1"}):
+            outcome = manager._finalize_retracement_entry(
+                manager.positions["BTCUSDT"], 99.8, 1.0, "LIMIT",
+            )
+
+        self.assertIsNone(outcome)
+        self.assertEqual(manager.positions["BTCUSDT"]["sl_price"], 98)
+        sl.assert_called_once_with("BTCUSDT", "BUY", 98)
 
     def test_existing_fixture_stays_a_noop_even_with_flag_on(self):
         # The default _retracement_manager() fixture never sets atr/
