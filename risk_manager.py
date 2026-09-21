@@ -1037,6 +1037,51 @@ def build_trade_plan(signal, balance):
         pools_for_targets, entry_price, side, risk_distance
     )
 
+    # config.MIN_NEAREST_FAVORABLE_SR_R - the gate this field was journaled
+    # for. TP1/TP2 are drawn TO a level that clears their own R floor, but
+    # until now nothing checked whether a CLOSER real level sits in the way
+    # first. See config.py for the full evidence table and the real
+    # XRPUSDT trade (nearest level 0.0199R - sitting on the entry price)
+    # that prompted it.
+    #
+    # Evaluated here rather than earlier on purpose: the value is already
+    # computed at this point for journaling, so the gate costs no extra
+    # work and no second pool search. It also means SL_ROI_TOO_HIGH/
+    # ENTRY_TOO_EXTENDED above still win when several apply at once -
+    # deliberate, so this new reason never masks a pre-existing one in the
+    # reject tallies.
+    #
+    # A None reading PASSES, and that direction is the whole point:
+    # nearest_favorable_structure_r returns None when NO real pool exists
+    # in the favorable direction - a CLEAR path (or no pool data), not a
+    # blocked one. Rejecting on None would invert the gate and turn away
+    # exactly the trades it exists to keep.
+    #
+    # Two independent conditions, both meaning "a real level is in the
+    # way", so both report the same reason:
+    #
+    # 1. config.NEAREST_SR_BLOCKS_TARGET_ENABLED (primary) - the level sits
+    #    closer than THIS TRADE'S OWN target. Uses tp1_price rather than
+    #    TP1_R_MULTIPLE because the realized target distance varies (it can
+    #    land anywhere in the [TP1_R_MULTIPLE, TP1_MAX_R_MULTIPLE] window on
+    #    a pool, or exactly on the flat fallback), so a fixed constant
+    #    cannot express "between entry and the target". tp1_price is the
+    #    right field even when single_tp - build_trade_plan sets tp_price
+    #    FROM it below, so they are the same number.
+    # 2. config.MIN_NEAREST_FAVORABLE_SR_R (secondary) - an absolute floor,
+    #    independent of where the target landed.
+    if nearest_favorable_sr_r is not None:
+        if config.NEAREST_SR_BLOCKS_TARGET_ENABLED:
+            tp1_distance_r = abs(tp1_price - entry_price) / risk_distance
+
+            if nearest_favorable_sr_r < tp1_distance_r:
+                return None, "NEAREST_SR_TOO_CLOSE"
+
+        min_nearest_sr_r = max(float(config.MIN_NEAREST_FAVORABLE_SR_R), 0)
+
+        if min_nearest_sr_r > 0 and nearest_favorable_sr_r < min_nearest_sr_r:
+            return None, "NEAREST_SR_TOO_CLOSE"
+
     # config.TP_STATIC_ROI_ENABLED - a static-ROI TP1 was never resolved
     # against a pool at all, so the touches lookup is meaningless there;
     # tp1_source records which of the three real paths tp1_price actually

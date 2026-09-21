@@ -2236,6 +2236,100 @@ ENTRY_RANGE_LOOKBACK_CANDLES = env_int("ENTRY_RANGE_LOOKBACK_CANDLES", 12)
 # leverage), just not one that fights an already-proven mechanism by
 # default.
 MAX_SL_ROI_PCT = env_float("MAX_SL_ROI_PCT", 30)
+# Rejects an entry whose path to target is blocked by a real structure level
+# sitting closer than this many R - see risk_manager.nearest_favorable_
+# structure_r, which has been computed and journaled on every trade since it
+# was built specifically so this question could be answered with evidence
+# before anything gated on it ("log it before gating on it", the same
+# rollout ema_aligned/oi_rising used - see OI_RISING_REJECT_ENABLED).
+#
+# The evidence now exists (2026-09-20, 68 resolved current-regime trades,
+# 51 carrying a reading). TP1/TP2 are drawn TO a qualifying level, but
+# nothing checked whether a CLOSER one sits in the way first and caps or
+# reverses the move before the target is reached:
+#   nearest level  <0.25R    25.0% win (n=4)    -1.0R
+#                  0.25-1.0R  0.0% win (n=7)    -7.0R
+#                  1.0-2.0R  33.3% win (n=12)    0.0R
+#                  >=2.0R    53.6% win (n=28)  +17.0R
+#
+# Threshold sizing against a +9.0R/39.2%-win baseline over those 51:
+#   >=1.00  removes n=11 (9.1% win, -8.0R), keeps +17.0R   -> +8.0R
+#   >=1.25  removes n=12 (8.3% win, -9.0R), keeps +18.0R   -> +9.0R
+#   >=1.50  removes n=13 (7.7% win,-10.0R), keeps +19.0R   -> +10.0R
+#   >=2.00  removes n=23 (21.7% win,-8.0R), keeps +17.0R   -> +8.0R
+# 1.0 is the conservative end of the 1.0-1.5 plateau - most of the gain for
+# the smallest cut in exposure. 2.0 is strictly worse (same +8R for nearly
+# double the trades removed), because the 1.0-2.0R band is break-even, not
+# negative.
+#
+# NOT one trigger in disguise - the split survives every holdout:
+#   all triggers          <1.0R  9.1% (n=11)  vs  >=1.0R 47.5% (n=40)
+#   excl CVD_DIVERGENCE   <1.0R 10.0% (n=10)  vs  >=1.0R 52.6% (n=19)
+#   excl ORDER_BLOCK_RET  <1.0R 16.7% (n=6)   vs  >=1.0R 45.2% (n=31)
+#   excl both             <1.0R 20.0% (n=5)   vs  >=1.0R 50.0% (n=10)
+#
+# Real motivation (2026-09-20, operator): a live XRPUSDT SELL that hit SL
+# had nearest_favorable_sr_r=0.0199 - a real level sitting essentially ON
+# the entry price - while its TP was a 2.0R FALLBACK projection with no
+# real level behind it at all. It bites hardest exactly where the operator's
+# concern was: 36% of ORDER_BLOCK_RETEST and 50% of EMA_PULLBACK entries,
+# vs 5% of CVD_DIVERGENCE.
+#
+# Reject-only and risk-REDUCING by construction (can only ever remove a
+# trade, never add one or enlarge it), so it ships on real evidence
+# immediately rather than defaulting off - same basis as MIN_STOP_DISTANCE_
+# ATR_MULTIPLE/MAX_SL_ROI_PCT. Honest caveat: n=51 with a reading, removed
+# cohort n=11, a single ~2-week window in one market regime.
+#
+# 0 disables it. A None reading (no real pool ahead at all) always PASSES -
+# see risk_manager.build_trade_plan for why that direction matters.
+#
+# This absolute floor is the SECONDARY half of the gate. A fixed number
+# cannot actually express "nothing blocks the path to target", because the
+# target's own distance varies trade to trade (median 2.10R over the same
+# 51, but ranging 0.82R to 6.35R) - see NEAREST_SR_BLOCKS_TARGET_ENABLED
+# below, which is the primary test. Kept as an independent floor for the
+# case the relative test is weakest at: a trade whose target is unusually
+# close, where "closer than target" barely excludes anything. Ships 0
+# (off) - the relative test covers every case seen so far.
+MIN_NEAREST_FAVORABLE_SR_R = env_float("MIN_NEAREST_FAVORABLE_SR_R", 0)
+# The PRIMARY, target-relative half: reject when a real structure level
+# sits closer than THIS TRADE'S OWN take-profit, i.e. genuinely between
+# entry and the target rather than closer than some fixed constant.
+#
+# Why relative rather than fixed (2026-09-20, operator's question - does a
+# fixed 1.0 match TP1_R_MULTIPLE=2.0/TP1_MAX_R_MULTIPLE=2.5?): it does not.
+# _find_structure_target only accepts a pool inside [TP1_R_MULTIPLE,
+# TP1_MAX_R_MULTIPLE], so a level at 1.5R sits BETWEEN entry and a 2.0R
+# target and obstructs it, yet a 1.0 floor waves it through. Of the same 51
+# trades, where the nearest level actually sat:
+#   inside 1.0R                                  11
+#   1.0-2.0R  (between entry and TP)             12   <- missed by a 1.0 floor
+#   2.0-2.5R  (IS the TP window)                  2
+#   beyond 2.5R (clear run to a 2.0R fallback)   26
+#
+# Measured, against a +9.0R / +0.176R-per-trade no-gate baseline:
+#   fixed >=1.0   keeps n=40  +17.0R  +0.425R/trade
+#   fixed >=1.5   keeps n=38  +19.0R  +0.500R/trade
+#   fixed >=2.0   keeps n=28  +17.0R  +0.607R/trade
+#   RELATIVE      keeps n=26  +19.0R  +0.731R/trade   <- best on both
+# Per-trade R is the metric that matters here, not just total: MAX_TOTAL_
+# POSITIONS=4 makes slots scarce, so a break-even trade is not free - it
+# occupies a slot a better one could have used. That is also why the
+# original 1.0 was wrong: it spared the 1.0-2.0R band precisely because
+# that band was break-even, which is exactly the trade worth skipping.
+#
+# Interacts correctly with STRUCTURE_TARGET_ATR_BUFFER by construction:
+# nearest_favorable_structure_r measures the RAW pool price (it passes no
+# atr, so no buffer), while compute_targets rests the target that buffer IN
+# FRONT of its pool. So for a POOL-sourced target the TP is slightly NEARER
+# than the pool it came from, the comparison comes out false, and the trade
+# passes - while a closer, non-qualifying pool still blocks it.
+#
+# Honest caveat, same as the floor above: n=51, removed cohort n=25 at 20.0%
+# win, a single ~2-week window in one market regime. Reject-only and risk-
+# reducing by construction, which is why it ships on this much evidence.
+NEAREST_SR_BLOCKS_TARGET_ENABLED = env_bool("NEAREST_SR_BLOCKS_TARGET_ENABLED", "False")
 # What happens when MAX_SL_ROI_PCT is breached AFTER capital has already
 # landed on the exchange - i.e. position_manager._finalize_retracement_
 # entry's settle path, where RETRACEMENT_SL_FLOOR_REVALIDATE_ENABLED has
@@ -3201,6 +3295,14 @@ REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
     "DEPTH_TREND_UNSTABLE",
     "CRASH_MODE",
     "CROSS_EXCHANGE_OI_DISAGREE",
+    # config.MIN_NEAREST_FAVORABLE_SR_R - the one plan-level (risk_manager.
+    # build_trade_plan) reject worth rows. main.py prefixes every plan
+    # reject with "PLAN_REJECTED:" and these carry no trailing detail, so
+    # this exact token is the whole reason string - listing it here journals
+    # this gate's blocked population WITHOUT pulling in ENTRY_TOO_EXTENDED
+    # (~99% of everything reaching that point for some symbols - see
+    # main.py's own note) or any other plan reject.
+    "PLAN_REJECTED:NEAREST_SR_TOO_CLOSE",
 ])
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)

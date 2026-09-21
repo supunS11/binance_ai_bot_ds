@@ -1,4 +1,5 @@
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import config
@@ -973,6 +974,20 @@ class BuildTradePlanTests(unittest.TestCase):
         # same pattern as every other flag pinned above.
         self.tp1_close_pct_patcher = patch.object(config, "TP1_CLOSE_PCT", 50)
         self.tp1_close_pct_patcher.start()
+        # config.MIN_NEAREST_FAVORABLE_SR_R - live .env has this at 1.0,
+        # and many fixtures here pass liquidity_pools with a level close to
+        # entry, which would start returning NEAREST_SR_TOO_CLOSE instead
+        # of a plan. Pinned to the coded default (0 = disabled) so that
+        # live value can't silently break this class, same pattern as every
+        # other flag above; NearestFavorableSrGateTests turns it on locally.
+        self.nearest_sr_patcher = patch.object(config, "MIN_NEAREST_FAVORABLE_SR_R", 0)
+        self.nearest_sr_patcher.start()
+        # config.NEAREST_SR_BLOCKS_TARGET_ENABLED - the target-relative half
+        # of the same gate, live .env True. Pinned off for the same reason:
+        # fixtures here routinely pass a pool nearer than their own target.
+        self.nearest_sr_rel_patcher = patch.object(
+            config, "NEAREST_SR_BLOCKS_TARGET_ENABLED", False)
+        self.nearest_sr_rel_patcher.start()
 
     def tearDown(self):
         self.extension_patcher.stop()
@@ -980,6 +995,8 @@ class BuildTradePlanTests(unittest.TestCase):
         self.static_roi_patcher.stop()
         self.tp2_enabled_patcher.stop()
         self.tp1_close_pct_patcher.stop()
+        self.nearest_sr_patcher.stop()
+        self.nearest_sr_rel_patcher.stop()
 
     def _signal(
         self, side="BUY", entry_price=100, structure_level=98, atr=1,
@@ -1588,6 +1605,312 @@ class MaxSlRoiTests(unittest.TestCase):
             )
 
         self.assertEqual(status, "OK")
+
+
+class NearestFavorableSrGateTests(unittest.TestCase):
+    """See config.MIN_NEAREST_FAVORABLE_SR_R - TP1/TP2 are drawn TO a level
+    that clears their own R floor, but nothing checked whether a CLOSER
+    real level sits in the way first and caps the move before the target is
+    reached. Real motivation (2026-09-20, operator): a live XRPUSDT SELL
+    that hit SL had a real level 0.0199R from entry - sitting on the entry
+    price - while aiming at a 2.0R FALLBACK target.
+
+    Fixture: BUY entry 100, structure_level 98, atr 0 and a zero stop
+    buffer, so sl_price=98 and risk_distance=2. A BUY_SIDE pool at 101 is
+    therefore 0.5R away, at 102 exactly 1.0R, at 103 1.5R."""
+
+    def _plan(self, pools, **overrides):
+        settings = {
+            # The absolute floor half. The target-relative half is pinned
+            # off here so these cases test the floor in isolation;
+            # TargetRelativeSrGateTests below covers the other one.
+            "MIN_NEAREST_FAVORABLE_SR_R": 1.0,
+            "NEAREST_SR_BLOCKS_TARGET_ENABLED": False,
+            "MAX_ENTRY_EXTENSION_R": 0,
+            "MAX_SL_ROI_PCT": 0,
+            "STRUCTURE_STOP_ATR_BUFFER": 0,
+            "SL_TP_USE_HTF_STRUCTURE": False,
+            "LIQUIDATION_HEATMAP_SL_TP_ENABLED": False,
+            "TP_STATIC_ROI_ENABLED": False,
+            "TP1_R_MULTIPLE": 1.0,
+            "TP2_R_MULTIPLE": 2.0,
+        }
+        settings.update(overrides)
+
+        with ExitStack() as stack:
+            for name, value in settings.items():
+                stack.enter_context(patch.object(config, name, value))
+            stack.enter_context(
+                patch.object(risk_manager, "calculate_position_size", return_value=10.0)
+            )
+            return risk_manager.build_trade_plan(
+                {
+                    "signal": "BUY", "symbol": "BTCUSDT", "entry_price": 100,
+                    "structure_level": 98, "atr": 0, "liquidity_pools": pools,
+                },
+                balance=1000,
+            )
+
+    def test_level_inside_the_threshold_is_rejected(self):
+        # 101 is 1 away on a risk_distance of 2 -> 0.5R, under the 1.0 bar.
+        plan, status = self._plan([{"type": "BUY_SIDE", "price": 101}])
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
+
+    def test_level_exactly_at_the_threshold_passes(self):
+        # 102 is 2 away on a risk_distance of 2 -> exactly 1.0R. The bound
+        # is inclusive - only strictly-closer levels are turned away.
+        plan, status = self._plan([{"type": "BUY_SIDE", "price": 102}])
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["nearest_favorable_sr_r"], 1.0)
+
+    def test_level_beyond_the_threshold_passes(self):
+        plan, status = self._plan([{"type": "BUY_SIDE", "price": 103}])
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["nearest_favorable_sr_r"], 1.5)
+
+    def test_no_pool_ahead_passes(self):
+        # THE case this gate must never get backwards: nearest_favorable_
+        # structure_r returns None when no real pool exists in the
+        # favorable direction - a CLEAR path, not a blocked one. Rejecting
+        # on None would turn away exactly the trades this exists to keep.
+        plan, status = self._plan([])
+
+        self.assertEqual(status, "OK")
+        self.assertIsNone(plan["nearest_favorable_sr_r"])
+
+    def test_only_adverse_side_pools_also_count_as_no_pool_ahead(self):
+        # A SELL_SIDE pool below a BUY's entry is not in the way of it.
+        plan, status = self._plan([{"type": "SELL_SIDE", "price": 97}])
+
+        self.assertEqual(status, "OK")
+        self.assertIsNone(plan["nearest_favorable_sr_r"])
+
+    def test_zero_threshold_disables_the_gate(self):
+        # The coded default - a level right on top of entry still passes.
+        plan, status = self._plan(
+            [{"type": "BUY_SIDE", "price": 100.05}], MIN_NEAREST_FAVORABLE_SR_R=0,
+        )
+
+        self.assertEqual(status, "OK")
+
+    def test_nearest_of_several_pools_is_what_binds(self):
+        plan, status = self._plan([
+            {"type": "BUY_SIDE", "price": 104},
+            {"type": "BUY_SIDE", "price": 101},   # nearest - 0.5R
+        ])
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
+
+    def test_sell_side_mirrors_the_buy_case(self):
+        settings = {
+            "MIN_NEAREST_FAVORABLE_SR_R": 1.0,
+            "NEAREST_SR_BLOCKS_TARGET_ENABLED": False,
+            "MAX_ENTRY_EXTENSION_R": 0,
+            "MAX_SL_ROI_PCT": 0, "STRUCTURE_STOP_ATR_BUFFER": 0,
+            "SL_TP_USE_HTF_STRUCTURE": False,
+            "LIQUIDATION_HEATMAP_SL_TP_ENABLED": False,
+            "TP_STATIC_ROI_ENABLED": False,
+            "TP1_R_MULTIPLE": 1.0, "TP2_R_MULTIPLE": 2.0,
+        }
+        with ExitStack() as stack:
+            for name, value in settings.items():
+                stack.enter_context(patch.object(config, name, value))
+            plan, status = risk_manager.build_trade_plan(
+                {
+                    # SELL entry 100, stop 102 -> risk_distance 2; a
+                    # SELL_SIDE pool at 99 is 0.5R below.
+                    "signal": "SELL", "symbol": "BTCUSDT", "entry_price": 100,
+                    "structure_level": 102, "atr": 0,
+                    "liquidity_pools": [{"type": "SELL_SIDE", "price": 99}],
+                },
+                balance=1000,
+            )
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
+
+    def test_pre_existing_rejects_still_win_when_both_apply(self):
+        # Deliberate ordering: this gate runs AFTER SL_ROI_TOO_HIGH, so a
+        # trade failing both keeps reporting the older reason and this one
+        # never masks it in the reject tallies.
+        plan, status = self._plan(
+            [{"type": "BUY_SIDE", "price": 101}],
+            MAX_SL_ROI_PCT=30, LEVERAGE=10, STRUCTURE_STOP_ATR_BUFFER=0,
+        )
+
+        self.assertIsNone(plan)
+        # 2% stop * 10x = 20% ROI, under the cap - so this one still passes
+        # the ROI check and falls through to the new gate.
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
+
+        plan, status = self._plan(
+            [{"type": "BUY_SIDE", "price": 101}],
+            MAX_SL_ROI_PCT=10, LEVERAGE=10,
+        )
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "SL_ROI_TOO_HIGH")
+
+
+class TargetRelativeSrGateTests(unittest.TestCase):
+    """See config.NEAREST_SR_BLOCKS_TARGET_ENABLED - the primary half of
+    the same gate. A FIXED threshold cannot express "a level sits between
+    entry and the target", because the realized target distance varies per
+    trade (median 2.10R over the sample, range 0.82R-6.35R): a level at
+    1.5R obstructs a 2.0R target but clears a 1.0R floor. This compares
+    against the trade's OWN tp1_price instead.
+
+    Fixture: BUY entry 100, structure_level 98, atr 0, zero stop buffer ->
+    sl 98, risk_distance 2. A BUY_SIDE pool at 101 is 0.5R out, 103 is
+    1.5R, 105 is 2.5R."""
+
+    def _plan(self, pools, atr=0, **overrides):
+        settings = {
+            "NEAREST_SR_BLOCKS_TARGET_ENABLED": True,
+            "MIN_NEAREST_FAVORABLE_SR_R": 0,     # floor off - relative only
+            "MAX_ENTRY_EXTENSION_R": 0,
+            "MAX_SL_ROI_PCT": 0,
+            "STRUCTURE_STOP_ATR_BUFFER": 0,
+            "STRUCTURE_TARGET_ATR_BUFFER": 0,
+            "SL_TP_USE_HTF_STRUCTURE": False,
+            "LIQUIDATION_HEATMAP_SL_TP_ENABLED": False,
+            "TP_STATIC_ROI_ENABLED": False,
+            "TP1_R_MULTIPLE": 2.0,
+            "TP1_MAX_R_MULTIPLE": 2.5,
+            "TP2_R_MULTIPLE": 3.0,
+            "TP2_MAX_R_MULTIPLE": 4.0,
+        }
+        settings.update(overrides)
+
+        with ExitStack() as stack:
+            for name, value in settings.items():
+                stack.enter_context(patch.object(config, name, value))
+            stack.enter_context(
+                patch.object(risk_manager, "calculate_position_size", return_value=10.0)
+            )
+            return risk_manager.build_trade_plan(
+                {
+                    "signal": "BUY", "symbol": "BTCUSDT", "entry_price": 100,
+                    "structure_level": 98, "atr": atr, "liquidity_pools": pools,
+                },
+                balance=1000,
+            )
+
+    def test_level_between_entry_and_target_is_rejected(self):
+        # 103 is 1.5R - too close to qualify as TP1 (needs 2.0R), so the
+        # target falls back to a flat 2.0R at 104 and this level sits
+        # squarely in the way. A fixed 1.0 floor would have allowed it, and
+        # 12 of 51 real trades were exactly this shape.
+        plan, status = self._plan([{"type": "BUY_SIDE", "price": 103}])
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
+
+    def test_the_target_pool_itself_does_not_block_its_own_target(self):
+        # 105 is 2.5R - inside [2.0, 2.5], so it BECOMES tp1. The nearest
+        # level and the target are then the same price, and a trade must
+        # never be rejected for the level it is aiming at.
+        plan, status = self._plan([{"type": "BUY_SIDE", "price": 105}])
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["tp1_price"], 105)
+        self.assertAlmostEqual(plan["nearest_favorable_sr_r"], 2.5)
+
+    def test_a_closer_non_qualifying_pool_still_blocks_a_pool_target(self):
+        # 105 becomes tp1 as above, but 101 (0.5R) sits in front of it.
+        plan, status = self._plan([
+            {"type": "BUY_SIDE", "price": 105},
+            {"type": "BUY_SIDE", "price": 101},
+        ])
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
+
+    def test_level_beyond_the_target_passes(self):
+        # 107 is 3.5R - past TP1_MAX_R_MULTIPLE, so tp1 falls back to 2.0R
+        # at 104 and the real level is well beyond it. Clear run.
+        plan, status = self._plan([{"type": "BUY_SIDE", "price": 107}])
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["tp1_price"], 104)
+
+    def test_no_pool_ahead_passes(self):
+        plan, status = self._plan([])
+
+        self.assertEqual(status, "OK")
+        self.assertIsNone(plan["nearest_favorable_sr_r"])
+
+    def test_flag_off_allows_a_blocking_level(self):
+        # With both halves off this is byte-identical to pre-gate behaviour.
+        plan, status = self._plan(
+            [{"type": "BUY_SIDE", "price": 103}],
+            NEAREST_SR_BLOCKS_TARGET_ENABLED=False,
+        )
+
+        self.assertEqual(status, "OK")
+
+    def test_target_buffer_does_not_make_a_pool_block_its_own_target(self):
+        # config.STRUCTURE_TARGET_ATR_BUFFER rests the target IN FRONT of
+        # its pool, so a POOL-sourced tp1 is strictly NEARER than the pool
+        # that produced it - the comparison must still come out false.
+        # Pool at 105 with atr 1 and a 0.5 buffer -> tp1 104.5 (2.25R) vs a
+        # nearest reading of 2.5R (raw, unbuffered).
+        plan, status = self._plan(
+            [{"type": "BUY_SIDE", "price": 105}], atr=1,
+            STRUCTURE_TARGET_ATR_BUFFER=0.5,
+        )
+
+        self.assertEqual(status, "OK")
+        self.assertAlmostEqual(plan["tp1_price"], 104.5)
+        self.assertAlmostEqual(plan["nearest_favorable_sr_r"], 2.5)
+
+    def test_absolute_floor_still_applies_independently(self):
+        # The two halves are independent: a level beyond the target passes
+        # the relative test but can still trip a floor set above it.
+        plan, status = self._plan(
+            [{"type": "BUY_SIDE", "price": 107}],   # 3.5R, past a 2.0R tp1
+            MIN_NEAREST_FAVORABLE_SR_R=4.0,
+        )
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
+
+    def test_sell_side_mirrors_the_buy_case(self):
+        settings = {
+            "NEAREST_SR_BLOCKS_TARGET_ENABLED": True,
+            "MIN_NEAREST_FAVORABLE_SR_R": 0, "MAX_ENTRY_EXTENSION_R": 0,
+            "MAX_SL_ROI_PCT": 0, "STRUCTURE_STOP_ATR_BUFFER": 0,
+            "STRUCTURE_TARGET_ATR_BUFFER": 0,
+            "SL_TP_USE_HTF_STRUCTURE": False,
+            "LIQUIDATION_HEATMAP_SL_TP_ENABLED": False,
+            "TP_STATIC_ROI_ENABLED": False,
+            "TP1_R_MULTIPLE": 2.0, "TP1_MAX_R_MULTIPLE": 2.5,
+            "TP2_R_MULTIPLE": 3.0, "TP2_MAX_R_MULTIPLE": 4.0,
+        }
+        with ExitStack() as stack:
+            for name, value in settings.items():
+                stack.enter_context(patch.object(config, name, value))
+            stack.enter_context(
+                patch.object(risk_manager, "calculate_position_size", return_value=10.0)
+            )
+            # SELL entry 100, stop 102 -> risk 2; a SELL_SIDE level at 97 is
+            # 1.5R below, in front of a 2.0R target at 96.
+            plan, status = risk_manager.build_trade_plan(
+                {
+                    "signal": "SELL", "symbol": "BTCUSDT", "entry_price": 100,
+                    "structure_level": 102, "atr": 0,
+                    "liquidity_pools": [{"type": "SELL_SIDE", "price": 97}],
+                },
+                balance=1000,
+            )
+
+        self.assertIsNone(plan)
+        self.assertEqual(status, "NEAREST_SR_TOO_CLOSE")
 
 
 class ComputeDcaPriceTests(unittest.TestCase):

@@ -534,6 +534,16 @@ def _evaluate_symbol(
 
     if status != "OK":
         _tally_reject(reject_counts, reject_symbols, symbol, f"PLAN_REJECTED:{status}")
+        # config.REJECT_JOURNAL_REASONS - plan-level rejects reached the
+        # heartbeat tally and bot.log but never signal_rejects.csv, so a
+        # gate that lives in build_trade_plan had no measurable blocked
+        # population the way every signal_engine gate does (added
+        # 2026-09-20 for MIN_NEAREST_FAVORABLE_SR_R). _journal_reject is
+        # allowlist-gated on the reason's leading token, and these reasons
+        # carry no trailing detail, so only the specific PLAN_REJECTED:*
+        # entries listed there produce rows - volume stays bounded and
+        # every other plan reject is unaffected.
+        _journal_reject(symbol, f"PLAN_REJECTED:{status}", result, ltf_candles)
         # trigger/entry_price/structure_level (all already computed by
         # signal_engine, zero extra cost) - real gap found live (2026-08-16):
         # ENTRY_TOO_EXTENDED was ~99% of everything reaching this point for

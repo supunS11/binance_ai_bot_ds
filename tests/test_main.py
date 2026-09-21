@@ -1257,7 +1257,8 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
     # invisible to it regardless of REJECT_JOURNAL_REASONS - which made the
     # most binding gate live the one whose counterfactual was discarded.
 
-    def _run_journalled(self, result, reason_allowlist, **flag_overrides):
+    def _run_journalled(self, result, reason_allowlist, plan_status="SL_TOO_TIGHT",
+                        **flag_overrides):
         main._reject_journal_seen.clear()
         self.addCleanup(main._reject_journal_seen.clear)
         feed = _FakeFeed()
@@ -1276,7 +1277,7 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
                 stack.enter_context(patch.object(config, name, value))
             stack.enter_context(patch.object(signal_engine, "evaluate", return_value=result))
             stack.enter_context(patch.object(risk_manager, "build_trade_plan",
-                                             return_value=(None, "SL_TOO_TIGHT")))
+                                             return_value=(None, plan_status)))
             append = stack.enter_context(
                 patch.object(signal_journal, "append_rejected_signal")
             )
@@ -1309,6 +1310,44 @@ class EvaluateSymbolStabilityTests(unittest.TestCase):
         )
         self.assertEqual(append.call_count, 1)
         self.assertEqual(append.call_args.args[1], "INSUFFICIENT_CONFIRMATION_DATA")
+
+    # config.MIN_NEAREST_FAVORABLE_SR_R - plan-level rejects (risk_manager.
+    # build_trade_plan) previously reached the heartbeat tally and bot.log
+    # but NEVER signal_rejects.csv, so a gate living in build_trade_plan had
+    # no measurable blocked population the way every signal_engine gate
+    # does. main.py now journals them, still allowlist-bounded.
+
+    def test_an_allowlisted_plan_reject_is_journaled(self):
+        append = self._run_journalled(
+            self._confluence_result(available=12, favourable=10),   # 0.83, passes
+            ["PLAN_REJECTED:NEAREST_SR_TOO_CLOSE"],
+            plan_status="NEAREST_SR_TOO_CLOSE",
+        )
+
+        self.assertEqual(append.call_count, 1)
+        self.assertEqual(append.call_args.args[1], "PLAN_REJECTED:NEAREST_SR_TOO_CLOSE")
+
+    def test_other_plan_rejects_stay_out_of_the_journal(self):
+        # ENTRY_TOO_EXTENDED alone can be ~99% of everything reaching that
+        # point for some symbols - allowlisting one plan reject must not
+        # pull in the rest.
+        append = self._run_journalled(
+            self._confluence_result(available=12, favourable=10),
+            ["PLAN_REJECTED:NEAREST_SR_TOO_CLOSE"],
+            plan_status="ENTRY_TOO_EXTENDED",
+        )
+
+        self.assertEqual(append.call_count, 0)
+
+    def test_a_plan_reject_is_not_journaled_when_the_journal_is_off(self):
+        append = self._run_journalled(
+            self._confluence_result(available=12, favourable=10),
+            ["PLAN_REJECTED:NEAREST_SR_TOO_CLOSE"],
+            plan_status="NEAREST_SR_TOO_CLOSE",
+            REJECT_JOURNAL_ENABLED=False,
+        )
+
+        self.assertEqual(append.call_count, 0)
 
     def test_a_post_signal_reason_outside_the_allowlist_is_not_journaled(self):
         append = self._run_journalled(
