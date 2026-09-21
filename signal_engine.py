@@ -20,6 +20,7 @@ import liquidation_heatmap
 import liquidity_sweep
 import market_structure
 import oi_divergence
+import signal_journal
 from logger import log_info
 
 
@@ -841,6 +842,31 @@ def evaluate(
 
     if not candidates:
         return _reject("NO_LIVE_STRUCTURE_BREAK")
+
+    # config.TRIGGER_EVIDENCE_JOURNAL_ENABLED (plan step 0.3) - record the
+    # raw order-flow measurements for EVERY candidate, here and nowhere
+    # later: past this point the only candidates still visible are the ones
+    # that survived the gates, which is precisely the population bias this
+    # dataset exists to measure around. Writes nothing while the flag is off,
+    # gates nothing when it is on, and cannot raise (see
+    # signal_journal.append_trigger_evidence).
+    signal_journal.append_trigger_evidence(
+        symbol, candidates, ltf_candles[-1].get("open_time"),
+        entry_price=latest_price,
+        atr=ltf_analysis.get("atr"),
+        htf_atr=htf_atr,
+        cvd_snapshot=cvd_snapshot,
+        depth_snapshot=depth_snapshot,
+        oi_snapshot=oi_snapshot,
+        liquidation_snapshot=liquidation_snapshot,
+        efficiency_ratio=ltf_analysis.get("efficiency_ratio"),
+        premium_discount_zone=market_structure.zone_for_price(zone, latest_price),
+        zone_direction=zone_direction,
+        ltf_ema_regime=ltf_ema_regime,
+        htf_ema_regime=htf_ema_regime,
+        quote_volume_usdt=quote_volume_usdt,
+        funding_rate=funding_rate,
+    )
 
     def _evaluate_direction(direction, trigger):
         """Everything below this point depends only on `direction`/`side`

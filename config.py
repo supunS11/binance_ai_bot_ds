@@ -3246,6 +3246,54 @@ SHADOW_ONLY_TRIGGERS = env_str_list("SHADOW_ONLY_TRIGGERS", [])
 #
 # Purely additive: no trade is gated, sized or ordered differently by this.
 REJECT_JOURNAL_ENABLED = env_bool("REJECT_JOURNAL_ENABLED", "False")
+# One row per CANDIDATE - every trigger that fired, before any gate has run -
+# carrying the RAW order-flow measurements taken at that instant. Plan step
+# 0.3 of the 2026-09-21 trigger-restructuring audit.
+#
+# WHY THIS EXISTS. A detector-level replay of 120 symbols x 90 days
+# (trigger_lab.py, n=3,580-17,682 per trigger) measured every kline-only
+# trigger against a seeded random-entry control pushed through the identical
+# pipeline. All six genuinely beat it:
+#
+#   RANDOM_CONTROL      -0.050R/trade   (n=8,782, drift-adjusted)
+#   OB_FVG_RETEST       +0.040R         (+0.090R over random)
+#   ORDER_BLOCK_RETEST  +0.038R         (+0.088R)
+#   EMA_PULLBACK        -0.015R         (+0.035R, weakest)
+#
+# So the triggers select. But the best sits at +0.040R gross while a round
+# trip costs ~0.05R at LEVERAGE=10 against a ~1.5% stop - every trigger is at
+# or below break-even net of fees. A ~50-feature scan (each gradient required
+# to hold independently on BOTH sides, so market drift cannot leak through)
+# found nothing that closes the gap: `reclaimed` is negative, `size_atr`
+# fails drift control, `choch_age` is inconsistent.
+#
+# The one source never tested is the order-flow layer, because it CANNOT be
+# backtested at any sample size: exchange.get_historical_agg_trades is
+# hard-capped at ~2 days (_AGG_TRADES_MAX_LOOKBACK_MS) so CVD is
+# unreconstructable beyond that, there is no historical liquidation endpoint
+# at all, and order-book depth has no history whatsoever. Forward collection
+# is the only route that exists.
+#
+# RAW VALUES ONLY - deliberately no derived booleans. The whole point is to
+# re-derive windows and thresholds offline afterwards, and a pre-baked
+# boolean forecloses exactly that. The existing liquidation_cluster/
+# liquidation_aligned journal fields are the cautionary case: they bake in
+# LIQUIDATION_CLUSTER_MIN_NOTIONAL_USDT and a 120s window, and are empty in
+# 158 of 159 journal rows as a result.
+#
+# OUTCOMES ARE NOT RECORDED HERE. They are derived later from klines by
+# trigger_lab.py, which has unlimited kline history and already implements
+# the forward walk; candle_open_time is the join key. The live bot records
+# only what it alone can see, which is what keeps this cheap.
+#
+# Volume is handled the same two ways REJECT_JOURNAL_ENABLED uses: one row
+# per (symbol, trigger, direction, ltf candle) rather than per tick at
+# SIGNAL_EVAL_INTERVAL_SECONDS=5. Roughly 30k rows/day (~6 MB/day).
+#
+# Purely additive: gates nothing, changes no returned field, no reject
+# reason, no tally and no order. Default OFF, same convention as every other
+# journal flag.
+TRIGGER_EVIDENCE_JOURNAL_ENABLED = env_bool("TRIGGER_EVIDENCE_JOURNAL_ENABLED", "False")
 # Which reject reasons are worth the rows. Matched on the reason's LEADING
 # TOKEN, because several carry detail after it (e.g. the reason string
 # "NOT_IN_DISCOUNT price_zone=PREMIUM"). Default is the set that answers

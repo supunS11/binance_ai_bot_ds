@@ -233,6 +233,167 @@ class RejectJournalTests(unittest.TestCase):
         self.assertEqual(row["premium_discount_zone"], "PREMIUM")
 
 
+class TriggerEvidenceJournalTests(unittest.TestCase):
+    """config.TRIGGER_EVIDENCE_JOURNAL_ENABLED (plan step 0.3) - raw
+    order-flow measurements for every candidate, written before any gate.
+    The order-flow layer cannot be backtested at any sample size, so forward
+    collection is the only route; these tests guard the two properties that
+    make the dataset usable (rawness and one-row-per-candle) plus the
+    hot-path safety contract."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmpdir.name) / "trigger_evidence.csv"
+        self.patchers = [
+            patch.object(signal_journal, "EVIDENCE_JOURNAL_PATH", self.path),
+            patch.object(config, "TRIGGER_EVIDENCE_JOURNAL_ENABLED", True),
+        ]
+
+        for p in self.patchers:
+            p.start()
+
+        signal_journal._evidence_seen.clear()
+
+    def tearDown(self):
+        for p in self.patchers:
+            p.stop()
+
+        signal_journal._evidence_seen.clear()
+        self.tmpdir.cleanup()
+
+    def _rows(self):
+        with open(self.path, newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def _append(self, candles_open_time=1788660000000, candidates=None, **kwargs):
+        base = dict(
+            entry_price=100.0, atr=1.5, htf_atr=3.0,
+            cvd_snapshot={"available": True, "cvd_score": 0.42, "sample_count": 88,
+                          "whale_notional": 25000.0, "whale_direction": "BUY"},
+            depth_snapshot={"available": True, "depth_imbalance": 0.18,
+                            "depth_consistency_pct": 0.72, "microprice_bps": 1.4,
+                            "age_seconds": 0.8},
+            oi_snapshot={"available": True, "oi_value": 1234.0,
+                         "oi_change_pct": 2.5, "sample_count": 12},
+            liquidation_snapshot={"available": True,
+                                  "long_liquidation_notional": 8000.0,
+                                  "short_liquidation_notional": 1000.0,
+                                  "net_liquidation_notional": 7000.0,
+                                  "sample_count": 4},
+            efficiency_ratio=0.41, premium_discount_zone="DISCOUNT",
+            zone_direction="BULLISH", ltf_ema_regime="BULLISH",
+            htf_ema_regime="BEARISH", quote_volume_usdt=9_000_000.0,
+            funding_rate=0.0001,
+        )
+        base.update(kwargs)
+
+        if candidates is None:
+            candidates = [{
+                "signal_trigger": "ORDER_BLOCK_RETEST", "direction": "BULLISH",
+                "structure_level": 98.5, "setup_age_candles": 7,
+            }]
+
+        signal_journal.append_trigger_evidence(
+            "BTCUSDT", candidates, candles_open_time, **base
+        )
+
+    def test_writes_raw_measurements_not_derived_booleans(self):
+        self._append()
+        row = self._rows()[0]
+
+        self.assertEqual(row["symbol"], "BTCUSDT")
+        self.assertEqual(row["signal_trigger"], "ORDER_BLOCK_RETEST")
+        self.assertEqual(row["direction"], "BULLISH")
+        self.assertEqual(row["candle_open_time"], "1788660000000")
+        self.assertEqual(row["structure_level"], "98.5")
+        self.assertEqual(row["setup_age_candles"], "7")
+        # raw values, so windows/thresholds stay re-derivable offline
+        self.assertEqual(row["cvd_score"], "0.42")
+        self.assertEqual(row["liq_net_notional"], "7000.0")
+        self.assertEqual(row["depth_consistency_pct"], "0.72")
+        self.assertEqual(row["oi_change_pct"], "2.5")
+        # the schema must not smuggle in a pre-thresholded boolean
+        for baked in ("liquidation_cluster", "liquidation_aligned", "cvd_confirmed"):
+            self.assertNotIn(baked, row)
+
+    def test_one_row_per_candidate(self):
+        self._append(candidates=[
+            {"signal_trigger": "ORDER_BLOCK_RETEST", "direction": "BULLISH",
+             "structure_level": 98.5, "setup_age_candles": 7},
+            {"signal_trigger": "LIQUIDITY_SWEEP", "direction": "BULLISH",
+             "structure_level": 97.0, "setup_age_candles": None},
+        ])
+        rows = self._rows()
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {r["signal_trigger"] for r in rows},
+            {"ORDER_BLOCK_RETEST", "LIQUIDITY_SWEEP"},
+        )
+        # None must serialise blank, never the string "None"
+        sweep = next(r for r in rows if r["signal_trigger"] == "LIQUIDITY_SWEEP")
+        self.assertEqual(sweep["setup_age_candles"], "")
+
+    def test_dedupes_to_one_row_per_candle(self):
+        """evaluate() runs every SIGNAL_EVAL_INTERVAL_SECONDS across the whole
+        watchlist - without this the file grows by a row per tick."""
+        for _ in range(5):
+            self._append()
+
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_a_new_candle_writes_again(self):
+        self._append(candles_open_time=1788660000000)
+        self._append(candles_open_time=1788663600000)
+
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_disabled_writes_nothing_at_all(self):
+        with patch.object(config, "TRIGGER_EVIDENCE_JOURNAL_ENABLED", False):
+            self._append()
+
+        self.assertFalse(self.path.exists())
+
+    def test_unavailable_liquidation_is_recorded_not_skipped(self):
+        """The FALSE case is itself the finding: the tracker reports
+        unavailable whenever no liquidation landed inside the window, and
+        that base rate is what a wider window has to beat."""
+        self._append(liquidation_snapshot={"available": False, "sample_count": 0})
+        row = self._rows()[0]
+
+        self.assertEqual(row["liq_available"], "0")
+        self.assertEqual(row["liq_net_notional"], "")
+
+    def test_missing_snapshots_do_not_raise(self):
+        self._append(cvd_snapshot=None, depth_snapshot=None,
+                     oi_snapshot=None, liquidation_snapshot=None)
+        row = self._rows()[0]
+
+        self.assertEqual(row["cvd_score"], "")
+        self.assertEqual(row["liq_available"], "0")
+
+    def test_disk_failure_never_raises_into_the_hot_path(self):
+        with patch.object(signal_journal, "_ensure_evidence_header",
+                          side_effect=OSError("disk full")):
+            self._append()  # must not raise
+
+    def test_header_drift_backs_up_and_restarts(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(self.path, "w", newline="") as handle:
+            csv.writer(handle).writerow(["stale", "header"])
+
+        self._append()
+        rows = self._rows()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "BTCUSDT")
+        self.assertTrue(any(
+            p.name.startswith("trigger_evidence.bak_")
+            for p in self.path.parent.iterdir()
+        ))
+
+
 class SignalJournalTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()

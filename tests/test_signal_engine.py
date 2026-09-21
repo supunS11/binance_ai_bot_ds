@@ -1,5 +1,8 @@
 import contextlib
+import csv
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import config
@@ -128,6 +131,7 @@ class SignalEngineTests(unittest.TestCase):
         htf_candles=None,
         htf_trend_ema_primary_enabled=False,
         both_opposed_reject_triggers=(),
+        trigger_evidence_journal_enabled=False,
         ltf_trend_ema=None,
         ltf_ema_fast=None,
         ltf_ema_slow=None,
@@ -321,6 +325,16 @@ class SignalEngineTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(config, "OI_RISING_REJECT_ENABLED", oi_rising_reject_enabled))
             stack.enter_context(patch.object(config, "HTF_TREND_EMA_PRIMARY_ENABLED", htf_trend_ema_primary_enabled))
+            # config.TRIGGER_EVIDENCE_JOURNAL_ENABLED - pinned OFF so no test
+            # in this module ever writes data/trigger_evidence.csv as a side
+            # effect, and so enabling it in a future .env cannot change any
+            # existing assertion here. Same insulation discipline as the two
+            # flags above; the journal's own behaviour is covered by
+            # tests/test_signal_journal.py instead.
+            stack.enter_context(patch.object(
+                config, "TRIGGER_EVIDENCE_JOURNAL_ENABLED",
+                trigger_evidence_journal_enabled,
+            ))
             # config.EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS - live .env now
             # lists ORDER_BLOCK_RETEST. Pinned inert here so no test is
             # coupled to that value, same insulation as the two above. This
@@ -5217,6 +5231,54 @@ class LiquidationPoolsFieldTests(unittest.TestCase):
         # True inside _run) returns [] by default, same as the real
         # production result whenever LIQUIDATION_HEATMAP_ENABLED=False.
         self.assertEqual(result["liquidation_pools"], [])
+
+
+class TriggerEvidenceJournalIsInertTests(unittest.TestCase):
+    """config.TRIGGER_EVIDENCE_JOURNAL_ENABLED (plan step 0.3) is pure
+    observation. It records raw order-flow measurements for every candidate
+    before any gate runs, and must never change what the bot trades.
+
+    This is the guard for that claim: the dict evaluate() returns has to be
+    identical with the flag on and off. Worth an explicit test because the
+    call sits in the hot path of live entry selection, where a silent
+    behavioural change would be both expensive and hard to attribute."""
+
+    def test_flag_does_not_change_the_returned_dict(self):
+        import signal_journal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trigger_evidence.csv"
+
+            with patch.object(signal_journal, "EVIDENCE_JOURNAL_PATH", path):
+                signal_journal._evidence_seen.clear()
+                off = SignalEngineTests()._run(trigger_evidence_journal_enabled=False)
+                self.assertFalse(
+                    path.exists(),
+                    "flag OFF must not create the file at all",
+                )
+
+                signal_journal._evidence_seen.clear()
+                on = SignalEngineTests()._run(trigger_evidence_journal_enabled=True)
+
+                self.assertEqual(off, on)
+                self.assertTrue(path.exists(), "flag ON must record the candidate")
+
+                with open(path, newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+
+                # One row per CANDIDATE, and the fixture legitimately raises
+                # more than one - that is the point of writing before the
+                # gates, where every trigger that fired is still visible
+                # rather than only whichever survived to win selection.
+                self.assertGreaterEqual(len(rows), 1)
+                self.assertTrue(all(r["symbol"] == "BTCUSDT" for r in rows))
+                self.assertTrue(all(r["signal_trigger"] for r in rows))
+
+                keys = [(r["signal_trigger"], r["direction"]) for r in rows]
+                self.assertEqual(len(keys), len(set(keys)),
+                                 "dedupe must give one row per trigger/direction")
+
+            signal_journal._evidence_seen.clear()
 
 
 if __name__ == "__main__":

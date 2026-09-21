@@ -19,6 +19,9 @@ logs/
 data/*.csv
 data/*.json
 data/backtest_cache/
+# trigger_lab.py replay output - tens of thousands of rows per trigger per
+# run, regenerable from cached klines at any time
+data/lab/
 
 # OS files
 .DS_Store

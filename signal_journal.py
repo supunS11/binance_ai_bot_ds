@@ -253,6 +253,167 @@ def append_rejected_signal(symbol, reason, result, candle_open_time=None):
         log_warning(f"could not append to signal_rejects.csv (continuing): {exc}")
 
 
+EVIDENCE_JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "trigger_evidence.csv"
+
+# config.TRIGGER_EVIDENCE_JOURNAL_ENABLED - one row per CANDIDATE, written
+# before any gate has run, carrying the RAW order-flow measurements taken at
+# that instant. A THIRD file, separate from both of the above for the same
+# reason they are separate from each other: different lifecycle, no trade_id,
+# no outcome row, and nothing in journal_analysis.load_trades should ever try
+# to read it.
+#
+# Deliberately raw - no derived booleans. See the config flag's own comment
+# for why (the liquidation_cluster/liquidation_aligned fields bake in a
+# threshold and a 120s window, and are empty in 158 of 159 journal rows as a
+# result). Outcomes are NOT here either: they are reconstructed from klines
+# afterwards by trigger_lab.py, joined on candle_open_time.
+EVIDENCE_FIELDNAMES = [
+    "timestamp", "candle_open_time", "symbol", "signal_trigger", "direction",
+    "entry_price", "atr", "htf_atr", "structure_level", "setup_age_candles",
+    # order flow (order_flow.CVDEngine.snapshot)
+    "cvd_score", "cvd_sample_count", "whale_notional", "whale_direction",
+    # order book (orderbook.DepthEngine.snapshot)
+    "depth_imbalance", "depth_consistency_pct", "microprice_bps", "depth_age_seconds",
+    # open interest (open_interest.OpenInterestEngine.snapshot)
+    "oi_value", "oi_change_pct", "oi_sample_count",
+    # forced liquidations (liquidation_tracker.LiquidationTracker.snapshot).
+    # liq_available is recorded explicitly because its FALSE case is itself
+    # the finding - the tracker reports unavailable whenever the symbol saw
+    # no liquidation inside LIQUIDATION_WINDOW_SECONDS, which is most of the
+    # time, and that base rate is what a wider window has to beat.
+    "liq_available", "liq_long_notional", "liq_short_notional",
+    "liq_net_notional", "liq_sample_count",
+    # context
+    "efficiency_ratio", "premium_discount_zone", "zone_direction",
+    "ltf_ema_regime", "htf_ema_regime", "quote_volume_usdt", "funding_rate",
+]
+
+# Last candle_open_time written per (symbol, trigger, direction). MODULE
+# level for the same reason main.py's _reject_journal_seen is: evaluate()
+# runs every SIGNAL_EVAL_INTERVAL_SECONDS (5s) across the whole watchlist, so
+# without this the file grows by a row per tick per symbol per trigger.
+# Bounded by watchlist x triggers x 2 (~400 x 9 x 2).
+_evidence_seen = {}
+
+
+def _ensure_evidence_header():
+    """Same backup-on-mismatch discipline as the two headers above."""
+    EVIDENCE_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not EVIDENCE_JOURNAL_PATH.exists():
+        with open(EVIDENCE_JOURNAL_PATH, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=EVIDENCE_FIELDNAMES).writeheader()
+        return
+
+    existing = _existing_header(EVIDENCE_JOURNAL_PATH)
+
+    if existing is not None and existing != EVIDENCE_FIELDNAMES:
+        backup_path = EVIDENCE_JOURNAL_PATH.with_name(
+            f"trigger_evidence.bak_{int(time.time())}.csv"
+        )
+        EVIDENCE_JOURNAL_PATH.rename(backup_path)
+        log_warning(
+            f"trigger_evidence.csv header didn't match the current schema - "
+            f"backed up to {backup_path.name} and started a fresh file"
+        )
+
+        with open(EVIDENCE_JOURNAL_PATH, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=EVIDENCE_FIELDNAMES).writeheader()
+
+
+def _blank(value):
+    return "" if value is None else value
+
+
+def append_trigger_evidence(
+    symbol, candidates, candle_open_time, entry_price=None, atr=None,
+    htf_atr=None, cvd_snapshot=None, depth_snapshot=None, oi_snapshot=None,
+    liquidation_snapshot=None, efficiency_ratio=None, premium_discount_zone=None,
+    zone_direction=None, ltf_ema_regime=None, htf_ema_regime=None,
+    quote_volume_usdt=None, funding_rate=None,
+):
+    """config.TRIGGER_EVIDENCE_JOURNAL_ENABLED - see that flag's comment.
+
+    Called from signal_engine.evaluate() with the full candidate list, BEFORE
+    any gate has run: anything later sees only gate survivors, which would
+    bias the dataset toward exactly the population this exists to question.
+
+    Never raises into the caller. This sits in the evaluation hot path, so a
+    disk problem must degrade to a warning and nothing else - same contract
+    as append_rejected_signal above."""
+    if not config.TRIGGER_EVIDENCE_JOURNAL_ENABLED or not candidates:
+        return
+
+    cvd = cvd_snapshot or {}
+    depth = depth_snapshot or {}
+    oi = oi_snapshot or {}
+    liq = liquidation_snapshot or {}
+
+    shared = {
+        "timestamp": int(time.time()),
+        "candle_open_time": _blank(candle_open_time),
+        "symbol": symbol,
+        "entry_price": _blank(entry_price),
+        "atr": _blank(atr),
+        "htf_atr": _blank(htf_atr),
+        "cvd_score": _blank(cvd.get("cvd_score")),
+        "cvd_sample_count": _blank(cvd.get("sample_count")),
+        "whale_notional": _blank(cvd.get("whale_notional")),
+        "whale_direction": _blank(cvd.get("whale_direction")),
+        "depth_imbalance": _blank(depth.get("depth_imbalance")),
+        "depth_consistency_pct": _blank(depth.get("depth_consistency_pct")),
+        "microprice_bps": _blank(depth.get("microprice_bps")),
+        "depth_age_seconds": _blank(depth.get("age_seconds")),
+        "oi_value": _blank(oi.get("oi_value")),
+        "oi_change_pct": _blank(oi.get("oi_change_pct")),
+        "oi_sample_count": _blank(oi.get("sample_count")),
+        "liq_available": int(bool(liq.get("available"))),
+        "liq_long_notional": _blank(liq.get("long_liquidation_notional")),
+        "liq_short_notional": _blank(liq.get("short_liquidation_notional")),
+        "liq_net_notional": _blank(liq.get("net_liquidation_notional")),
+        "liq_sample_count": _blank(liq.get("sample_count")),
+        "efficiency_ratio": _blank(efficiency_ratio),
+        "premium_discount_zone": _blank(premium_discount_zone),
+        "zone_direction": _blank(zone_direction),
+        "ltf_ema_regime": _blank(ltf_ema_regime),
+        "htf_ema_regime": _blank(htf_ema_regime),
+        "quote_volume_usdt": _blank(quote_volume_usdt),
+        "funding_rate": _blank(funding_rate),
+    }
+
+    rows = []
+
+    for candidate in candidates:
+        trigger = candidate.get("signal_trigger")
+        direction = candidate.get("direction")
+        key = (symbol, trigger, direction)
+
+        if _evidence_seen.get(key) == candle_open_time:
+            continue
+
+        _evidence_seen[key] = candle_open_time
+        row = dict(shared)
+        row["signal_trigger"] = _blank(trigger)
+        row["direction"] = _blank(direction)
+        row["structure_level"] = _blank(candidate.get("structure_level"))
+        row["setup_age_candles"] = _blank(candidate.get("setup_age_candles"))
+        rows.append(row)
+
+    if not rows:
+        return
+
+    try:
+        _ensure_evidence_header()
+
+        with open(EVIDENCE_JOURNAL_PATH, "a", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=EVIDENCE_FIELDNAMES)
+
+            for row in rows:
+                writer.writerow(row)
+    except OSError as exc:
+        log_warning(f"could not append to trigger_evidence.csv (continuing): {exc}")
+
+
 def _make_trade_id(symbol):
     return f"{symbol}_{int(time.time() * 1000)}"
 
