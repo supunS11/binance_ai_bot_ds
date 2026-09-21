@@ -49,6 +49,23 @@ class RejectJournalGatingTests(unittest.TestCase):
         # "NOT_IN_DISCOUNT price_zone=PREMIUM" must still match.
         self.assertEqual(self._run("NOT_IN_DISCOUNT price_zone=PREMIUM").call_count, 1)
 
+    def test_both_opposed_reason_is_journaled_when_allowlisted(self):
+        # config.EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS ships against the
+        # measured evidence, so its blocked population MUST be measurable
+        # forward - that is the only way the call gets revisited on real
+        # data rather than re-argued.
+        with patch.object(config, "REJECT_JOURNAL_ENABLED", True), \
+             patch.object(config, "REJECT_JOURNAL_REASONS", ["EMA_TREND_BOTH_OPPOSED"]), \
+             patch.object(signal_journal, "append_rejected_signal") as append:
+            main._journal_reject(
+                "BTCUSDT", "EMA_TREND_BOTH_OPPOSED",
+                {"signal": None, "reason": "EMA_TREND_BOTH_OPPOSED"},
+                self._candles(),
+            )
+
+        self.assertEqual(append.call_count, 1)
+        self.assertEqual(append.call_args.args[1], "EMA_TREND_BOTH_OPPOSED")
+
     def test_reason_outside_the_allowlist_is_not_journaled(self):
         self.assertEqual(self._run("MARKET_CHOPPY").call_count, 0)
 

@@ -127,6 +127,7 @@ class SignalEngineTests(unittest.TestCase):
         volume_profile_snapshot=None,
         htf_candles=None,
         htf_trend_ema_primary_enabled=False,
+        both_opposed_reject_triggers=(),
         ltf_trend_ema=None,
         ltf_ema_fast=None,
         ltf_ema_slow=None,
@@ -320,6 +321,18 @@ class SignalEngineTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(config, "OI_RISING_REJECT_ENABLED", oi_rising_reject_enabled))
             stack.enter_context(patch.object(config, "HTF_TREND_EMA_PRIMARY_ENABLED", htf_trend_ema_primary_enabled))
+            # config.EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS - live .env now
+            # lists ORDER_BLOCK_RETEST. Pinned inert here so no test is
+            # coupled to that value, same insulation as the two above. This
+            # is load-bearing for test_ema_trend_both_opposed_passes, an
+            # explicit REGRESSION GUARD that BOTH_OPPOSED stays reachable:
+            # it only survives today because _run()'s default trigger is
+            # STRUCTURE_BREAK, so a future .env adding that trigger would
+            # otherwise break it silently.
+            stack.enter_context(patch.object(
+                config, "EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS",
+                list(both_opposed_reject_triggers),
+            ))
             stack.enter_context(patch.object(market_structure, "structure_state", return_value=htf_structure))
             stack.enter_context(patch.object(market_structure, "premium_discount_zone", return_value=zone))
             stack.enter_context(patch.object(market_structure, "zone_direction", return_value=zone_direction))
@@ -1217,6 +1230,112 @@ class SignalEngineTests(unittest.TestCase):
             result = self._mixed_order_block_retest_sell()
 
         self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
+    # config.EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS (2026-09-21) - the 0-of-2
+    # bucket, rejected only for explicitly listed triggers. EXPLICIT OPERATOR
+    # DECISION taken against the measured evidence (the removed
+    # ORDER_BLOCK_RETEST cohort was n=21, 57.1% win, +15.0R, and its BUY half
+    # alone was +1.400R/trade) - see config.py for the full cost table. These
+    # tests pin the mechanics, not the merits.
+
+    def _both_opposed_order_block_retest_sell(self, **kwargs):
+        # Same fixture shape as _mixed_order_block_retest_sell above, but
+        # with BOTH regimes bullish against a SELL -> 0 of 2 agree. Built as
+        # a dict so individual EMA values can be overridden (the unreadable-
+        # regime case needs ltf_ema_slow=None).
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        args = {
+            "ltf_close": 108.0,
+            "cvd": {"available": True, "cvd_score": -0.5},
+            "depth": {"available": True, "depth_imbalance": -0.2},
+            "htf_structure": HTF_BEARISH, "ltf_analysis": analysis,
+            "sweep_direction": None, "ema_value": 115.0,
+            "order_block_retest_direction": "BEARISH", "order_block_retest_level": 88,
+            "ltf_ema_fast": 110.0, "ltf_ema_slow": 100.0,
+            "htf_ema_fast": 110.0, "htf_ema_slow": 100.0,
+        }
+        args.update(kwargs)
+        return self._run(**args)
+
+    def test_both_opposed_rejects_for_a_listed_trigger(self):
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._both_opposed_order_block_retest_sell(
+                both_opposed_reject_triggers=["ORDER_BLOCK_RETEST"],
+            )
+
+        self.assertEqual(result["reason"], "EMA_TREND_BOTH_OPPOSED")
+
+    def test_both_opposed_passes_for_an_unlisted_trigger(self):
+        # The scoping has to actually scope - listing a different trigger
+        # must leave ORDER_BLOCK_RETEST alone.
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._both_opposed_order_block_retest_sell(
+                both_opposed_reject_triggers=["EMA_PULLBACK"],
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
+        self.assertEqual(result["ema_trend_bucket"], "BOTH_OPPOSED")
+
+    def test_both_opposed_empty_list_is_the_inert_default(self):
+        # env_str_list's own gotcha (see the MIXED exemption tests above):
+        # the default must be [], so an unconfigured deploy behaves exactly
+        # as it did before this gate existed.
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._both_opposed_order_block_retest_sell(
+                both_opposed_reject_triggers=[],
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["ema_trend_bucket"], "BOTH_OPPOSED")
+
+    def test_mixed_still_reports_its_own_reason_for_a_listed_trigger(self):
+        # Ordering: the MIXED gate runs first, so a trigger listed in BOTH
+        # settings must still surface EMA_TREND_MIXED - the new reason must
+        # never mask the older one in the reject tallies.
+        with patch.object(config, "EMA_TREND_MIXED_REJECT_ENABLED", True), \
+             patch.object(config, "EMA_TREND_MIXED_EXEMPT_TRIGGERS", []), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._mixed_order_block_retest_sell(
+                both_opposed_reject_triggers=["ORDER_BLOCK_RETEST"],
+            )
+
+        self.assertEqual(result["reason"], "EMA_TREND_MIXED")
+
+    def test_both_agree_passes_for_a_listed_trigger(self):
+        # Only the 0-of-2 bucket is gated; 2-of-2 must stay reachable.
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_close=108.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH, ltf_analysis=analysis,
+                sweep_direction=None, ema_value=115.0,
+                order_block_retest_direction="BEARISH", order_block_retest_level=88,
+                # Both regimes bearish against a SELL -> 2 of 2 agree.
+                ltf_ema_fast=100.0, ltf_ema_slow=110.0,
+                htf_ema_fast=100.0, htf_ema_slow=110.0,
+                both_opposed_reject_triggers=["ORDER_BLOCK_RETEST"],
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["ema_trend_bucket"], "BOTH_AGREE")
+
+    def test_unreadable_regime_never_rejects_even_for_a_listed_trigger(self):
+        # Fails open, same as every other read in this block. A None bucket
+        # is the NORMAL state until the 200-candle trend buffer fills, so
+        # this must never block a trade.
+        with patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True):
+            result = self._both_opposed_order_block_retest_sell(
+                ltf_ema_slow=None,
+                both_opposed_reject_triggers=["ORDER_BLOCK_RETEST"],
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertIsNone(result["ema_trend_bucket"])
 
     def test_ema_trend_mixed_exempt_triggers_does_not_affect_other_triggers(self):
         # STRUCTURE_BREAK is still genuinely protective (-2.33/trade) -

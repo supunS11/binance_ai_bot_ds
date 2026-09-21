@@ -1261,6 +1261,31 @@ def evaluate(
         ):
             return _reject("EMA_TREND_MIXED")
 
+        # config.EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS - the 0-of-2 bucket,
+        # rejected only for triggers explicitly listed (default: none, so
+        # this is inert unless opted into). Reuses ema_trend_bucket computed
+        # just above - no extra indicator read.
+        #
+        # EXPLICIT OPERATOR DECISION taken against the measured evidence -
+        # see that setting's config.py comment for the full cost table. The
+        # short version: for ORDER_BLOCK_RETEST this removes n=21 at 57.1%
+        # win / +15.0R, and the BUY half of that (n=10, 80.0% win,
+        # +1.400R/trade) is the trigger's single most profitable cell. The
+        # regression guard the MIXED gate carries (test_ema_trend_both_
+        # opposed_passes) still holds by default precisely because this list
+        # ships empty.
+        #
+        # Checked AFTER the MIXED gate deliberately: the two reasons stay
+        # distinguishable in the reject tallies, and neither can mask the
+        # other. A None bucket (unreadable regime - the normal state until
+        # the 200-candle trend buffer fills) never rejects, same fail-open
+        # behaviour every other read in this block has.
+        if (
+            ema_trend_bucket == "BOTH_OPPOSED"
+            and trigger in config.EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS
+        ):
+            return _reject("EMA_TREND_BOTH_OPPOSED")
+
         # entry_range_position ("how bad is this entry for THIS side" - 0.0 =
         # the ideal end of the recent range, 1.0 = the worst end) and
         # price_zone (where price sits in the HTF range) are both COMPUTED

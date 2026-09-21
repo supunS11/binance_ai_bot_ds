@@ -894,6 +894,50 @@ EMA_TREND_MIXED_SELL_EXEMPT_ENABLED = env_bool("EMA_TREND_MIXED_SELL_EXEMPT_ENAB
 # env_str_list gotcha: an empty .env value falls back to this default,
 # never to a non-empty stale list.
 EMA_TREND_MIXED_EXEMPT_TRIGGERS = env_str_list("EMA_TREND_MIXED_EXEMPT_TRIGGERS", [])
+# Triggers for which the BOTH_OPPOSED bucket (0 of 2 EMA50/200 regimes agree
+# with the trade's direction) is ALSO rejected. Opt-IN by trigger - the
+# inverse polarity of EMA_TREND_MIXED_EXEMPT_TRIGGERS above, which is
+# opt-OUT. Default empty = completely inert.
+#
+# EXPLICIT OPERATOR DECISION (2026-09-21), taken AGAINST the measured
+# evidence and against an independent second-opinion review. Recorded
+# honestly so a future reader does not mistake this for an evidence-led
+# default. What it removes, whole journal, ORDER_BLOCK_RETEST, EMA regime
+# reconstructed from real klines (ema_trend_bucket itself only exists from
+# 2026-09-05, so the journal column alone cannot answer this):
+#
+#   ORDER_BLOCK_RETEST   n=31  54.8% win  +20.0R  (+0.645R/trade)  before
+#                        n=10  50.0% win   +5.0R  (+0.500R/trade)  after
+#
+# The removed cohort is n=21, 57.1% win, +15.0R - PROFITABLE in aggregate,
+# and it is 68% of the trigger's resolved flow. Split by side, essentially
+# all of the cost is the BUY half:
+#   removed BUY   n=10  80.0% win  +14.0R  (+1.400R/trade)
+#   removed SELL  n=11  36.4% win   +1.0R  (+0.091R/trade)
+#
+# The operator's motivating case is real but narrow: in the CURRENT regime
+# (LIVE only) the gate removes 9 trades at 22.2% win / -3.0R. Whole-journal
+# and current-regime views disagree because the exit config changed on
+# 2026-09-05 (target distance roughly doubled and all stop management went
+# inert) - see the era-boundary note on MIN_NEAREST_FAVORABLE_SR_R.
+#
+# Two live consequences:
+#   1. This COMPOUNDS with NEAREST_SR_BLOCKS_TARGET_ENABLED. Only 7 trades
+#      are caught by both, so the cuts add: together they remove ~57% of
+#      current-regime LIVE entries (20 of 35).
+#   2. The surviving ORDER_BLOCK_RETEST population becomes 8 MIXED + 2
+#      BOTH_AGREE. MIXED is the one bucket every OTHER trigger rejects (see
+#      EMA_TREND_MIXED_REJECT_ENABLED); this trigger only keeps it via its
+#      exemption above. So the trigger ends up trading almost exclusively
+#      what the system rejects everywhere else.
+#
+# Scoping to one SIDE is NOT supported by this list - entries are matched
+# against the trigger name only. Restricting to SELL (which the evidence
+# favours, since it would keep the +14.0R BUY half) needs a follow-up
+# side-aware flag, not a value like "ORDER_BLOCK_RETEST_SELL" here.
+EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS = env_str_list(
+    "EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS", []
+)
 # Deliberately NOT read from trigger_gate_profiles(), same reasoning as
 # LTF_TREND_FILTER_ENABLED above: the validation applied this to every
 # trigger with no exemption. Here an exemption would point the WRONG way -
@@ -3303,6 +3347,11 @@ REJECT_JOURNAL_REASONS = env_str_list("REJECT_JOURNAL_REASONS", [
     # (~99% of everything reaching that point for some symbols - see
     # main.py's own note) or any other plan reject.
     "PLAN_REJECTED:NEAREST_SR_TOO_CLOSE",
+    # config.EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS - journaled from the
+    # start specifically BECAUSE this gate ships against the evidence: the
+    # blocked population needs to be measurable so the call can be revisited
+    # on real forward data rather than argued about again.
+    "EMA_TREND_BOTH_OPPOSED",
 ])
 POSITION_POLL_INTERVAL_SECONDS = env_int("POSITION_POLL_INTERVAL_SECONDS", 10)
 SIGNAL_EVAL_INTERVAL_SECONDS = env_int("SIGNAL_EVAL_INTERVAL_SECONDS", 5)
