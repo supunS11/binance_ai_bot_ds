@@ -1335,6 +1335,50 @@ EFFICIENCY_RATIO_CHOP_THRESHOLD = env_float("EFFICIENCY_RATIO_CHOP_THRESHOLD", 0
 # rejects) so ships live immediately, same precedent as
 # HTF_TREND_FRESHNESS_ENABLED/MIN_STOP_DISTANCE_ATR_MULTIPLE.
 EFFICIENCY_RATIO_GATE_ENABLED = env_bool("EFFICIENCY_RATIO_GATE_ENABLED", "True")
+# Per-trigger scoping for the MARKET_CHOPPY gate above, read by
+# trigger_gate_profiles() rather than checked at the gate site (the profile
+# is this project's single source - see its docstring). Same shape and same
+# env_str_list empty-default gotcha as EMA_TREND_MIXED_EXEMPT_TRIGGERS /
+# NOT_IN_PREMIUM_EXEMPT_TRIGGERS: default [] so an unconfigured deploy keeps
+# the gate universal, never a stale non-empty list.
+#
+# 2026-09-22 evidence. Replay of data/signal_rejects.csv (n=55,753 single-
+# trigger rows; 1h bars, 48-bar forward walk, first touch wins, per-row
+# maker+taker fees) scored as LIFT AGAINST EACH SIDE'S OWN POOLED BASELINE.
+# That control is not optional here: over the measured window all blocked
+# BUYs averaged +0.129R and all blocked SELLs -0.176R, a 0.305R directional
+# spread, so a gate read against zero measures the market and not the gate
+# (same trap project_trend_reads_no_edge already documents at n=523k).
+#
+# Restricted to the CURRENT gate-config era only - 2026-09-15 onward,
+# bounded by the last exemption change on 09-14. Measuring the full journal
+# instead "rediscovers" the EMA_TREND_MIXED/NOT_IN_PREMIUM exemptions that
+# shipped 09-13/14 and reports them as fresh upside; the journal records
+# what each gate did under whatever config was live when the row was
+# written, not under today's.
+#
+# MARKET_CHOPPY overall: n=9,423, BUY lift +0.048, SELL lift +0.044 -
+# costing on both sides independently, not a drift artifact. Per trigger,
+# drift-adjusted (BUY and SELL scored separately, then averaged):
+#   STRUCTURE_BREAK     n=1,898  +0.092   BUY +0.032  SELL +0.152
+#   ORDER_BLOCK_RETEST  n=2,690  +0.051   BUY +0.104  SELL -0.002
+#   OB_FVG_RETEST       n=2,098  +0.047   BUY +0.066  SELL +0.027
+#   LIQUIDITY_SWEEP     n=  526  +0.050   BUY +0.009  SELL +0.090
+#   EMA_PULLBACK        n=2,118  +0.008   BUY +0.009  SELL +0.006
+#   CHOCH_RETEST        n=   93  -0.107   BUY -0.465  SELL +0.252
+# The three listed below are the ones with four-figure samples AND a
+# consistent sign. LIQUIDITY_SWEEP is left gated on n=87 SELL alone;
+# EMA_PULLBACK is a genuine null, so exempting it would buy throughput at
+# no measured expectancy gain and is not worth the extra moving part;
+# CHOCH_RETEST's cells (52/41) are far too thin to read either way.
+#
+# Scoping rather than flipping EFFICIENCY_RATIO_GATE_ENABLED off is the
+# deliberately conservative form: the gate keeps protecting every trigger
+# whose blocked population has not been shown to beat its own baseline.
+# Note this can only ever let MORE trades through - the opposite risk
+# direction from most flags in this file, and the reason the revert
+# criterion is written into the plan rather than left to judgement.
+MARKET_CHOPPY_EXEMPT_TRIGGERS = env_str_list("MARKET_CHOPPY_EXEMPT_TRIGGERS", [])
 # Real evidence (2026-08-25 signal-engine audit + direct re-check): the old
 # default (0.0005) was measured against journaled outcomes and found to
 # almost never vary - only 3 of 118 resolved trades ever read "unfavorable"
@@ -1842,6 +1886,16 @@ def trigger_gate_profiles():
             gates.discard("HTF_TREND_STALE")
 
         if MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED and trigger in _REVERSAL_TRIGGERS:
+            gates.discard("MARKET_CHOPPY")
+
+        # MARKET_CHOPPY_EXEMPT_TRIGGERS - the measured per-trigger list, on
+        # top of the structural reversal-trigger skip above. Deliberately a
+        # separate discard rather than an extension of _REVERSAL_TRIGGERS:
+        # that set encodes a structural claim (a reversal thesis is not
+        # invalidated by chop), this one encodes an empirical one (these
+        # triggers' blocked populations beat their own side's baseline), and
+        # collapsing the two would make either impossible to revise alone.
+        if trigger in MARKET_CHOPPY_EXEMPT_TRIGGERS:
             gates.discard("MARKET_CHOPPY")
 
         if OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED and trigger != "STRUCTURE_BREAK":

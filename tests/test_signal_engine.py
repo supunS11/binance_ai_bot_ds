@@ -131,6 +131,7 @@ class SignalEngineTests(unittest.TestCase):
         htf_candles=None,
         htf_trend_ema_primary_enabled=False,
         both_opposed_reject_triggers=(),
+        market_choppy_exempt_triggers=(),
         trigger_evidence_journal_enabled=False,
         ltf_trend_ema=None,
         ltf_ema_fast=None,
@@ -346,6 +347,19 @@ class SignalEngineTests(unittest.TestCase):
             stack.enter_context(patch.object(
                 config, "EMA_TREND_BOTH_OPPOSED_REJECT_TRIGGERS",
                 list(both_opposed_reject_triggers),
+            ))
+            # config.MARKET_CHOPPY_EXEMPT_TRIGGERS - live .env lists
+            # STRUCTURE_BREAK, ORDER_BLOCK_RETEST and OB_FVG_RETEST.
+            # STRUCTURE_BREAK is _run()'s own default trigger, so without
+            # this pin every MarketChoppyGateTests case would stop seeing
+            # the gate the moment that line is deployed. A kwarg rather
+            # than a hardcoded [] for the same reason both_opposed_reject_
+            # triggers is one: this stack enters AFTER any call-site
+            # patch.object, so a flat pin here would silently override a
+            # test trying to set the list itself.
+            stack.enter_context(patch.object(
+                config, "MARKET_CHOPPY_EXEMPT_TRIGGERS",
+                list(market_choppy_exempt_triggers),
             ))
             stack.enter_context(patch.object(market_structure, "structure_state", return_value=htf_structure))
             stack.enter_context(patch.object(market_structure, "premium_discount_zone", return_value=zone))
@@ -1532,6 +1546,40 @@ class SignalEngineTests(unittest.TestCase):
         # Still journaled/available as an informational reading even
         # though the gate itself is off.
         self.assertFalse(result["efficiency_favorable"])
+
+    # config.MARKET_CHOPPY_EXEMPT_TRIGGERS (2026-09-22) - the per-trigger
+    # scoping, exercised end-to-end through the real gate cascade rather
+    # than only against trigger_gate_profiles() (covered separately in
+    # tests/test_trigger_gate_profiles.py). _run()'s default trigger is
+    # STRUCTURE_BREAK, which is on the deployed list.
+    def test_market_choppy_exempt_trigger_lets_a_choppy_structure_break_through(self):
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+            result = self._run(
+                ltf_analysis=analysis,
+                market_choppy_exempt_triggers=["STRUCTURE_BREAK"],
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+        # The gate is scoped off, not the reading - efficiency_ratio stays
+        # journaled so the forward dataset keeps building either way.
+        self.assertFalse(result["efficiency_favorable"])
+
+    def test_market_choppy_exemption_does_not_leak_to_an_unlisted_trigger(self):
+        # EMA_PULLBACK measured as a genuine null (+0.008) and is
+        # deliberately left gated - exempting STRUCTURE_BREAK must not
+        # release it by association.
+        analysis = dict(LTF_BULLISH_BREAK, efficiency_ratio=0.1)
+
+        with patch.object(config, "EFFICIENCY_RATIO_CHOP_THRESHOLD", 0.3):
+            result = self._run(
+                ltf_analysis=analysis,
+                market_choppy_exempt_triggers=["EMA_PULLBACK"],
+            )
+
+        self.assertEqual(result["reason"], "MARKET_CHOPPY")
 
     def test_no_efficiency_data_yet_does_not_block_the_signal(self):
         # LTF_BULLISH_BREAK carries no efficiency_ratio key - absence

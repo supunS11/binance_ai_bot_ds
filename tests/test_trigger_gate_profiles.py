@@ -39,6 +39,11 @@ class TriggerGateProfilesTests(unittest.TestCase):
             "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED": True,
             "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED": True,
             "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED": True,
+            # Pinned empty for the same reason as the booleans above, and
+            # for a concrete one: the live .env sets this to a real list,
+            # which would otherwise break test_structure_break_gets_every_
+            # variable_gate the moment it is deployed.
+            "MARKET_CHOPPY_EXEMPT_TRIGGERS": [],
         }
         for name, value in defaults.items():
             patcher = patch.object(config, name, value)
@@ -99,7 +104,8 @@ class TriggerGateProfilesTests(unittest.TestCase):
              patch.object(config, "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False), \
              patch.object(config, "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", False), \
              patch.object(config, "CVD_NOT_CONFIRMED_SKIP_FOR_CVD_DIVERGENCE_ENABLED", False), \
-             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False):
+             patch.object(config, "DEPTH_TREND_MIN_CONSISTENCY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False), \
+             patch.object(config, "MARKET_CHOPPY_EXEMPT_TRIGGERS", []):
             profiles = config.trigger_gate_profiles()
 
         for trigger in ALL_TRIGGERS:
@@ -124,6 +130,65 @@ class TriggerGateProfilesTests(unittest.TestCase):
                 self.assertNotIn("DEPTH_TREND_MIN_CONSISTENCY", profiles[trigger])
             else:
                 self.assertIn("DEPTH_TREND_MIN_CONSISTENCY", profiles[trigger])
+
+    # config.MARKET_CHOPPY_EXEMPT_TRIGGERS (2026-09-22) - the measured
+    # per-trigger scoping of MARKET_CHOPPY, on top of the structural
+    # reversal-trigger skip. See that setting's config.py comment for the
+    # full evidence table and why only three triggers are listed.
+    def test_market_choppy_exempt_triggers_removes_the_gate_for_listed_only(self):
+        listed = ["STRUCTURE_BREAK", "ORDER_BLOCK_RETEST", "OB_FVG_RETEST"]
+
+        with patch.object(config, "MARKET_CHOPPY_EXEMPT_TRIGGERS", listed):
+            profiles = config.trigger_gate_profiles()
+
+        for trigger in listed:
+            self.assertNotIn("MARKET_CHOPPY", profiles[trigger])
+
+        # EMA_PULLBACK/LIQUIDITY_SWEEP/CHOCH_RETEST were measured and
+        # deliberately left gated - a null, an n=87 SELL cell, and an n=93
+        # cell respectively. They must not pick the exemption up by
+        # association with the three above.
+        for trigger in ("EMA_PULLBACK", "LIQUIDITY_SWEEP", "CHOCH_RETEST"):
+            self.assertIn("MARKET_CHOPPY", profiles[trigger])
+
+    def test_market_choppy_exempt_triggers_empty_by_default_still_gates(self):
+        # env_str_list's own gotcha (CONFLUENCE_SHADOW_PROBE_EXCLUDE_
+        # TRIGGERS hit this once, EMA_TREND_MIXED_EXEMPT_TRIGGERS guards it
+        # too) - the default must be [], never a stale non-empty list, so an
+        # unconfigured deploy keeps the gate universal.
+        with patch.object(config, "MARKET_CHOPPY_EXEMPT_TRIGGERS", []):
+            profiles = config.trigger_gate_profiles()
+
+        for trigger in ALL_TRIGGERS:
+            if trigger in ("CVD_DIVERGENCE", "OI_DIVERGENCE", "LIQUIDATION_SWEEP_CONFIRMED"):
+                continue            # structural skip, tested separately
+            self.assertIn("MARKET_CHOPPY", profiles[trigger])
+
+    def test_market_choppy_exempt_triggers_disturbs_no_other_gate(self):
+        # The discard must be surgical: exempting a trigger from
+        # MARKET_CHOPPY must leave the rest of its profile byte-identical,
+        # or this flag becomes a way to silently drop unrelated protection.
+        before = config.trigger_gate_profiles()
+
+        with patch.object(config, "MARKET_CHOPPY_EXEMPT_TRIGGERS", ["STRUCTURE_BREAK"]):
+            after = config.trigger_gate_profiles()
+
+        self.assertEqual(after["STRUCTURE_BREAK"], before["STRUCTURE_BREAK"] - {"MARKET_CHOPPY"})
+
+        for trigger in ALL_TRIGGERS:
+            if trigger != "STRUCTURE_BREAK":
+                self.assertEqual(after[trigger], before[trigger])
+
+    def test_market_choppy_exempt_triggers_is_additive_to_the_reversal_skip(self):
+        # The two discards are deliberately separate - one structural, one
+        # empirical. Turning the structural flag off must not resurrect
+        # MARKET_CHOPPY for a trigger the empirical list also exempts.
+        with patch.object(config, "MARKET_CHOPPY_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED", False), \
+             patch.object(config, "MARKET_CHOPPY_EXEMPT_TRIGGERS", ["CVD_DIVERGENCE"]):
+            profiles = config.trigger_gate_profiles()
+
+        self.assertNotIn("MARKET_CHOPPY", profiles["CVD_DIVERGENCE"])
+        self.assertIn("MARKET_CHOPPY", profiles["OI_DIVERGENCE"])
 
     def test_recomputes_live_rather_than_caching_at_import_time(self):
         # Real bug caught 2026-08-17: an earlier version computed this
