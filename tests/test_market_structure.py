@@ -4,6 +4,43 @@ from unittest.mock import patch
 import config
 import market_structure as ms
 
+# config.ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT - pinned inert (0.0) for
+# the whole module. Every FindOrderBlockRetest* assertion below predates
+# this flag and was written against the old "close anywhere inside the
+# block" condition; the live .env sets 0.5, which would otherwise silently
+# break them the moment it is deployed. Same insulation pattern
+# tests/test_risk_manager.py already uses for SL_TP_USE_HTF_STRUCTURE, and
+# the same "new flag, old tests never pin it, live .env eventually sets it"
+# cycle that has caught this suite out before. The dedicated threshold
+# tests (OrderBlockRetestCloseThroughTests) set it locally instead.
+_ob_close_through_patcher = patch.object(
+    config, "ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT", 0.0
+)
+# config.EMA_PULLBACK_REQUIRE_TREND_ENABLED (live .env: True) and
+# config.LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED (live .env: True) -
+# pinned inert for the same reason. Every DetectEmaPullbackTests fixture
+# predates the trend condition and builds candles with no EMA history to
+# slope, and every FindLiquidityPoolsTests fixture was written against
+# chained clustering. Their own behaviour is covered by
+# EmaPullbackTrendTests / AnchoredPoolClusteringTests, which enable the
+# flags locally.
+_ema_trend_patcher = patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", False)
+_anchored_pools_patcher = patch.object(
+    config, "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", False
+)
+
+
+def setUpModule():
+    _ob_close_through_patcher.start()
+    _ema_trend_patcher.start()
+    _anchored_pools_patcher.start()
+
+
+def tearDownModule():
+    _ob_close_through_patcher.stop()
+    _ema_trend_patcher.stop()
+    _anchored_pools_patcher.stop()
+
 
 def _candle(open_time, high, low, close=None, open_=None, closed=True):
     close = high if close is None else close
@@ -737,6 +774,314 @@ class FindOrderBlockRetestRequireClosedCandleTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
+
+
+class OrderBlockRetestCloseThroughTests(unittest.TestCase):
+    """config.ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT (2026-09-22) - the
+    rejection-strength requirement ported from find_fvg_retest, which has
+    carried the identical parameter since 2026-08-22.
+
+    Block used throughout: high=5, low=4, so range=1 and the midpoint is
+    4.5. For a BULLISH (demand) block the far edge is `low` and the near
+    edge is `high`, so required_close = 4 + 1*pct.
+    """
+
+    BLOCK = {"direction": "BULLISH", "high": 5, "low": 4, "index": 0, "open_time": 0}
+
+    def _candles(self, retest_close):
+        return [
+            _candle(0, high=5, low=4, open_=5, close=4),     # the origin block
+            _candle(1, high=9, low=8),                        # away from the block
+            _candle(2, high=9, low=8),
+            _candle(3, high=5.5, low=4.05, open_=5.3, close=retest_close),
+        ]
+
+    def _retest(self, retest_close, pct):
+        return ms.find_order_block_retest(
+            self._candles(retest_close), blocks=[dict(self.BLOCK)],
+            min_close_through_pct=pct,
+        )
+
+    def test_zero_is_byte_identical_to_the_pre_fix_condition(self):
+        # The old condition was exactly `close > low`. At pct=0.0 a close a
+        # hair above the far edge must still detect - this is the proof the
+        # CODE DEFAULT is inert, so a deploy without the .env line cannot
+        # change live behaviour.
+        self.assertIsNotNone(self._retest(4.01, 0.0))
+        # ...and a close at or below the far edge must still not detect.
+        self.assertIsNone(self._retest(4.0, 0.0))
+        self.assertIsNone(self._retest(3.99, 0.0))
+
+    def test_the_code_default_is_zero_so_a_code_only_deploy_is_a_no_op(self):
+        # This project deploys code and .env separately onto a live account,
+        # so the CODE default must stay 0.0 - reading config.<flag> here
+        # would just read whatever the live .env holds (0.5), which proves
+        # nothing. Asserted against the source literal rather than by
+        # reloading config: importlib.reload rebinds module attributes and
+        # would silently break this module's own setUpModule patcher (and
+        # any other active patch.object) for every test that follows.
+        import pathlib
+        import re
+
+        source = pathlib.Path(config.__file__).read_text(encoding="utf-8", errors="replace")
+        match = re.search(
+            r'ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT\s*=\s*env_float\(\s*'
+            r'"ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT"\s*,\s*([0-9.]+)\s*,?\s*\)',
+            source,
+        )
+
+        self.assertIsNotNone(
+            match,
+            "could not find the ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT env_float "
+            "declaration in config.py - if it was renamed or restructured, update "
+            "this guard rather than deleting it",
+        )
+        self.assertEqual(
+            float(match.group(1)), 0.0,
+            "the CODE default for ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT must stay "
+            "0.0 so deploying code without the matching .env line cannot change "
+            "behaviour on a live account",
+        )
+
+    def test_half_rejects_a_close_below_the_block_midpoint(self):
+        # 4.3 sits deep inside the block - the "price is sitting in the
+        # zone" case the audit identified. Detected at 0.0, rejected at 0.5.
+        self.assertIsNotNone(self._retest(4.3, 0.0))
+        self.assertIsNone(self._retest(4.3, 0.5))
+
+    def test_half_accepts_a_close_above_the_block_midpoint(self):
+        self.assertIsNotNone(self._retest(4.8, 0.5))
+
+    def test_half_is_exclusive_at_the_midpoint_itself(self):
+        # required_close = 4 + 1*0.5 = 4.5, and the test is strictly `>`.
+        self.assertIsNone(self._retest(4.5, 0.5))
+        self.assertIsNotNone(self._retest(4.51, 0.5))
+
+    def test_one_requires_a_full_reclaim_past_the_near_edge(self):
+        self.assertIsNone(self._retest(4.9, 1.0))
+        self.assertIsNotNone(self._retest(5.1, 1.0))
+
+    def test_bearish_blocks_mirror_the_geometry(self):
+        # BEARISH supply block high=10, low=9, midpoint 9.5. Far edge is
+        # `high`, near edge `low`, so required_close = 10 - 1*pct and the
+        # test is strictly `<`.
+        block = {"direction": "BEARISH", "high": 10, "low": 9, "index": 0, "open_time": 0}
+        candles = [
+            _candle(0, high=10, low=9, open_=9, close=10),
+            _candle(1, high=8, low=6),
+            _candle(2, high=7, low=5),
+            _candle(3, high=10.3, low=9.5, open_=9.8, close=9.7),
+        ]
+
+        self.assertIsNotNone(
+            ms.find_order_block_retest(candles, blocks=[dict(block)], min_close_through_pct=0.0)
+        )
+        # 9.7 is above the 9.5 midpoint - a weak rejection for a SHORT.
+        self.assertIsNone(
+            ms.find_order_block_retest(candles, blocks=[dict(block)], min_close_through_pct=0.5)
+        )
+
+    def test_zero_range_block_behaves_identically_at_every_pct(self):
+        # A doji origin candle gives high == low, so there is no range to
+        # measure a reclaim against. max(range, 0) makes required_close
+        # collapse to the far edge at ANY pct rather than the block being
+        # silently dropped - the behaviour it had before this parameter
+        # existed.
+        block = {"direction": "BULLISH", "high": 4, "low": 4, "index": 0, "open_time": 0}
+        candles = [
+            _candle(0, high=4, low=4, open_=4, close=4),
+            _candle(1, high=9, low=8),
+            _candle(2, high=9, low=8),
+            _candle(3, high=5.5, low=3.9, open_=5.3, close=4.01),
+        ]
+
+        for pct in (0.0, 0.5, 1.0):
+            with self.subTest(pct=pct):
+                self.assertIsNotNone(
+                    ms.find_order_block_retest(
+                        candles, blocks=[dict(block)], min_close_through_pct=pct
+                    )
+                )
+
+    def test_out_of_range_values_are_clamped(self):
+        # An .env typo must not be able to invert the condition: a negative
+        # pct would otherwise push required_close BELOW the far edge and
+        # accept closes the unfixed code rejected.
+        self.assertIsNone(self._retest(3.99, -1.0))
+        self.assertIsNotNone(self._retest(4.01, -1.0))     # clamps to 0.0
+        self.assertIsNone(self._retest(4.9, 5.0))          # clamps to 1.0
+        self.assertIsNotNone(self._retest(5.1, 5.0))
+
+    def test_reads_the_config_value_when_not_passed(self):
+        with patch.object(config, "ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT", 0.5):
+            self.assertIsNone(
+                ms.find_order_block_retest(self._candles(4.3), blocks=[dict(self.BLOCK)])
+            )
+
+        with patch.object(config, "ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT", 0.0):
+            self.assertIsNotNone(
+                ms.find_order_block_retest(self._candles(4.3), blocks=[dict(self.BLOCK)])
+            )
+
+
+class EmaPullbackTrendTests(unittest.TestCase):
+    """config.EMA_PULLBACK_REQUIRE_TREND_ENABLED (2026-09-22) - supplies the
+    "within an established trend" half of detect_ema_pullback's own
+    description, which the detector never implemented. Measured live, 30.6%
+    of its detections fired against the slope of the very EMA they were
+    pulling back to."""
+
+    def _candles(self, closes, wick_close):
+        """`closes` builds the EMA history; the final candle is the retest,
+        wicking through `level` and closing back across it."""
+        out = [_candle(i, c + 1, c - 1, close=c, open_=c) for i, c in enumerate(closes)]
+        out.append(_candle(len(closes), high=wick_close + 3, low=wick_close - 3,
+                           close=wick_close, open_=wick_close))
+        return out
+
+    def test_flag_off_is_identical_to_the_thin_wrapper(self):
+        # A falling EMA with a BULLISH pullback - accepted today, because
+        # there is no trend condition at all.
+        candles = self._candles([100 - i for i in range(30)], wick_close=75)
+
+        with patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", False):
+            result = ms.detect_ema_pullback(candles, ema_value=74)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+
+    def test_bullish_pullback_against_a_falling_ema_is_dropped(self):
+        candles = self._candles([100 - i for i in range(30)], wick_close=75)
+
+        with patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", True):
+            result = ms.detect_ema_pullback(candles, ema_value=74)
+
+        self.assertIsNone(result)
+
+    def test_bullish_pullback_with_a_rising_ema_is_kept(self):
+        candles = self._candles([70 + i for i in range(30)], wick_close=101)
+
+        with patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", True):
+            result = ms.detect_ema_pullback(candles, ema_value=100)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+
+    def test_bearish_pullback_requires_a_falling_ema(self):
+        falling = self._candles([100 - i for i in range(30)], wick_close=73)
+        rising = self._candles([70 + i for i in range(30)], wick_close=99)
+
+        with patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", True):
+            # BEARISH: wick ABOVE the level, close back below it.
+            self.assertIsNotNone(ms.detect_ema_pullback(falling, ema_value=74))
+            self.assertIsNone(ms.detect_ema_pullback(rising, ema_value=100))
+
+    def test_a_flat_ema_rejects_both_directions(self):
+        # Not a tie to be broken - a flat EMA is the ABSENCE of a trend, so
+        # neither side qualifies as trend-continuation.
+        candles = self._candles([100] * 30, wick_close=101)
+
+        with patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", True), \
+             patch.object(ms, "ema_prior_value", return_value=100.0):
+            self.assertIsNone(ms.detect_ema_pullback(candles, ema_value=100.0))
+
+    def test_missing_prior_ema_fails_open(self):
+        # Too little history to measure a slope must not silently kill the
+        # trigger - same fail-open convention as every other read.
+        candles = self._candles([70 + i for i in range(30)], wick_close=101)
+
+        with patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", True), \
+             patch.object(ms, "ema_prior_value", return_value=None):
+            self.assertIsNotNone(ms.detect_ema_pullback(candles, ema_value=100))
+
+    def test_no_pullback_is_still_none_whatever_the_trend(self):
+        candles = self._candles([70 + i for i in range(30)], wick_close=101)
+
+        with patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", True):
+            # level far below the candle's low - never touched.
+            self.assertIsNone(ms.detect_ema_pullback(candles, ema_value=10))
+
+
+class AnchoredPoolClusteringTests(unittest.TestCase):
+    """config.LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED (2026-09-22) -
+    find_liquidity_pools compared each point to cluster[-1], the PREVIOUS
+    point, so a chain of points each within tolerance of its neighbour
+    merged into one pool spanning far more than the tolerance. Measured
+    live: 8.0% of pools exceeded their own tolerance, up to 3.4x."""
+
+    def _swings(self, prices):
+        return [ms.SwingPoint(i, i, p, "HIGH") for i, p in enumerate(prices)]
+
+    def test_a_chain_merges_when_chained_and_splits_when_anchored(self):
+        # Each step is 0.8% - inside a 1% tolerance - but the run spans
+        # 2.4%, well outside it.
+        swings = self._swings([100.0, 100.8, 101.6, 102.4])
+
+        chained = ms.find_liquidity_pools(swings, tolerance_pct=0.01, anchored=False)
+        anchored = ms.find_liquidity_pools(swings, tolerance_pct=0.01, anchored=True)
+
+        self.assertEqual(len(chained), 1)
+        self.assertGreater(len(anchored), len(chained))
+        # Nothing anchored may span more than the tolerance it was built with.
+        for pool in anchored:
+            self.assertLessEqual(pool["touches"], 2)
+
+    def test_genuinely_equal_highs_still_cluster_when_anchored(self):
+        swings = self._swings([100.0, 100.05, 100.09])
+
+        anchored = ms.find_liquidity_pools(swings, tolerance_pct=0.01, anchored=True)
+
+        self.assertEqual(len(anchored), 1)
+        self.assertEqual(anchored[0]["touches"], 3)
+
+    def test_default_reads_the_config_flag(self):
+        swings = self._swings([100.0, 100.8, 101.6, 102.4])
+
+        with patch.object(config, "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", False):
+            self.assertEqual(len(ms.find_liquidity_pools(swings, tolerance_pct=0.01)), 1)
+
+        with patch.object(config, "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", True):
+            self.assertGreater(len(ms.find_liquidity_pools(swings, tolerance_pct=0.01)), 1)
+
+    def test_a_single_point_never_forms_a_pool_either_way(self):
+        for anchored in (False, True):
+            with self.subTest(anchored=anchored):
+                self.assertEqual(
+                    ms.find_liquidity_pools(self._swings([100.0]), anchored=anchored), [])
+
+
+class OrderBlockScanLookbackTests(unittest.TestCase):
+    """config.ORDER_BLOCK_SCAN_LOOKBACK_CANDLES (2026-09-22) - was a
+    hardcoded 10 inside find_order_block. Default 10 must reproduce that
+    exactly; this exists to make the number visible, not to change it."""
+
+    def _candles(self):
+        # index 0 is the only bearish candle; everything after is bullish.
+        out = [_candle(0, high=10, low=9, open_=10, close=9)]
+        for i in range(1, 12):
+            out.append(_candle(i, high=20 + i, low=19 + i, open_=19 + i, close=20 + i))
+        return out
+
+    def test_default_ten_finds_a_block_nine_candles_back(self):
+        candles = self._candles()
+        block = ms.find_order_block(candles, index=9, direction="BULLISH")
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block["index"], 0)
+
+    def test_a_shorter_lookback_misses_it(self):
+        candles = self._candles()
+        self.assertIsNone(
+            ms.find_order_block(candles, index=9, direction="BULLISH", lookback=5))
+
+    def test_reads_the_config_value_when_not_passed(self):
+        candles = self._candles()
+
+        with patch.object(config, "ORDER_BLOCK_SCAN_LOOKBACK_CANDLES", 5):
+            self.assertIsNone(ms.find_order_block(candles, index=9, direction="BULLISH"))
+
+        with patch.object(config, "ORDER_BLOCK_SCAN_LOOKBACK_CANDLES", 10):
+            self.assertIsNotNone(ms.find_order_block(candles, index=9, direction="BULLISH"))
 
 
 class DetectLevelPullbackTests(unittest.TestCase):

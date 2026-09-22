@@ -14,6 +14,25 @@ import risk_manager
 import signal_engine
 import signal_journal
 
+# config.CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED - pinned inert (False)
+# for the whole module. The live .env sets it True, and the confluence
+# fixtures below (_confluence_result) fill _CONFLUENCE_BOOL_FIELDS
+# positionally, which includes both direction-blind fields the flag
+# excludes - so an enabled flag would silently shift every (available,
+# favourable) assertion by 2. Same insulation pattern
+# tests/test_risk_manager.py and tests/test_market_structure.py already use.
+_confluence_flag_patcher = patch.object(
+    config, "CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED", False
+)
+
+
+def setUpModule():
+    _confluence_flag_patcher.start()
+
+
+def tearDownModule():
+    _confluence_flag_patcher.stop()
+
 
 class RejectJournalGatingTests(unittest.TestCase):
     """config.REJECT_JOURNAL_ENABLED - main.py owns BOTH volume controls
@@ -2593,6 +2612,40 @@ class EvaluateSymbolRetracementRoutingTests(unittest.TestCase):
             main._evaluate_symbol(feed, "BTCUSDT", positions, 1000, Counter())
 
         self.assertEqual(len(positions.registered_retracement_pending), 0)
+
+
+class InertConfigurationWarningTests(unittest.TestCase):
+    """main._warn_on_inert_configuration - every gate and trigger in this
+    bot fails open, so a flag that is ON but cannot act produces SILENCE
+    rather than an error. EMA_PULLBACK takes its level from ema_value,
+    which signal_engine only computes when EMA_CONFIRMATION_ENABLED is on,
+    so the trigger is inert without it and nothing in bot.log said so."""
+
+    def _warn_calls(self, pullback_on, confirmation_on):
+        with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", pullback_on), \
+             patch.object(config, "EMA_CONFIRMATION_ENABLED", confirmation_on), \
+             patch.object(main, "log_warning") as warn:
+            main._warn_on_inert_configuration()
+
+        return [call.args[0] for call in warn.call_args_list]
+
+    def test_warns_when_the_trigger_is_on_but_its_dependency_is_off(self):
+        calls = self._warn_calls(pullback_on=True, confirmation_on=False)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("EMA_PULLBACK_TRIGGER_ENABLED", calls[0])
+        self.assertIn("EMA_CONFIRMATION_ENABLED", calls[0])
+
+    def test_silent_in_the_live_configuration(self):
+        # Both flags are currently True - this must log nothing, or it
+        # becomes noise on every restart.
+        self.assertEqual(self._warn_calls(pullback_on=True, confirmation_on=True), [])
+
+    def test_silent_when_the_trigger_itself_is_off(self):
+        # Nothing inert about a disabled trigger, regardless of the
+        # dependency's state.
+        self.assertEqual(self._warn_calls(pullback_on=False, confirmation_on=False), [])
+        self.assertEqual(self._warn_calls(pullback_on=False, confirmation_on=True), [])
 
 
 if __name__ == "__main__":

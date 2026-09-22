@@ -90,6 +90,19 @@ _CONFLUENCE_BOOL_FIELDS = (
 )
 _CONFLUENCE_ALWAYS_PRESENT_FIELDS = ("order_block", "fvg")
 _CONFLUENCE_SIGNED_FIELDS = ("cvd_score", "depth_imbalance")
+# config.CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED - these two sit in
+# _CONFLUENCE_BOOL_FIELDS, where the count is `favourable += 1 if value else
+# 0` with NO side term, and neither formula has one either:
+#     oi_rising           = oi_change_pct > 0
+#     liquidation_cluster = total_notional >= LIQUIDATION_CLUSTER_MIN_NOTIONAL
+# Rising open interest is not inherently bullish or bearish, and neither is
+# the presence of a liquidation cluster - both vote identically for BUY and
+# SELL, adding a constant to the numerator rather than confirming anything.
+# (liquidation_ALIGNED, the direction-aware sibling, is counted separately
+# and correctly, and stays.) See the config flag's own comment for the
+# measured effect and why this ships with the tautological exclusion rather
+# than on its own.
+_CONFLUENCE_DIRECTION_BLIND_FIELDS = ("oi_rising", "liquidation_cluster")
 
 
 def confirmation_confluence(result):
@@ -119,7 +132,28 @@ def confirmation_confluence(result):
     side = result.get("signal")
     available = favourable = 0
 
+    # config.CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED - drop readings
+    # that cannot be independent evidence for THIS candidate: ones that are
+    # true by definition given its own trigger, and ones with no direction
+    # term at all. Skipped in BOTH the numerator and the denominator, so the
+    # ratio stays a fair fraction rather than being penalised for readings
+    # that were never informative. Default off => `skip` is empty and every
+    # loop below is byte-identical to what it has always done.
+    skip = frozenset()
+
+    if config.CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED:
+        # signal_trigger is absent on the probe candidate built by
+        # _against_htf_bias_probe_ratio, which is correct: that dict carries
+        # no order_block/fvg keys either, so only the direction-blind
+        # exclusion applies there.
+        skip = frozenset(_CONFLUENCE_DIRECTION_BLIND_FIELDS) | (
+            config.confluence_tautological_fields(result.get("signal_trigger"))
+        )
+
     for field in _CONFLUENCE_BOOL_FIELDS:
+        if field in skip:
+            continue
+
         value = result.get(field)
 
         if value is None:
@@ -129,10 +163,16 @@ def confirmation_confluence(result):
         favourable += 1 if value else 0
 
     for field in _CONFLUENCE_ALWAYS_PRESENT_FIELDS:
+        if field in skip:
+            continue
+
         available += 1
         favourable += 1 if result.get(field) else 0
 
     for field in _CONFLUENCE_SIGNED_FIELDS:
+        if field in skip:
+            continue
+
         value = result.get(field)
 
         if value is None:
@@ -386,7 +426,13 @@ def evaluate(
         if config.LIQUIDATION_HEATMAP_SWEEP_ENABLED:
             pools = pools + liquidation_pools
 
-        sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
+        # config.LIQUIDITY_SWEEP_MIN_WICK_ATR_MULTIPLE - atr threaded in so
+        # the wick-size requirement scales with the symbol's own
+        # volatility. ltf_analysis is resolved further up, before this
+        # block; a missing atr simply fails the requirement open.
+        sweep = liquidity_sweep.detect_sweep(
+            ltf_candles, pools, atr=ltf_analysis.get("atr")
+        )
 
     # config.OB_FVG_RETEST_TRIGGER_ENABLED - a fourth, alternative entry
     # trigger: a fresh rejection wick into an unmitigated FVG, independent
@@ -1854,7 +1900,10 @@ def evaluate(
             if config.LIQUIDATION_HEATMAP_SWEEP_ENABLED:
                 pools = pools + liquidation_pools
 
-            sweep = liquidity_sweep.detect_sweep(ltf_candles, pools)
+            # Same atr threading as the hoisted call above.
+            sweep = liquidity_sweep.detect_sweep(
+                ltf_candles, pools, atr=ltf_analysis.get("atr")
+            )
 
         sweep_confluence = bool(sweep and sweep["direction"] == direction)
 

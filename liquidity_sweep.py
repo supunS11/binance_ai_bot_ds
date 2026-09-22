@@ -8,7 +8,10 @@ pattern.
 import config
 
 
-def detect_sweep(candles, pools, require_closed_candle=None):
+def detect_sweep(
+    candles, pools, require_closed_candle=None,
+    min_wick_atr_multiple=None, atr=None, select_nearest=None,
+):
     """By default (require_closed_candle=False) this checks the *current,
     possibly still-forming* candle - real-time, catching the sweep as it
     happens rather than after the candle closes.
@@ -22,12 +25,34 @@ def detect_sweep(candles, pools, require_closed_candle=None):
     reject that hadn't actually held by the time the candle finished
     forming - price resumed the original move and hit SL within minutes.
     Deliberately does NOT just test `candles[-1]["closed"]` - see
-    live_break_check's docstring for why that would almost never fire."""
+    live_break_check's docstring for why that would almost never fire.
+
+    min_wick_atr_multiple (config.LIQUIDITY_SWEEP_MIN_WICK_ATR_MULTIPLE)
+    requires the penetration to be a real one. wick_size was computed on
+    every sweep from the beginning and never read by anything, so until
+    2026-09-22 a one-tick poke through a pool scored identically to a
+    genuine stop run. Needs `atr` to scale with the symbol's own
+    volatility; fails open (no requirement) when either is missing or zero,
+    same convention as every other read in this engine.
+
+    select_nearest (config.LIQUIDITY_SWEEP_SELECT_NEAREST_POOL_ENABLED)
+    changes WHICH swept pool is returned when a candle sweeps more than
+    one. The original behaviour returns the first in list order, and
+    find_liquidity_pools emits every BUY_SIDE pool before every SELL_SIDE
+    one - so on a candle that swept both sides the BEARISH read won purely
+    by enumeration order, never on merit. Default False keeps that
+    behaviour byte-for-byte."""
     if not candles or not pools:
         return None
 
     if require_closed_candle is None:
         require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    if min_wick_atr_multiple is None:
+        min_wick_atr_multiple = float(config.LIQUIDITY_SWEEP_MIN_WICK_ATR_MULTIPLE)
+
+    if select_nearest is None:
+        select_nearest = config.LIQUIDITY_SWEEP_SELECT_NEAREST_POOL_ENABLED
 
     if require_closed_candle:
         closed_candles = [c for c in candles if c.get("closed")]
@@ -42,6 +67,10 @@ def detect_sweep(candles, pools, require_closed_candle=None):
     high = latest["high"]
     low = latest["low"]
     close = latest["close"]
+    # Fails open on a missing/zero ATR or a zero threshold - the sweep is
+    # still a sweep, we just cannot judge its size.
+    min_wick = max(float(min_wick_atr_multiple), 0) * max(float(atr or 0), 0)
+    hits = []
 
     for pool in pools:
         level = pool["price"]
@@ -49,26 +78,34 @@ def detect_sweep(candles, pools, require_closed_candle=None):
         if pool["type"] == "BUY_SIDE" and high > level and close < level:
             # Swept buy-side liquidity (stops above a high) and rejected
             # back down - bearish signal.
-            return {
+            hits.append({
                 "direction": "BEARISH",
                 "level": level,
                 "wick_size": high - level,
                 "pool": pool,
                 "open_time": latest["open_time"],
-            }
-
-        if pool["type"] == "SELL_SIDE" and low < level and close > level:
+            })
+        elif pool["type"] == "SELL_SIDE" and low < level and close > level:
             # Swept sell-side liquidity (stops below a low) and rejected
             # back up - bullish signal.
-            return {
+            hits.append({
                 "direction": "BULLISH",
                 "level": level,
                 "wick_size": level - low,
                 "pool": pool,
                 "open_time": latest["open_time"],
-            }
+            })
 
-    return None
+    if min_wick > 0:
+        hits = [h for h in hits if h["wick_size"] >= min_wick]
+
+    if not hits:
+        return None
+
+    if select_nearest:
+        return min(hits, key=lambda h: abs(h["level"] - close))
+
+    return hits[0]
 
 
 def detect_liquidation_confirmed_sweep(sweep, liquidation_snapshot, min_notional_usdt=None):

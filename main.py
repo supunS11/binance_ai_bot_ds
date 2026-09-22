@@ -932,8 +932,34 @@ def _refresh_watchlist(feed, positions, current_symbols):
     return merged, new_feed
 
 
+def _warn_on_inert_configuration():
+    """Flags settings that are switched ON but cannot actually do anything
+    because of a dependency on another flag. Every gate and trigger in this
+    bot fails open, which is the right behaviour at run time but means a
+    misconfiguration produces SILENCE rather than an error - the trigger
+    simply never fires and nothing in bot.log says why.
+
+    Kept as its own function so more checks can join it; called once at
+    startup, never in the eval loop."""
+    if config.EMA_PULLBACK_TRIGGER_ENABLED and not config.EMA_CONFIRMATION_ENABLED:
+        # signal_engine only computes ema_value when EMA_CONFIRMATION_ENABLED
+        # is on, and detect_ema_pullback returns None for a None level - so
+        # the trigger is inert. The dependency is documented at
+        # config.EMA_PULLBACK_TRIGGER_ENABLED ("reuses the same ema_value
+        # already computed... zero extra cost"), but nothing said so at run
+        # time, which is the gap this closes.
+        log_warning(
+            "EMA_PULLBACK_TRIGGER_ENABLED is on but EMA_CONFIRMATION_ENABLED is off - "
+            "the trigger takes its level from that flag's ema_value and will never "
+            "fire. Turn EMA_CONFIRMATION_ENABLED on, or turn the trigger off so the "
+            "configuration says what it does."
+        )
+
+
 def main():
     exchange.sync_client_time()
+
+    _warn_on_inert_configuration()
 
     symbols = _select_symbols()
 

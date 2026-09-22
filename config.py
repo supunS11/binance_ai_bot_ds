@@ -455,6 +455,35 @@ SWING_RIGHT = env_int("SWING_RIGHT", 2)
 STRUCTURE_LOOKBACK_CANDLES = env_int("STRUCTURE_LOOKBACK_CANDLES", 150)
 FVG_LOOKBACK_CANDLES = env_int("FVG_LOOKBACK_CANDLES", 50)
 LIQUIDITY_POOL_TOLERANCE_PCT = env_float("LIQUIDITY_POOL_TOLERANCE_PCT", 0.001)
+# 2026-09-22 trigger audit (D4). find_liquidity_pools clusters equal
+# highs/lows by comparing each point to cluster[-1] - the PREVIOUS point -
+# not to an anchor. That is single-linkage chaining: a run of points each
+# within LIQUIDITY_POOL_TOLERANCE_PCT of its neighbour merges into one
+# "pool" that can span far more than the tolerance, and the reported price
+# is the cluster MEAN, which may sit at no actual swing at all. Price then
+# oscillates around a level that was never a real level, producing repeated
+# spurious sweeps - and since the pool price becomes structure_level, it
+# also anchors the stop.
+#
+# Measured over 100 symbols x 20 days of 1h klines (pool geometry only):
+#     chained (live)  span p50 0.052%  p90 0.098%  max 0.344%
+#                     wider than tolerance: 4858/60914  (8.0%)
+#     anchored        span p50 0.051%  p90 0.091%  max 0.100%
+#                     wider than tolerance: 0/62508     (0.0%)
+# Anchored also yields slightly MORE pools (62,508 vs 60,914) because over-
+# wide chains split into their real constituents rather than merging.
+#
+# Fixes the algorithm, NOT the tolerance - LIQUIDITY_POOL_TOLERANCE_PCT is
+# untouched. Default False reproduces today's chaining exactly.
+LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED = env_bool(
+    "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", "False"
+)
+# How far back find_order_block scans from a confirmed break for the last
+# opposite-coloured candle. Was a hardcoded 10 until 2026-09-22 (audit D6) -
+# a magic number in a structural detector, aligned with no other lookback in
+# this file. Default 10 reproduces the previous behaviour exactly; this
+# exists to make the number visible and tunable, not to change it.
+ORDER_BLOCK_SCAN_LOOKBACK_CANDLES = env_int("ORDER_BLOCK_SCAN_LOOKBACK_CANDLES", 10)
 # 100 -> 60 (2026-09-06, real evidence). At 100 x HTF_KLINE_INTERVAL=4h
 # this window was 400 real hours (~16.7 days) - 5x longer than the live
 # trend it sits beside (HTF_TREND_EMA_PERIOD=20 on 4h is ~3.3 days). The
@@ -1427,6 +1456,49 @@ REQUIRE_CLOSE_CONFIRMED_BREAK = env_bool("REQUIRE_CLOSE_CONFIRMED_BREAK", "True"
 # the existing one. Default OFF, same convention as every other feature
 # this session.
 LIQUIDITY_SWEEP_TRIGGER_ENABLED = env_bool("LIQUIDITY_SWEEP_TRIGGER_ENABLED", "False")
+# 2026-09-22 trigger audit (D3b). detect_sweep computes wick_size on every
+# sweep it finds and NOTHING has ever read it - so a one-tick poke through a
+# pool scores identically to a real stop run, despite the module docstring
+# calling this a "stop-hunt detector". This is the threshold that makes the
+# measurement it was already taking actually matter.
+#
+# Expressed in ATR multiples, not percent, so it scales with each symbol's
+# own volatility - same reasoning MIN_STOP_DISTANCE_ATR_MULTIPLE carries.
+# Measured over 100 symbols x 20 days of 1h klines, wick_size / ATR of every
+# real sweep (detection counts only):
+#     p10 0.052   p25 0.139   median 0.290   p75 0.570   p90 0.912
+#     threshold 0.05 -> keeps 2120/2340  (90.6%)
+#     threshold 0.10 -> keeps 1904/2340  (81.4%)   <- live
+#     threshold 0.25 -> keeps 1305/2340  (55.8%)
+#     threshold 0.50 -> keeps  699/2340  (29.9%)
+# 0.10 removes the clear noise tail without touching the body: a p10 sweep
+# penetrates a pool by a twentieth of average range, which is not a stop run
+# by any reading.
+#
+# Fails open when ATR is unavailable or zero, same convention as every other
+# read in this engine. Default 0.0 = no requirement = today's behaviour.
+LIQUIDITY_SWEEP_MIN_WICK_ATR_MULTIPLE = env_float(
+    "LIQUIDITY_SWEEP_MIN_WICK_ATR_MULTIPLE", 0.0
+)
+# 2026-09-22 trigger audit (D3a). detect_sweep returns the FIRST pool in
+# list order that the current candle swept, and find_liquidity_pools emits
+# all BUY_SIDE pools (ascending price) before all SELL_SIDE ones. So the
+# lowest-priced buy-side pool wins over every other, and when a candle
+# sweeps pools on BOTH sides the BEARISH read wins purely by enumeration
+# order. Nothing sorts by distance to price, by touch count, or by wick.
+#
+# Measured over 100 symbols x 20 days: this matters LESS than the audit
+# claimed - the first-in-list pool already happens to be the nearest 95.3%
+# of the time and the most-touched 98.5% of the time. The part that is a
+# real bug is the tie-break: 7.6% of sweeping candles swept more than one
+# pool, and 2.5% swept pools in CONFLICTING directions, where today's
+# answer is decided by list order alone.
+#
+# When enabled, selects the surviving pool nearest to the candle's close.
+# Default False reproduces today's first-in-list behaviour exactly.
+LIQUIDITY_SWEEP_SELECT_NEAREST_POOL_ENABLED = env_bool(
+    "LIQUIDITY_SWEEP_SELECT_NEAREST_POOL_ENABLED", "False"
+)
 # Third entry trigger: an LTF reversal already CONFIRMED (market_structure's
 # last_event classified "CHoCH" - a break AGAINST the prior trend, not a
 # continuation BOS) within CHOCH_TRIGGER_MAX_AGE_CANDLES candles of now,
@@ -1719,6 +1791,106 @@ _REVERSAL_TRIGGERS = frozenset({
 _TREND_AGREEMENT_EXEMPT_TRIGGERS = _REVERSAL_TRIGGERS | {"CHOCH_RETEST"}
 _OB_FVG_TAUTOLOGICAL_TRIGGERS = frozenset({"OB_FVG_RETEST", "ORDER_BLOCK_RETEST"})
 
+
+# config.CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED - 2026-09-22 trigger
+# audit. signal_engine.confirmation_confluence() counts ~15 readings and
+# requires MIN_CONFIRMATION_AGREEMENT_RATIO (0.65) of them to agree with the
+# trade's side. Two separate defects in what it counts:
+#
+#   TAUTOLOGICAL (this function). order_block/fvg are true BY DEFINITION for
+#   OB_FVG_RETEST and ORDER_BLOCK_RETEST - the trigger IS an OB/FVG retest -
+#   and liquidation_aligned is for LIQUIDATION_SWEEP_CONFIRMED, whose
+#   detector (liquidity_sweep.detect_liquidation_confirmed_sweep) requires
+#   exactly that alignment to fire at all. This project ALREADY acts on that
+#   insight one layer down: _OB_FVG_TAUTOLOGICAL_TRIGGERS above exempts
+#   those same two triggers from the NO_ORDER_BLOCK_OR_FVG gate for this
+#   reason. The confluence SCORE never got the same treatment, so those
+#   triggers cleared a 0.65 bar with 2 of ~13 votes (~13%) free that every
+#   other trigger had to earn.
+#
+#   DIRECTION-BLIND (signal_engine._CONFLUENCE_DIRECTION_BLIND_FIELDS).
+#   oi_rising = oi_change_pct > 0 and liquidation_cluster = notional >= MIN
+#   carry no side term, so they vote identically for BUY and SELL.
+#
+# ONE FLAG FOR BOTH, deliberately. Measured over the 99 journaled candidates
+# whose confluence reading could be reconstructed (the reconstruction
+# matched the bot's own recorded confirmation_available/favourable 99/99, so
+# these are exact, and no outcome data was used):
+#     scheme                fields   median ratio   live entries lost
+#     current                 13.0          0.750           -
+#     tautological only       11.7          0.700       30.4%
+#     direction-blind only    12.0          0.818        0.0%
+#     BOTH (this flag)        10.7          0.778        0.0%
+# The two corrections offset almost exactly: removing guaranteed-favourable
+# votes lowers the ratio, removing mostly-unfavourable ones raises it. Split
+# across two flags, either could be reverted alone and would move live trade
+# selection by ~30%. They ship and revert together.
+#
+# NOT reject-only: 7 of those 99 move from the shadow-probe band into the
+# clear-pass band (0 move the other way), so this can ADD live trades.
+# MIN_CONFIRMATION_AGREEMENT_RATIO deliberately stays 0.65 - the measurement
+# says no live-band candidate falls below it, so no recalibration is needed
+# and moving the bar too would make the change unattributable.
+#
+# Still counted, deliberately: the six fields that are ALSO hard gates
+# earlier in the cascade (cvd_score, depth_imbalance, depth_trend_aligned,
+# efficiency_favorable, cross_exchange_oi_agree, whale_aligned). Removing
+# those is the same defect in principle but costs 75% of live entries at
+# 0.65 and needs the threshold re-derived (~0.50) - a separate cycle.
+CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED = env_bool(
+    "CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED", "False"
+)
+
+
+# 2026-09-22, CORRECTION to that same audit. It also claimed SIX confluence
+# fields were redundant because each is "already a hard gate earlier in the
+# cascade", so any candidate reaching the score must have passed them. That
+# inference was read off the code and was mostly WRONG. The decisive test is
+# how often each field is FAVOURABLE when present among candidates that
+# reached the score - a field a gate has forced is ~100%. Measured on 99
+# journaled candidates:
+#     cross_exchange_oi_agree  100.0%  -> genuinely forced (universal gate)
+#     long_short_favorable     100.0%  -> forced, and was NOT on the list
+#     whale_aligned         0 present  -> already uncounted, no-op
+#     cvd_score                 93.9%  -> keep
+#     efficiency_favorable      85.9%  -> keep
+#     depth_imbalance           77.8%  -> KEEP, carries real information
+#     depth_trend_aligned       75.8%  -> KEEP, carries real information
+# The reason: CVD_NOT_CONFIRMED, MARKET_CHOPPY and DEPTH_TREND_MIN_
+# CONSISTENCY are PER-TRIGGER (trigger_gate_profiles) and exempt for several
+# triggers, so on those candidates the gate never ran and the field is
+# genuine independent evidence. Only universal gates force their field.
+#
+# NOT SHIPPED. Even the corrected three-field version costs 25 of 81
+# live-band candidates (31%) and would need MIN_CONFIRMATION_AGREEMENT_RATIO
+# re-derived in the same change. Recorded here so the next attempt starts
+# from this measurement rather than from the original wrong inference.
+def confluence_tautological_fields(trigger):
+    """{confluence field names that are true BY DEFINITION for `trigger`}.
+
+    Reads _OB_FVG_TAUTOLOGICAL_TRIGGERS rather than restating the trigger
+    list, so the score and the NO_ORDER_BLOCK_OR_FVG gate can never drift
+    apart - they are acting on the same fact about the same triggers.
+
+    A function called fresh on every use, NOT a module-level constant, for
+    exactly the reason trigger_gate_profiles()'s own docstring records: a
+    dict built once at import time silently ignores the
+    `patch.object(config, ...)` overrides tests use.
+
+    Returns an empty set for an unknown or None trigger - the probe path in
+    signal_engine._against_htf_bias_probe_ratio builds a candidate dict
+    with no signal_trigger, and it carries no order_block/fvg keys either,
+    so nothing there is tautological."""
+    fields = set()
+
+    if trigger in _OB_FVG_TAUTOLOGICAL_TRIGGERS:
+        fields |= {"order_block", "fvg"}
+
+    if trigger == "LIQUIDATION_SWEEP_CONFIRMED":
+        fields.add("liquidation_aligned")
+
+    return frozenset(fields)
+
 # AGAINST_HTF_BIAS requires the swing-confirmed HTF trend to already agree
 # with this candidate's direction. A swing-confirmed trend is inherently
 # LAGGING (see HTF_TREND_STALE_ENABLED's own rationale) - fine for
@@ -1973,6 +2145,45 @@ ORDER_BLOCK_RETEST_MAX_AGE_CANDLES = env_int("ORDER_BLOCK_RETEST_MAX_AGE_CANDLES
 # blocks from - bounds both compute cost and staleness (an origin block
 # from 30 structure breaks ago is no longer a meaningful retest target).
 ORDER_BLOCK_RETEST_LOOKBACK_EVENTS = env_int("ORDER_BLOCK_RETEST_LOOKBACK_EVENTS", 5)
+# How far the retest candle's CLOSE has to reclaim back out of the block,
+# measured from the far edge (0.0) toward the near edge (1.0) - the exact
+# parameter, geometry and rationale OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT
+# already carries for find_fvg_retest, ported to find_order_block_retest.
+#
+# 2026-09-22, ground-up trigger audit. find_order_block_retest's docstring
+# claims "a fresh rejection wick back into a previously-formed, UNMITIGATED
+# order block", but its condition was `latest["low"] <= high and
+# latest["close"] > low` - a close ANYWHERE INSIDE the block qualifies,
+# which is price sitting in the zone, not rejecting from it. That is the
+# identical pre-fix condition find_fvg_retest carried until 2026-08-22,
+# when it gained this parameter for exactly this reason ("no confirmation
+# the rejection actually has any strength behind it"). The two functions
+# are explicit counterparts sharing mitigation and closed-candle logic;
+# only one got the fix. This is the other half.
+#
+# Sizing - 120 symbols x 20 days of real 1h klines, DETECTION COUNTS only
+# (no outcome or expectancy data was used to choose this value):
+#     pct    detections    kept    removed
+#     0.0          7251   100.0%         0   <- the unfixed behaviour
+#     0.25         6494    89.6%       757
+#     0.5          5294    73.0%      1957   <- live (matches the twin)
+#     0.75         3928    54.2%      3323
+#     1.0          2452    33.8%      4799
+# Where the close actually sits inside the block today (0.0 = far edge,
+# 1.0 = fully reclaimed past the near edge): p10 0.239, p25 0.459,
+# median 0.789, p75 1.125, p90 1.496 - and 33.8% already close fully back
+# outside. So 0.5 removes roughly the bottom quartile, not the bulk, and
+# 1.0 was rejected for the same reason the twin rejected it (it would
+# discard a lot of genuine retests along with the weak ones).
+#
+# CODE DEFAULT IS 0.0, deliberately unlike the twin's 0.5: at 0.0 the
+# condition reduces to `close > low` exactly, so a code deploy that lands
+# without the matching .env line changes nothing on a live account. The
+# .env opts in. Reject-only either way - this can only ever produce FEWER
+# candidates, never more.
+ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT = env_float(
+    "ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT", 0.0
+)
 # Seventh entry trigger: price's swing structure vs OPEN INTEREST's value
 # at those same swing points (oi_divergence.py) - a new price extreme not
 # backed by expanding OI is weaker evidence than one where OI genuinely
@@ -2072,6 +2283,40 @@ LIQUIDATION_SWEEP_DIAGNOSTIC_LOGGING_ENABLED = env_bool(
 # unvalidated mechanism - default OFF, same convention as every other
 # trigger.
 EMA_PULLBACK_TRIGGER_ENABLED = env_bool("EMA_PULLBACK_TRIGGER_ENABLED", "False")
+# 2026-09-22 trigger audit (D2). detect_ema_pullback's docstring opens with
+# "a pullback to the EMA within an ESTABLISHED TREND, followed by a same-
+# candle reclaim - the classic trend-continuation entry". There was no trend
+# condition in the detector at all. It fired on any wick through the 1h EMA
+# that closed back across it, including chop straddling the EMA, and the
+# trend requirement was delegated entirely to downstream gates that read a
+# DIFFERENT timeframe (4h AGAINST_HTF_BIAS) and a DIFFERENT EMA pair (50/200
+# EMA_TREND_MIXED). Nothing anywhere checked the slope of the EMA20 the
+# pullback is actually measured against.
+#
+# Measured over 100 symbols x 20 days of 1h klines (detection counts only):
+#     detections today                    13039
+#     EMA slope AGREES with the trade      9048   69.4%
+#     EMA slope OPPOSES the trade          3991   30.6%   <- fired against
+#                                                            its own trend
+# Requiring agreement is reject-only: -30.6% of detections.
+#
+# Deliberately placed INSIDE the detector rather than as another gate. The
+# standing architectural goal for this project is that each trigger be
+# independently meaningful rather than rescued by a filter stack afterwards,
+# and "the EMA I am pulling back to is sloping my way" is part of what this
+# setup IS, not an external confirmation of it.
+#
+# A flat EMA (value == prior) fails BOTH directions - correct, that is the
+# absence of a trend. Fails open when the prior EMA is unavailable, same
+# convention as every other read. Default False = today's behaviour.
+EMA_PULLBACK_REQUIRE_TREND_ENABLED = env_bool(
+    "EMA_PULLBACK_REQUIRE_TREND_ENABLED", "False"
+)
+# How many candles back to anchor the comparison EMA when measuring that
+# slope. 3 is market_structure.ema_prior_value's own default, already used
+# for the HTF slope read (HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES) - same
+# helper, same span, no second concept.
+EMA_PULLBACK_TREND_LOOKBACK_CANDLES = env_int("EMA_PULLBACK_TREND_LOOKBACK_CANDLES", 3)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)
@@ -2084,6 +2329,20 @@ RISK_BASED_POSITION_SIZING_ENABLED = env_bool(
 )
 POSITION_RISK_PCT = env_float("POSITION_RISK_PCT", 1.0)
 POSITION_RISK_MAX_USDT = env_float("POSITION_RISK_MAX_USDT", 0)
+# COUPLED SETTING - read alongside MIN_STOP_DISTANCE_ATR_MULTIPLE and
+# MAX_ENTRY_EXTENSION_R below before changing it. 2026-09-22, measured over
+# 724 real journaled plans: the structural stop distance this buffer is part
+# of (d + 0.5*atr, where d = |entry - structure_level|) is overridden by the
+# MIN_STOP_DISTANCE floor on 708 of them (97.8%), and corr(d, realised risk)
+# = 0.048. The floor only stops binding once d > 0.5*atr, and
+# MAX_ENTRY_EXTENSION_R = 0.5 rejects the plan at that same boundary - so
+# raising this buffer is the one lever that makes structure actually set the
+# distance. Left at 0.5 by explicit operator decision (see
+# risk_manager.compute_stop_loss): raising it to 1.0 widens the median stop
+# to ~1.32*atr, and because RISK_BASED_POSITION_SIZING_ENABLED is False,
+# sizing is a flat notional - so the USDT loss per losing trade rises ~32%
+# with nothing offsetting it, and ~14% of plans newly fail MAX_SL_ROI_PCT.
+# tests/test_risk_manager.py StopFloorDominanceTests fails if this moves.
 STRUCTURE_STOP_ATR_BUFFER = env_float("STRUCTURE_STOP_ATR_BUFFER", 0.5)
 # Target-side twin of STRUCTURE_STOP_ATR_BUFFER above. _find_structure_target
 # draws TP1/TP2 to a real liquidity-pool price EXACTLY - the same level the
@@ -2149,6 +2408,17 @@ MIN_STOP_DISTANCE_PCT = env_float("MIN_STOP_DISTANCE_PCT", 0.6)
 # feature this session, this ships live immediately rather than defaulting
 # off. Starting value, not yet calibrated against real trade data. 0
 # disables it (MIN_STOP_DISTANCE_PCT alone, the original behavior).
+# COUPLED SETTING - see STRUCTURE_STOP_ATR_BUFFER above. This is not a rare
+# safety catch: measured 2026-09-22, this floor is what sets the stop
+# distance on 97.8% of real plans (708/724), which makes it the bot's actual
+# stop model. Every trigger therefore risks the same max(0.6%*entry,
+# 1.0*atr) regardless of the level it fired against, so R is a volatility
+# unit rather than a structural one - and TP1_R_MULTIPLE inherits that.
+# Lowering this would let structure bind more often but would also tighten
+# stops, which with flat position sizing means more frequent stop-outs at
+# the same USDT size. tests/test_risk_manager.py StopFloorDominanceTests
+# pins the relationship between this, the buffer above, and the extension
+# cap below.
 MIN_STOP_DISTANCE_ATR_MULTIPLE = env_float("MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0)
 # Rejects an entry that's already run more than this many R beyond the
 # structure level that triggered it - chasing an already-extended move
@@ -2162,6 +2432,21 @@ MIN_STOP_DISTANCE_ATR_MULTIPLE = env_float("MIN_STOP_DISTANCE_ATR_MULTIPLE", 1.0
 # used everywhere else in this file), not raw price/ATR, so it scales
 # with each symbol's own volatility. Starting value is a reasonable
 # floor, not yet calibrated against real trade data. 0 disables it.
+# COUPLED SETTING, AND ITS UNIT IS NOT WHAT THE NAME SUGGESTS - see
+# STRUCTURE_STOP_ATR_BUFFER above and risk_manager._entry_extension_r for
+# the full derivation. Because risk_distance is itself derived from
+# d = |entry - structure_level|, "R" here collapses: with the floor not
+# binding, extension_r = d/(d + 0.5*atr), which is always < 1 and hits 0.5
+# exactly when d = 0.5*atr; with the floor binding it is d/floor, an
+# unbounded and different quantity. So 0.5 here means "price ran more than
+# ~0.5*atr past the level", NOT "half the risk distance". That is also the
+# exact boundary at which the MIN_STOP_DISTANCE floor stops binding, which
+# is why this gate and that floor are complementary by construction - this
+# rejects precisely the plans where structure would have set the stop.
+# 152 of 724 real plans were rejected here, so it is live and binding.
+# Left at 0.5 (2026-09-22): re-denominating it in atr units would be
+# clearer but would change which plans reject, and the decision was
+# explicitly no behavioural change.
 MAX_ENTRY_EXTENSION_R = env_float("MAX_ENTRY_EXTENSION_R", 0.5)
 # config.ENTRY_RANGE_POSITION_REJECT_ENABLED - 2026-09-05, operator's own
 # explicit and repeatedly-restated call: stop entering BUYs near the top of

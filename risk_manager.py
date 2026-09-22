@@ -495,13 +495,31 @@ def build_dca_plan(
 
 
 def _apply_min_stop_distance(sl_price, entry_price, side, atr=0):
-    """Structure can occasionally land pathologically close to entry - a
+    """THIS IS THE PRIMARY STOP MECHANISM, not an occasional safety catch.
+
+    Measured 2026-09-22 over 724 real journaled plans: this floor sets the
+    stop distance on 708 of them (97.8%), and the correlation between
+    |entry - structure_level| and the realised risk distance is 0.048. The
+    "structure-based stop" in compute_stop_loss below almost never decides
+    how far the stop actually sits - see that function's own comment for
+    why the two are coupled, and MAX_ENTRY_EXTENSION_R's comment in
+    config.py for the third constant in the same interaction. Changing
+    STRUCTURE_STOP_ATR_BUFFER, MIN_STOP_DISTANCE_ATR_MULTIPLE or
+    MAX_ENTRY_EXTENSION_R silently changes what the other two mean;
+    tests/test_risk_manager.py's StopFloorDominanceTests pins the
+    relationship so a change to any one of them fails loudly.
+
+    The original rationale still holds and is still why the floor sits
+    where it does: structure can land pathologically close to entry - a
     fast/noisy market, or a tight fractal window finding a swing point
     right next to current price. Left alone, that produces a stop that's
-    essentially inside normal noise (gets hit immediately) and, because
-    position size is solved from the stop distance, an oversized position
-    to match. Widen the stop out to a minimum distance from entry rather
-    than let one through at a size ordinary noise will trigger.
+    essentially inside normal noise (gets hit immediately) and, when
+    RISK_BASED_POSITION_SIZING_ENABLED is on, an oversized position to
+    match. Widen the stop out to a minimum distance from entry rather
+    than let one through at a size ordinary noise will trigger. (That
+    sizing link is currently inert - RISK_BASED_POSITION_SIZING_ENABLED
+    is False, so sizing is a flat MARGIN_PER_TRADE*LEVERAGE notional and
+    a wider stop means a larger USDT loss, not a smaller position.)
 
     The floor is the WIDER of two measures, not just MIN_STOP_DISTANCE_PCT
     alone: a flat percentage of price can't be "enough" for every symbol
@@ -528,6 +546,34 @@ def _apply_min_stop_distance(sl_price, entry_price, side, atr=0):
 
 
 def compute_stop_loss(signal, side):
+    """Resolves the stop's DIRECTION and starting point from structure; its
+    DISTANCE is then almost always overridden by _apply_min_stop_distance
+    above (97.8% of 724 real plans - see that function's comment).
+
+    The two are coupled by construction, which is why the override is
+    near-total rather than occasional. With d = |entry - structure_level|:
+
+        structure distance = d + STRUCTURE_STOP_ATR_BUFFER*atr   (0.5*atr)
+        floor              = max(MIN_STOP_DISTANCE_PCT*entry,
+                                 MIN_STOP_DISTANCE_ATR_MULTIPLE*atr)
+
+    The floor stops binding only once d > 0.5*atr - and _entry_too_extended
+    (MAX_ENTRY_EXTENSION_R = 0.5) rejects the plan at that same boundary,
+    so the region where structure would set the distance is the region that
+    never reaches execution. Neither constant is wrong on its own; they are
+    complementary, and that is only visible when read together.
+
+    structure_level is NOT inert, and this comment should not be read that
+    way - it still decides which side of entry the stop goes on, and it
+    genuinely drives two live behaviours: _entry_extension_r below (a
+    binding gate - 152 of those same 724 plans were rejected by it) and
+    TRIGGER_QUALITY_RANKING_ENABLED's candidate _score in signal_engine.py.
+    What it does not do is make one trigger's risk differ from another's.
+
+    2026-09-22 operator decision: left as-is. Widening it would need
+    STRUCTURE_STOP_ATR_BUFFER >= 1.0, and with RISK_BASED_POSITION_SIZING_
+    ENABLED False that raises the USDT loss per losing trade ~32% with
+    nothing offsetting it."""
     entry_price = signal.get("entry_price")
 
     if config.SL_TP_USE_HTF_STRUCTURE:
@@ -866,7 +912,27 @@ def _entry_extension_r(signal, entry_price, side, risk_distance):
     hard MAX_ENTRY_EXTENSION_R reject) and build_trade_plan's
     entry_extension_r output (used by main.py to route a moderately-
     extended-but-not-rejected entry to a limit order instead of a market
-    order - see config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R)."""
+    order - see config.ENTRY_ROUTING_EXTENSION_THRESHOLD_R).
+
+    CAUTION - "R" here is not a stable unit, because risk_distance is
+    itself derived from d = |entry - structure_level|. Two regimes, with
+    two different meanings for the same threshold:
+
+      floor NOT binding:  risk = d + 0.5*atr
+                          -> extension_r = d / (d + 0.5*atr)
+                          -> ALWAYS < 1, asymptotic, and exactly 0.5 when
+                             d = 0.5*atr
+      floor binding:      risk = max(0.6%*entry, 1.0*atr)
+                          -> extension_r = d / floor, unbounded
+
+    So MAX_ENTRY_EXTENSION_R = 0.5 does not mean "half the risk distance"
+    in any independent sense - it means "price ran more than ~0.5*atr past
+    the level". That is the same boundary at which the floor stops binding
+    (see compute_stop_loss above), which is why the two gates are
+    complementary rather than independent. Documented rather than
+    re-expressed in atr units: re-denominating it would change which plans
+    reject, and the 2026-09-22 decision was explicitly no behavioural
+    change. StopFloorDominanceTests pins this."""
     if risk_distance <= 0:
         return None
 

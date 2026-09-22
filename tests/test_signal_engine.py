@@ -14,6 +14,39 @@ import oi_divergence
 import risk_manager
 import signal_engine
 
+# config.CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED - pinned inert (False)
+# for the whole module. The live .env sets it True, and ConfirmationConfluence
+# Tests calls confirmation_confluence() DIRECTLY rather than through _run(),
+# so an ExitStack pin inside that helper would not reach it. Every
+# (available, favourable) assertion in this file was written against the
+# un-excluded field set. The flag's own behaviour is covered by
+# ConfluenceIndependentEvidenceTests, which enables it locally.
+_confluence_flag_patcher = patch.object(
+    config, "CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED", False
+)
+# 2026-09-22 audit batch - all live in .env, all pinned inert here. The
+# fixtures in this module build pools and EMA values directly and assert on
+# the resulting sweep/pullback candidate, so any of these would silently
+# change which trigger fires.
+_audit_batch_patchers = [
+    patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", False),
+    patch.object(config, "LIQUIDITY_SWEEP_MIN_WICK_ATR_MULTIPLE", 0.0),
+    patch.object(config, "LIQUIDITY_SWEEP_SELECT_NEAREST_POOL_ENABLED", False),
+    patch.object(config, "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", False),
+]
+
+
+def setUpModule():
+    _confluence_flag_patcher.start()
+    for patcher in _audit_batch_patchers:
+        patcher.start()
+
+
+def tearDownModule():
+    _confluence_flag_patcher.stop()
+    for patcher in _audit_batch_patchers:
+        patcher.stop()
+
 
 def _ltf_candles(close, range_high=None, range_low=None):
     # range_high/range_low let a test place `close` anywhere inside the
@@ -360,6 +393,15 @@ class SignalEngineTests(unittest.TestCase):
             stack.enter_context(patch.object(
                 config, "MARKET_CHOPPY_EXEMPT_TRIGGERS",
                 list(market_choppy_exempt_triggers),
+            ))
+            # config.ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT - live .env
+            # sets 0.5. Pinned inert here so the ORDER_BLOCK_RETEST fixtures
+            # in this module (which build blocks without regard to where the
+            # retest candle's close lands inside them) keep producing the
+            # candidate they were written to produce. The threshold's own
+            # behaviour is covered in tests/test_market_structure.py.
+            stack.enter_context(patch.object(
+                config, "ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT", 0.0,
             ))
             stack.enter_context(patch.object(market_structure, "structure_state", return_value=htf_structure))
             stack.enter_context(patch.object(market_structure, "premium_discount_zone", return_value=zone))
@@ -4795,6 +4837,135 @@ class ConfirmationConfluenceTests(unittest.TestCase):
         avail, fav = signal_engine.confirmation_confluence(result)
         expected = len(signal_engine._CONFLUENCE_BOOL_FIELDS) + 2 + 2
         self.assertEqual((avail, fav), (expected, expected))
+
+
+class ConfluenceIndependentEvidenceTests(unittest.TestCase):
+    """config.CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED (2026-09-22) -
+    drops readings that cannot be independent evidence for a candidate:
+    TAUTOLOGICAL ones (true by definition given its own trigger) and
+    DIRECTION-BLIND ones (no side term at all). Excluded from BOTH the
+    numerator and the denominator, so the ratio stays a fair fraction."""
+
+    def _full(self, trigger, side="BUY"):
+        """Every confluence reading present and favourable, so any change in
+        the counts is attributable purely to an exclusion."""
+        result = {"signal": side, "signal_trigger": trigger,
+                  "order_block": {"i": 1}, "fvg": {"i": 1},
+                  "cvd_score": 0.4 if side == "BUY" else -0.4,
+                  "depth_imbalance": 0.2 if side == "BUY" else -0.2}
+        for field in signal_engine._CONFLUENCE_BOOL_FIELDS:
+            result[field] = True
+        return result
+
+    def _score(self, trigger, enabled, side="BUY"):
+        with patch.object(config, "CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED", enabled):
+            return signal_engine.confirmation_confluence(self._full(trigger, side))
+
+    def test_flag_off_is_byte_identical_for_every_trigger(self):
+        # The inert-default proof: a code deploy without the .env line must
+        # not move a single count, on any trigger.
+        total = len(signal_engine._CONFLUENCE_BOOL_FIELDS) + 4
+        for trigger in ("ORDER_BLOCK_RETEST", "OB_FVG_RETEST", "STRUCTURE_BREAK",
+                        "LIQUIDATION_SWEEP_CONFIRMED", "EMA_PULLBACK", None):
+            with self.subTest(trigger=trigger):
+                self.assertEqual(self._score(trigger, enabled=False), (total, total))
+
+    def test_direction_blind_fields_drop_out_for_every_trigger(self):
+        # oi_rising / liquidation_cluster vote identically for BUY and SELL,
+        # so they are removed regardless of what fired.
+        total = len(signal_engine._CONFLUENCE_BOOL_FIELDS) + 4
+        blind = len(signal_engine._CONFLUENCE_DIRECTION_BLIND_FIELDS)
+
+        for trigger in ("STRUCTURE_BREAK", "EMA_PULLBACK", "CHOCH_RETEST"):
+            with self.subTest(trigger=trigger):
+                avail, fav = self._score(trigger, enabled=True)
+                self.assertEqual((avail, fav), (total - blind, total - blind))
+
+    def test_order_block_and_fvg_drop_out_only_for_the_retest_triggers(self):
+        total = len(signal_engine._CONFLUENCE_BOOL_FIELDS) + 4
+        blind = len(signal_engine._CONFLUENCE_DIRECTION_BLIND_FIELDS)
+
+        for trigger in ("ORDER_BLOCK_RETEST", "OB_FVG_RETEST"):
+            with self.subTest(trigger=trigger):
+                # -2 more: the trigger IS an OB/FVG retest, so those two
+                # readings are true by construction and carry no evidence.
+                self.assertEqual(
+                    self._score(trigger, enabled=True), (total - blind - 2,) * 2)
+
+        # A trigger that is not an OB/FVG retest keeps them.
+        self.assertEqual(
+            self._score("STRUCTURE_BREAK", enabled=True), (total - blind,) * 2)
+
+    def test_liquidation_aligned_drops_out_only_for_its_own_trigger(self):
+        total = len(signal_engine._CONFLUENCE_BOOL_FIELDS) + 4
+        blind = len(signal_engine._CONFLUENCE_DIRECTION_BLIND_FIELDS)
+
+        # detect_liquidation_confirmed_sweep REQUIRES this alignment to fire,
+        # so counting it again as confirmation is circular.
+        self.assertEqual(
+            self._score("LIQUIDATION_SWEEP_CONFIRMED", enabled=True),
+            (total - blind - 1,) * 2,
+        )
+        self.assertEqual(
+            self._score("LIQUIDITY_SWEEP", enabled=True), (total - blind,) * 2)
+
+    def test_probe_path_with_no_trigger_gets_only_the_direction_blind_cut(self):
+        # _against_htf_bias_probe_ratio builds a candidate with no
+        # signal_trigger; nothing is tautological without one.
+        total = len(signal_engine._CONFLUENCE_BOOL_FIELDS) + 4
+        blind = len(signal_engine._CONFLUENCE_DIRECTION_BLIND_FIELDS)
+
+        self.assertEqual(self._score(None, enabled=True), (total - blind,) * 2)
+
+    def test_exclusion_removes_the_field_from_both_counts_not_just_one(self):
+        # The whole point: dropping a guaranteed-favourable vote must shrink
+        # the DENOMINATOR too, or the correction would punish the candidate
+        # twice over. With every reading favourable the ratio stays 1.0.
+        avail, fav = self._score("ORDER_BLOCK_RETEST", enabled=True)
+        self.assertEqual(avail, fav)
+
+    def test_a_retest_candidate_that_only_passed_on_free_votes_now_fails(self):
+        # The behavioural point, at the live 0.65 bar. order_block/fvg are
+        # the only favourable readings; everything else disagrees.
+        result = {"signal": "BUY", "signal_trigger": "ORDER_BLOCK_RETEST",
+                  "order_block": {"i": 1}, "fvg": {"i": 1},
+                  "ema_aligned": True, "btc_aligned": True,
+                  "sweep_confluence": False, "absorption_aligned": False}
+
+        with patch.object(config, "CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED", False):
+            avail, fav = signal_engine.confirmation_confluence(result)
+        self.assertEqual((avail, fav), (6, 4))
+        self.assertGreaterEqual(fav / avail, 0.65)
+
+        with patch.object(config, "CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED", True):
+            avail, fav = signal_engine.confirmation_confluence(result)
+        self.assertEqual((avail, fav), (4, 2))
+        self.assertLess(fav / avail, 0.65)
+
+    def test_tautological_map_follows_the_gate_exemption_set(self):
+        # config.confluence_tautological_fields reads
+        # _OB_FVG_TAUTOLOGICAL_TRIGGERS rather than restating it, so the
+        # score and the NO_ORDER_BLOCK_OR_FVG gate cannot drift apart.
+        with patch.object(config, "_OB_FVG_TAUTOLOGICAL_TRIGGERS",
+                          frozenset({"STRUCTURE_BREAK"})):
+            self.assertEqual(
+                config.confluence_tautological_fields("STRUCTURE_BREAK"),
+                frozenset({"order_block", "fvg"}),
+            )
+            self.assertEqual(
+                config.confluence_tautological_fields("ORDER_BLOCK_RETEST"), frozenset())
+
+    def test_recomputed_live_rather_than_cached_at_import_time(self):
+        # Same bug trigger_gate_profiles() documents: a dict built once at
+        # import silently ignores patch.object overrides.
+        with patch.object(config, "_OB_FVG_TAUTOLOGICAL_TRIGGERS", frozenset()):
+            self.assertEqual(
+                config.confluence_tautological_fields("ORDER_BLOCK_RETEST"), frozenset())
+
+        self.assertEqual(
+            config.confluence_tautological_fields("ORDER_BLOCK_RETEST"),
+            frozenset({"order_block", "fvg"}),
+        )
 
 
 class RejectDiagnosticsTests(unittest.TestCase):

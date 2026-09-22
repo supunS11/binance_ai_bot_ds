@@ -199,13 +199,22 @@ def live_break_check(candles, structure, require_closed_candle=None):
     }
 
 
-def find_order_block(candles, index, direction):
+def find_order_block(candles, index, direction, lookback=None):
     """The order block for a bullish break is the last bearish (red)
     candle before the impulsive move up; for a bearish break, the last
-    bullish (green) candle before the move down."""
-    index = min(max(index, 0), len(candles) - 1)
+    bullish (green) candle before the move down.
 
-    for i in range(index, max(index - 10, -1), -1):
+    lookback (config.ORDER_BLOCK_SCAN_LOOKBACK_CANDLES) is how far back to
+    scan for that candle. It was a hardcoded 10 until 2026-09-22 - a magic
+    number in a structural detector, tied to no other lookback in the
+    project. The default is still 10, so this is a rename of the constant,
+    not a change to it."""
+    index = min(max(index, 0), len(candles) - 1)
+    lookback = int(
+        config.ORDER_BLOCK_SCAN_LOOKBACK_CANDLES if lookback is None else lookback
+    )
+
+    for i in range(index, max(index - lookback, -1), -1):
         candle = candles[i]
         is_bullish_candle = candle["close"] > candle["open"]
 
@@ -271,7 +280,10 @@ def find_order_blocks(candles, left=None, right=None, max_events=None):
     return blocks
 
 
-def find_order_block_retest(candles, blocks=None, max_age_candles=None, require_closed_candle=None):
+def find_order_block_retest(
+    candles, blocks=None, max_age_candles=None, require_closed_candle=None,
+    min_close_through_pct=None,
+):
     """A fresh rejection wick back into a previously-formed, UNMITIGATED
     order block - the retest counterpart to find_fvg_retest, but for
     order blocks instead of fair value gaps (deliberately deferred when
@@ -289,12 +301,34 @@ def find_order_block_retest(candles, blocks=None, max_age_candles=None, require_
     applied uniformly), scans back to the most recently CLOSED candle
     instead. Returns the most recently formed qualifying block's retest
     (direction/level/block/open_time - the candle actually tested), or
-    None."""
+    None.
+
+    min_close_through_pct (config.ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT)
+    raises how far the retest candle's CLOSE has to reclaim back out of the
+    block, measured from the far edge (0.0) toward the near edge (1.0) -
+    the same parameter, geometry and rationale find_fvg_retest below
+    already carries as OB_FVG_RETEST_MIN_CLOSE_THROUGH_PCT.
+
+    2026-09-22: until now this function had no such requirement at all. Its
+    condition was `latest["low"] <= high and latest["close"] > low`, which
+    accepts a close ANYWHERE INSIDE the block - price sitting in the zone,
+    not rejecting from it, despite the "fresh rejection wick" this
+    docstring opens with. That is the identical pre-fix condition
+    find_fvg_retest carried until 2026-08-22; these two are explicit
+    counterparts sharing mitigation and closed-candle logic, and only one
+    got the fix. Code default is 0.0 (exactly the old behaviour) so the
+    live .env opts in - see the config.py comment for the detection-count
+    sizing behind the 0.5 chosen there."""
     if len(candles) < 2:
         return None
 
     if require_closed_candle is None:
         require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    if min_close_through_pct is None:
+        min_close_through_pct = float(config.ORDER_BLOCK_RETEST_MIN_CLOSE_THROUGH_PCT)
+
+    min_close_through_pct = min(max(min_close_through_pct, 0.0), 1.0)
 
     if require_closed_candle:
         closed_candles = [(i, c) for i, c in enumerate(candles) if c.get("closed")]
@@ -326,10 +360,34 @@ def find_order_block_retest(candles, blocks=None, max_age_candles=None, require_
         if mitigated:
             continue
 
-        if block["direction"] == "BULLISH" and latest["low"] <= high and latest["close"] > low:
+        block_range = high - low
+        # Near edge = the side price approached the block FROM. A BULLISH
+        # order block is a demand zone sitting below price, so price comes
+        # back down INTO it and the near edge is `high`; a BEARISH block is
+        # supply above price, approached from below, near edge `low`. The
+        # close must reclaim min_close_through_pct of the way from the far
+        # edge back toward that near edge - same geometry as find_fvg_retest.
+        #
+        # max(block_range, 0) rather than a `continue` guard: a degenerate
+        # zero-range block (high == low) then yields required == the far
+        # edge at ANY pct, which is byte-identical to the pre-2026-09-22
+        # condition, so the code default of 0.0 stays provably inert
+        # instead of silently dropping blocks it used to accept.
+        bullish_required_close = low + max(block_range, 0) * min_close_through_pct
+        bearish_required_close = high - max(block_range, 0) * min_close_through_pct
+
+        if (
+            block["direction"] == "BULLISH"
+            and latest["low"] <= high
+            and latest["close"] > bullish_required_close
+        ):
             return {"direction": "BULLISH", "level": low, "block": block, "open_time": latest["open_time"]}
 
-        if block["direction"] == "BEARISH" and latest["high"] >= low and latest["close"] < high:
+        if (
+            block["direction"] == "BEARISH"
+            and latest["high"] >= low
+            and latest["close"] < bearish_required_close
+        ):
             return {"direction": "BEARISH", "level": high, "block": block, "open_time": latest["open_time"]}
 
     return None
@@ -382,7 +440,7 @@ def detect_level_pullback(candles, level, require_closed_candle=None):
     return None
 
 
-def detect_ema_pullback(candles, ema_value, require_closed_candle=None):
+def detect_ema_pullback(candles, ema_value, require_closed_candle=None, require_trend=None):
     """A pullback to the EMA within an established trend, followed by a
     same-candle reclaim - the classic trend-continuation entry, well
     suited to smooth, high-liquidity trending symbols (majors) that
@@ -399,10 +457,43 @@ def detect_ema_pullback(candles, ema_value, require_closed_candle=None):
     precision tradeoff every other trigger's shared-computation hoisting
     in signal_engine.py already makes.
 
-    Thin wrapper over detect_level_pullback - identical behaviour to
-    what this function always did; ema_value is just this trigger's own
-    choice of level."""
-    return detect_level_pullback(candles, ema_value, require_closed_candle=require_closed_candle)
+    require_trend (config.EMA_PULLBACK_REQUIRE_TREND_ENABLED) supplies the
+    "within an established trend" half of the description above, which this
+    detector did not implement until 2026-09-22. Without it the function
+    fires on ANY wick through the EMA that closes back across it, including
+    chop straddling the EMA - and the trend requirement was delegated
+    entirely to downstream gates reading a different timeframe (4h) and a
+    different EMA pair (50/200), so nothing checked the slope of the EMA
+    this trigger is actually built on. Measured live: 30.6% of detections
+    fired against their own EMA's slope.
+
+    A flat EMA fails BOTH directions - that is the absence of a trend, not
+    a tie. Fails open when the prior EMA is unavailable (too little
+    history), same convention as every other read here. Default off keeps
+    the original thin-wrapper behaviour exactly."""
+    result = detect_level_pullback(
+        candles, ema_value, require_closed_candle=require_closed_candle
+    )
+
+    if result is None:
+        return None
+
+    if require_trend is None:
+        require_trend = config.EMA_PULLBACK_REQUIRE_TREND_ENABLED
+
+    if not require_trend or ema_value is None:
+        return result
+
+    prior = ema_prior_value(
+        candles, candles_back=int(config.EMA_PULLBACK_TREND_LOOKBACK_CANDLES)
+    )
+
+    if prior is None:
+        return result
+
+    agrees = ema_value > prior if result["direction"] == "BULLISH" else ema_value < prior
+
+    return result if agrees else None
 
 
 def find_fair_value_gaps(candles, lookback=None):
@@ -432,13 +523,29 @@ def find_fair_value_gaps(candles, lookback=None):
     return gaps
 
 
-def find_liquidity_pools(swings, tolerance_pct=None):
+def find_liquidity_pools(swings, tolerance_pct=None, anchored=None):
     """Cluster equal highs into BUY_SIDE liquidity (above the market -
     short stops + breakout buyers) and equal lows into SELL_SIDE liquidity
-    (below the market - long stops), requiring at least 2 touches."""
+    (below the market - long stops), requiring at least 2 touches.
+
+    anchored (config.LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED) decides
+    what each candidate point is compared against. The original behaviour
+    compares it to cluster[-1], the PREVIOUS point - single-linkage
+    chaining, so a run of points each within tolerance of its neighbour
+    merges into one pool spanning far more than the tolerance, and the
+    reported price (the cluster mean) can sit at no real swing at all.
+    Measured live: 8.0% of pools exceeded the tolerance, up to 3.4x it.
+
+    Anchored compares each point to cluster[0] instead, so a pool can never
+    span more than the tolerance it was built with. Default False keeps the
+    chaining behaviour byte-for-byte - see the config flag's own comment."""
     tolerance_pct = float(
         config.LIQUIDITY_POOL_TOLERANCE_PCT if tolerance_pct is None else tolerance_pct
     )
+
+    if anchored is None:
+        anchored = config.LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED
+
     pools = []
 
     for kind, label in (("HIGH", "BUY_SIDE"), ("LOW", "SELL_SIDE")):
@@ -449,7 +556,16 @@ def find_liquidity_pools(swings, tolerance_pct=None):
         cluster = []
 
         for point in points:
-            if cluster and abs(point.price - cluster[-1].price) / cluster[-1].price <= tolerance_pct:
+            # Anchored compares against the cluster's FIRST member so the
+            # cluster can never span more than tolerance_pct; chained
+            # compares against the previous point, which is what lets a run
+            # of near-neighbours drift arbitrarily far.
+            reference = None
+
+            if cluster:
+                reference = cluster[0] if anchored else cluster[-1]
+
+            if reference is not None and abs(point.price - reference.price) / reference.price <= tolerance_pct:
                 cluster.append(point)
                 continue
 

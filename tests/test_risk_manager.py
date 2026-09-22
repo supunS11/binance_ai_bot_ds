@@ -257,6 +257,130 @@ class MinStopDistanceAtrFloorTests(unittest.TestCase):
         self.assertEqual(sl, 90.0)
 
 
+class StopFloorDominanceTests(unittest.TestCase):
+    """DOCUMENTATION TEST - pins what the stop machinery currently DOES, not
+    what it ought to do.
+
+    Every other stop test in this file patches MIN_STOP_DISTANCE_* to 0 (or
+    STRUCTURE_STOP_ATR_BUFFER to 0) to isolate one mechanism at a time, so
+    none of them exercises the interaction between the three live constants.
+    That gap hid a real property of the system until 2026-09-22:
+
+      structure distance = d + STRUCTURE_STOP_ATR_BUFFER*atr   (d + 0.5*atr)
+      floor              = max(MIN_STOP_DISTANCE_PCT*entry,
+                               MIN_STOP_DISTANCE_ATR_MULTIPLE*atr)
+      extension_r        = d / risk_distance, capped at MAX_ENTRY_EXTENSION_R
+
+    where d = |entry - structure_level|. The floor stops binding only once
+    d > 0.5*atr, and the extension cap rejects the plan at that same
+    boundary - so the plans where structure would actually set the stop are
+    exactly the plans that never execute. Measured over 724 real journaled
+    plans: the floor set the distance on 708 (97.8%), and corr(d, realised
+    risk) = 0.048.
+
+    These tests fail if ANY of the three constants moves, because moving one
+    silently changes what the other two mean. That is the point - the
+    failure message names the others so the next change is made knowingly.
+    """
+
+    # Today's live values, pinned explicitly - this test is about their
+    # RELATIONSHIP, so it must not read whatever .env happens to hold.
+    BUFFER = 0.5
+    FLOOR_PCT = 0.6
+    FLOOR_ATR = 1.0
+    MAX_EXT = 0.5
+
+    def _pins(self, stack):
+        stack.enter_context(patch.object(config, "STRUCTURE_STOP_ATR_BUFFER", self.BUFFER))
+        stack.enter_context(patch.object(config, "MIN_STOP_DISTANCE_PCT", self.FLOOR_PCT))
+        stack.enter_context(patch.object(config, "MIN_STOP_DISTANCE_ATR_MULTIPLE", self.FLOOR_ATR))
+        stack.enter_context(patch.object(config, "MAX_ENTRY_EXTENSION_R", self.MAX_EXT))
+
+    def _evaluate(self, d, entry=100.0, atr=2.0):
+        """Returns (risk_distance, floor, extension_r, rejected) for a BUY
+        whose structure level sits `d` below entry."""
+        signal = {"structure_level": entry - d, "atr": atr, "entry_price": entry}
+
+        with ExitStack() as stack:
+            self._pins(stack)
+            sl = risk_manager.compute_stop_loss(signal, "BUY")
+            risk = abs(entry - sl)
+            ext = risk_manager._entry_extension_r(signal, entry, "BUY", risk)
+            rejected = risk_manager._entry_too_extended(ext)
+
+        return risk, max(entry * self.FLOOR_PCT / 100, atr * self.FLOOR_ATR), ext, rejected
+
+    def test_the_constants_still_hold_the_values_this_test_documents(self):
+        # Guards the guard: if the live defaults move, everything below is
+        # describing a system that no longer exists.
+        self.assertEqual(
+            (config.STRUCTURE_STOP_ATR_BUFFER, config.MIN_STOP_DISTANCE_ATR_MULTIPLE,
+             config.MAX_ENTRY_EXTENSION_R),
+            (self.BUFFER, self.FLOOR_ATR, self.MAX_EXT),
+            "STRUCTURE_STOP_ATR_BUFFER / MIN_STOP_DISTANCE_ATR_MULTIPLE / "
+            "MAX_ENTRY_EXTENSION_R are coupled (see their config.py comments). "
+            "One of them changed - re-derive the boundary in "
+            "risk_manager.compute_stop_loss's docstring and update this class, "
+            "rather than just relaxing the assertion.",
+        )
+
+    def test_just_inside_the_extension_cap_the_floor_sets_the_stop(self):
+        # d = 0.49*atr -> structure would give 0.49*2 + 0.5*2 = 1.98,
+        # narrower than the 2.0 floor, so the floor wins.
+        risk, floor, ext, rejected = self._evaluate(d=0.49 * 2.0)
+
+        self.assertAlmostEqual(risk, floor)
+        self.assertFalse(rejected)
+        self.assertLessEqual(ext, self.MAX_EXT)
+
+    def test_where_structure_would_set_the_stop_the_plan_is_rejected(self):
+        # d = 0.51*atr -> structure gives 2.02, wider than the 2.0 floor, so
+        # structure finally binds - and the extension cap rejects it.
+        risk, floor, ext, rejected = self._evaluate(d=0.51 * 2.0)
+
+        self.assertGreater(risk, floor)
+        self.assertTrue(
+            rejected,
+            "structure set the stop distance AND the plan survived - the two "
+            "gates are no longer complementary, which is a real behavioural "
+            "change worth understanding before it ships.",
+        )
+
+    def test_no_surviving_plan_ever_has_a_structure_set_stop(self):
+        """The invariant, swept rather than spot-checked: across the whole
+        range of d, there is no value where structure sets the distance and
+        the extension cap still lets the plan through."""
+        atr = 2.0
+        survivors_with_structure_stops = []
+
+        for step in range(1, 400):
+            d = step * 0.01 * atr           # 0.02*atr .. 4.0*atr
+            risk, floor, _ext, rejected = self._evaluate(d=d, atr=atr)
+
+            if not rejected and risk > floor * 1.0001:
+                survivors_with_structure_stops.append(round(d / atr, 3))
+
+        self.assertEqual(
+            survivors_with_structure_stops, [],
+            "these d/atr values now produce a structure-set stop that also "
+            "survives MAX_ENTRY_EXTENSION_R - the stop model has genuinely "
+            "changed and risk per trade now varies by trigger. Verify the "
+            "position-sizing side (RISK_BASED_POSITION_SIZING_ENABLED is "
+            "False, so a wider stop means a larger USDT loss, not a smaller "
+            "position) before accepting this.",
+        )
+
+    def test_pct_floor_dominates_instead_on_a_low_volatility_symbol(self):
+        # Same property, other floor branch: atr 0.1 on a 100-price symbol
+        # makes the 0.6% pct floor (0.6) the binding one, and it is 6x the
+        # atr so structure has no chance of reaching it inside the cap.
+        risk, floor, _ext, rejected = self._evaluate(d=0.49 * 0.1, atr=0.1)
+
+        self.assertAlmostEqual(risk, floor)
+        self.assertAlmostEqual(floor, 0.6)
+        self.assertFalse(rejected)
+
+
 class ComputeTargetsTests(unittest.TestCase):
     def test_buy_targets_are_r_multiples_above_entry(self):
         with patch.object(config, "TP1_R_MULTIPLE", 1.0), patch.object(config, "TP2_R_MULTIPLE", 2.0):
