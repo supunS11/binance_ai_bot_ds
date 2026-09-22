@@ -83,22 +83,16 @@ def _zigzag(swings):
     return filtered
 
 
-def _classify_swings(swings):
-    """Walk an already-alternating (post-zigzag) swing sequence and
-    classify the current trend plus the most recent BOS/CHoCH event. A
-    trend break is defined as the newest confirmed pivot exceeding the
-    *previous* confirmed pivot in the same direction (a higher high, or a
-    lower low). Split out from structure_state so the classification logic
-    can be unit-tested against hand-built swing sequences directly.
+def _walk_previous_pivot(swings):
+    """The ORIGINAL classification, behaviour unchanged: a trend break is
+    the newest confirmed pivot exceeding the *previous* confirmed pivot of
+    the same kind (a higher high, or a lower low).
 
-    `events` (every BOS/CHoCH found along the way, not just the last one)
-    backs ORDER_BLOCK_RETEST_TRIGGER_ENABLED's find_order_blocks below -
-    an origin block from several swings ago is still a valid, unmitigated
-    retest target, not just the very latest event structure_state's
-    original last_event-only shape exposed."""
-    if len(swings) < 2:
-        return {"available": False}
-
+    Kept as its own named function - and still the default while
+    config.STRUCTURE_PROTECTED_LEVEL_ENABLED is off - so every assertion
+    written against this shape stays reachable and byte-identical. See
+    _walk_protected_level below for what this rule actually measures and
+    how far it is from the BOS/CHoCH it names."""
     trend = None
     last_high = None
     last_low = None
@@ -108,47 +102,174 @@ def _classify_swings(swings):
     for swing in swings:
         if swing.kind == "HIGH":
             if last_high is not None and swing.price > last_high.price:
-                event_type = (
-                    "CHoCH" if trend == "BEARISH" else "BOS"
-                )
-                trend = "BULLISH"
                 last_event = {
-                    "type": event_type,
+                    "type": "CHoCH" if trend == "BEARISH" else "BOS",
                     "direction": "BULLISH",
                     "index": swing.index,
                     "price": swing.price,
                 }
+                trend = "BULLISH"
                 events.append(last_event)
             last_high = swing
         else:
             if last_low is not None and swing.price < last_low.price:
-                event_type = (
-                    "CHoCH" if trend == "BULLISH" else "BOS"
-                )
-                trend = "BEARISH"
                 last_event = {
-                    "type": event_type,
+                    "type": "CHoCH" if trend == "BULLISH" else "BOS",
                     "direction": "BEARISH",
                     "index": swing.index,
                     "price": swing.price,
                 }
+                trend = "BEARISH"
                 events.append(last_event)
+            last_low = swing
+
+    return {"trend": trend, "last_event": last_event, "events": events}
+
+
+def _walk_protected_level(swings):
+    """Standard market structure: a break must exceed the PROTECTED extreme
+    of the current leg, not merely the previous pivot of the same kind.
+
+    2026-09-22 ground-up detector audit, 110 symbols x 30 days of 1h
+    klines, 14,125 evaluations, measured against _walk_previous_pivot:
+
+      events not exceeding the structural extreme    55.5%
+        of which CHoCH                               71.9%
+        of which BOS                                 36.4%
+      total events                     76,178 -> 41,960   (-44.9%)
+      CHoCH                            40,990 -> 14,258   (-65.2%)
+      BOS share of all events            46.2% -> 66.0%
+
+    The BOS/CHoCH ratio inverting is the tell. Real markets continue more
+    often than they reverse; the previous-pivot rule reports the opposite
+    because any minor up-tick after a lower high flips the trend label and
+    manufactures a "change of character" that never happened. Concretely:
+    highs of 100, 95, 97 with an ascending low between fire a bullish BOS
+    at 97 while 100 stands unbroken and untested.
+
+    The OPPOSING extreme resets when the trend actually flips, so the next
+    break on that side measures continuation from the NEW leg rather than
+    from a level the market has already left behind.
+
+    Also returns the running extremes themselves. live_break_check reads
+    them to classify a break as structural or minor, which is why this walk
+    runs regardless of which classification is selected - the same "compute
+    it either way so the forward dataset builds" convention
+    signal_engine.py's ema_trend_bucket already uses."""
+    trend = None
+    structural_high = None
+    structural_low = None
+    last_event = None
+    events = []
+
+    for swing in swings:
+        if swing.kind == "HIGH":
+            if structural_high is not None and swing.price > structural_high:
+                last_event = {
+                    "type": "CHoCH" if trend == "BEARISH" else "BOS",
+                    "direction": "BULLISH",
+                    "index": swing.index,
+                    "price": swing.price,
+                }
+
+                if trend == "BEARISH":
+                    structural_low = None
+
+                trend = "BULLISH"
+                events.append(last_event)
+            structural_high = (
+                swing.price if structural_high is None
+                else max(structural_high, swing.price)
+            )
+        else:
+            if structural_low is not None and swing.price < structural_low:
+                last_event = {
+                    "type": "CHoCH" if trend == "BULLISH" else "BOS",
+                    "direction": "BEARISH",
+                    "index": swing.index,
+                    "price": swing.price,
+                }
+
+                if trend == "BULLISH":
+                    structural_high = None
+
+                trend = "BEARISH"
+                events.append(last_event)
+            structural_low = (
+                swing.price if structural_low is None
+                else min(structural_low, swing.price)
+            )
+
+    return {
+        "trend": trend,
+        "last_event": last_event,
+        "events": events,
+        "structural_high": structural_high,
+        "structural_low": structural_low,
+    }
+
+
+def _classify_swings(swings, structural=None):
+    """Walk an already-alternating (post-zigzag) swing sequence and
+    classify the current trend plus the most recent BOS/CHoCH event. Split
+    out from structure_state so the classification logic can be unit-tested
+    against hand-built swing sequences directly.
+
+    `structural` (config.STRUCTURE_PROTECTED_LEVEL_ENABLED) selects WHICH
+    rule supplies trend/last_event/events - see the two walks above. Both
+    always run: the protected-level extremes are exposed either way so
+    live_break_check can journal how a break classifies before anything
+    gates on it. Two passes over a list of tens of swings costs nothing
+    worth measuring.
+
+    `events` (every BOS/CHoCH found along the way, not just the last one)
+    backs ORDER_BLOCK_RETEST_TRIGGER_ENABLED's find_order_blocks below -
+    an origin block from several swings ago is still a valid, unmitigated
+    retest target, not just the very latest event structure_state's
+    original last_event-only shape exposed.
+
+    last_swing_high/last_swing_low are deliberately NOT the structural
+    extremes and never become them - they are the most recent swing of each
+    kind, which is the correct semantic for their two consumers:
+    position_manager._structure_stop_candidate (a trailing stop ratchets to
+    the latest confirmed swing, not to the leg's extreme) and CHOCH_RETEST's
+    retracement level in signal_engine.py. A regression test pins them
+    identical across both values of `structural`."""
+    if len(swings) < 2:
+        return {"available": False}
+
+    if structural is None:
+        structural = config.STRUCTURE_PROTECTED_LEVEL_ENABLED
+
+    previous = _walk_previous_pivot(swings)
+    protected = _walk_protected_level(swings)
+    chosen = protected if structural else previous
+
+    last_high = None
+    last_low = None
+
+    for swing in swings:
+        if swing.kind == "HIGH":
+            last_high = swing
+        else:
             last_low = swing
 
     return {
         "available": True,
-        "trend": trend,
-        "last_event": last_event,
-        "events": events,
+        "trend": chosen["trend"],
+        "last_event": chosen["last_event"],
+        "events": chosen["events"],
         "last_swing_high": last_high.price if last_high else None,
         "last_swing_low": last_low.price if last_low else None,
+        "structural_high": protected["structural_high"],
+        "structural_low": protected["structural_low"],
         "swings": swings,
     }
 
 
-def structure_state(candles, left=None, right=None):
+def structure_state(candles, left=None, right=None, structural=None):
     swings = _zigzag(find_swing_points(candles, left, right))
-    return _classify_swings(swings)
+    return _classify_swings(swings, structural=structural)
 
 
 def live_break_check(candles, structure, require_closed_candle=None):
@@ -190,10 +311,44 @@ def live_break_check(candles, structure, require_closed_candle=None):
     broke_up = last_high is not None and close > last_high
     broke_down = last_low is not None and close < last_low
 
+    # `structural` is DESCRIPTIVE ONLY - it rejects nothing, changes neither
+    # `broken` nor `direction`, and exists so the evidence journal can
+    # measure whether minor breaks behave differently before any flag gates
+    # on them (same journal-first discipline as ema_trend_bucket).
+    #
+    # This function breaks the most recent swing of each kind. That is not a
+    # break of STRUCTURE whenever the protected extreme still stands above
+    # (or below) it. 31.4% of ALL bars report a break here, which is far too
+    # often for a genuine break of structure.
+    #
+    # RATE, and why two numbers exist for it. The audit's Phase 1c measured
+    # 76.5% minor (110 symbols, 14,125 evaluations) against the BUFFER-WIDE
+    # extreme - the highest high and lowest low anywhere in the 200-candle
+    # window. This field instead uses _walk_protected_level's leg-local
+    # extreme, which RESETS on a trend flip, so it is a lower bar to clear.
+    # On identical buffers (20 majors, 876 breaks) the two disagree on 24.0%
+    # of breaks: buffer-wide 71.9%, leg-local 48.9%. The leg-local number is
+    # the one that describes THIS field, and the leg-local definition is the
+    # correct one - standard market structure does not require price to
+    # exceed an extreme from a leg the market has already reversed out of.
+    # Phase 1c's buffer-wide version was a measurement proxy, not a spec.
+    #
+    # A missing extreme reads False ("cannot confirm this is structural").
+    # That is fail-CLOSED, unlike every gate in this engine - deliberate,
+    # and safe only because nothing rejects on it. Whatever eventually does
+    # must pick its own fail-open behaviour explicitly.
+    structural_high = structure.get("structural_high")
+    structural_low = structure.get("structural_low")
+    structural_break = (
+        (broke_up and structural_high is not None and close > structural_high)
+        or (broke_down and structural_low is not None and close < structural_low)
+    )
+
     return {
         "broken": bool(broke_up or broke_down),
         "direction": "BULLISH" if broke_up else "BEARISH" if broke_down else None,
         "level": last_high if broke_up else last_low if broke_down else None,
+        "structural": bool(structural_break),
         "candle_closed": latest["closed"],
         "open_time": latest["open_time"],
     }
@@ -237,7 +392,7 @@ def find_order_block(candles, index, direction, lookback=None):
     return None
 
 
-def find_structure_events(candles, left=None, right=None):
+def find_structure_events(candles, left=None, right=None, structural=None):
     """Every BOS/CHoCH event across the full swing sequence - structure_state
     only exposes the single most recent one (last_event). Needed to
     enumerate historical order blocks below (ORDER_BLOCK_RETEST_TRIGGER_
@@ -247,7 +402,9 @@ def find_structure_events(candles, left=None, right=None):
     threading a new parameter through it - same "only pay for it when the
     flag needing it is on" convention as LIQUIDITY_SWEEP_TRIGGER_ENABLED's
     own pools/swings recompute."""
-    return _classify_swings(_zigzag(find_swing_points(candles, left, right))).get("events", [])
+    return _classify_swings(
+        _zigzag(find_swing_points(candles, left, right)), structural=structural
+    ).get("events", [])
 
 
 def find_order_blocks(candles, left=None, right=None, max_events=None):
@@ -523,7 +680,9 @@ def find_fair_value_gaps(candles, lookback=None):
     return gaps
 
 
-def find_liquidity_pools(swings, tolerance_pct=None, anchored=None):
+def find_liquidity_pools(
+    swings, tolerance_pct=None, anchored=None, min_touch_separation=None,
+):
     """Cluster equal highs into BUY_SIDE liquidity (above the market -
     short stops + breakout buyers) and equal lows into SELL_SIDE liquidity
     (below the market - long stops), requiring at least 2 touches.
@@ -538,7 +697,20 @@ def find_liquidity_pools(swings, tolerance_pct=None, anchored=None):
 
     Anchored compares each point to cluster[0] instead, so a pool can never
     span more than the tolerance it was built with. Default False keeps the
-    chaining behaviour byte-for-byte - see the config flag's own comment."""
+    chaining behaviour byte-for-byte - see the config flag's own comment.
+
+    min_touch_separation (config.LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES)
+    adds the TIME axis this clustering never had. A pool is supposed to be
+    multiple SEPARATE VISITS to a level - that is what makes stops
+    accumulate there - but the price-only clustering happily turns a run of
+    consecutive fractal swings inside one impulse into a "pool with N
+    touches". Measured 2026-09-22: 9.5% of pools have every touch on
+    CONSECUTIVE candles, 13.4% span <= 3 candles, 32.9% span <= 10.
+
+    Deliberately a SPAN test (first touch to last), not a pairwise one: a
+    level tagged five times in one impulse and then revisited two days later
+    IS a real pool, and a pairwise rule would discard it. Default 0 = no
+    requirement, byte-identical to before."""
     tolerance_pct = float(
         config.LIQUIDITY_POOL_TOLERANCE_PCT if tolerance_pct is None else tolerance_pct
     )
@@ -546,7 +718,30 @@ def find_liquidity_pools(swings, tolerance_pct=None, anchored=None):
     if anchored is None:
         anchored = config.LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED
 
+    if min_touch_separation is None:
+        min_touch_separation = config.LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES
+
+    min_touch_separation = max(int(min_touch_separation), 0)
     pools = []
+
+    def _flush(cluster, label):
+        """A cluster becomes a pool only if it has the touches AND spans the
+        time. Shared by the mid-loop and end-of-loop flushes so the two can
+        never drift apart."""
+        if len(cluster) < 2:
+            return
+
+        if min_touch_separation > 0:
+            indices = [p.index for p in cluster]
+
+            if max(indices) - min(indices) < min_touch_separation:
+                return
+
+        pools.append({
+            "type": label,
+            "price": sum(p.price for p in cluster) / len(cluster),
+            "touches": len(cluster),
+        })
 
     for kind, label in (("HIGH", "BUY_SIDE"), ("LOW", "SELL_SIDE")):
         points = sorted(
@@ -569,21 +764,10 @@ def find_liquidity_pools(swings, tolerance_pct=None, anchored=None):
                 cluster.append(point)
                 continue
 
-            if len(cluster) >= 2:
-                pools.append({
-                    "type": label,
-                    "price": sum(p.price for p in cluster) / len(cluster),
-                    "touches": len(cluster),
-                })
-
+            _flush(cluster, label)
             cluster = [point]
 
-        if len(cluster) >= 2:
-            pools.append({
-                "type": label,
-                "price": sum(p.price for p in cluster) / len(cluster),
-                "touches": len(cluster),
-            })
+        _flush(cluster, label)
 
     return pools
 
@@ -766,6 +950,131 @@ def find_fvg_retest(
             }
 
     return None
+
+
+def find_break_ote_retest(
+    candles, swings=None, max_age_candles=None, require_closed_candle=None,
+):
+    """config.BREAK_OTE_RETEST_TRIGGER_ENABLED - structure broke recently,
+    and price has NOW retraced into the OTE band OF THE BROKEN LEG.
+
+    This is the two-candle pattern signal_engine.py's NOT_IN_OTE gate has
+    always CLAIMED to enforce - "structure break, then retrace to OTE" - but
+    never did. That gate tests both halves simultaneously on the break candle
+    itself, which cannot happen: a break fires at an extreme (measured median
+    retracement depth 0.158) while OTE demands 0.705-0.79. It blocks 98.4% of
+    STRUCTURE_BREAK detections as a result. See OTE_GATE_EXEMPT_TRIGGERS in
+    config.py for that measurement; this function is the other half of the
+    fix - the pattern implemented on the candle where it can actually occur.
+
+    Two deliberate differences from the gate:
+
+      * The leg, not the window. The OTE band is measured on the impulse leg
+        that broke (swing low -> break high, or the mirror), which is what
+        ICT actually anchors a retracement to. The gate measures it on
+        PREMIUM_DISCOUNT_LOOKBACK_CANDLES of arbitrary range, so its band
+        moves with unrelated price action.
+
+      * The break must be REAL. The leg comes from _walk_protected_level,
+        not from structure_state's last_event, so this trigger anchors to a
+        break that cleared the protected extreme regardless of whether
+        config.STRUCTURE_PROTECTED_LEVEL_ENABLED is on. It is correct from
+        day one and does not silently change meaning when that flag flips.
+
+    Returns {direction, level, leg, open_time, tested_index,
+    setup_age_candles} or None. Direction is the BREAK's direction - a
+    bullish break that has retraced is a BUY back into discount, not a
+    fade."""
+    if len(candles) < 3:
+        return None
+
+    if require_closed_candle is None:
+        require_closed_candle = config.REQUIRE_CLOSE_CONFIRMED_BREAK
+
+    max_age = int(
+        config.BREAK_OTE_RETEST_MAX_AGE_CANDLES
+        if max_age_candles is None else max_age_candles
+    )
+
+    if require_closed_candle:
+        closed_candles = [(i, c) for i, c in enumerate(candles) if c.get("closed")]
+
+        if not closed_candles:
+            return None
+
+        tested_index, latest = closed_candles[-1]
+    else:
+        tested_index = len(candles) - 1
+        latest = candles[tested_index]
+
+    if swings is None:
+        swings = _zigzag(find_swing_points(candles))
+
+    if len(swings) < 2:
+        return None
+
+    event = _walk_protected_level(swings)["last_event"]
+
+    if event is None:
+        return None
+
+    age = tested_index - event["index"]
+
+    if age <= 0 or age > max_age:
+        return None
+
+    # The leg is the move that produced the break: from the last opposing
+    # swing BEFORE the breaking pivot, to the breaking pivot itself.
+    opposing_kind = "LOW" if event["direction"] == "BULLISH" else "HIGH"
+    opposing = [
+        s for s in swings
+        if s.kind == opposing_kind and s.index < event["index"]
+    ]
+
+    if not opposing:
+        return None
+
+    if event["direction"] == "BULLISH":
+        leg_high, leg_low = event["price"], opposing[-1].price
+    else:
+        leg_high, leg_low = opposing[-1].price, event["price"]
+
+    leg = leg_high - leg_low
+
+    if leg <= 0:
+        return None
+
+    ote_min = float(config.OTE_RETRACEMENT_MIN)
+    ote_max = float(config.OTE_RETRACEMENT_MAX)
+    close = latest["close"]
+
+    if event["direction"] == "BULLISH":
+        # Retraced DOWN from the break high into the band, and the leg is
+        # still intact (a close back under its origin invalidates it).
+        if close <= leg_low:
+            return None
+
+        band_low, band_high = leg_high - leg * ote_max, leg_high - leg * ote_min
+    else:
+        if close >= leg_high:
+            return None
+
+        band_low, band_high = leg_low + leg * ote_min, leg_low + leg * ote_max
+
+    if not band_low <= close <= band_high:
+        return None
+
+    return {
+        "direction": event["direction"],
+        # The invalidation edge, same role structure_level plays for every
+        # other trigger: the level the setup is wrong below (BULLISH) or
+        # above (BEARISH).
+        "level": leg_low if event["direction"] == "BULLISH" else leg_high,
+        "leg": {"high": leg_high, "low": leg_low, "index": event["index"]},
+        "open_time": latest["open_time"],
+        "tested_index": tested_index,
+        "setup_age_candles": age,
+    }
 
 
 def premium_discount_zone(candles, lookback=None):
@@ -1075,6 +1384,18 @@ def analyze(candles):
         "last_event": structure["last_event"],
         "last_swing_high": structure["last_swing_high"],
         "last_swing_low": structure["last_swing_low"],
+        # The protected extremes of the current leg - distinct from the two
+        # fields above, which are the most recent swing of each kind. See
+        # _walk_protected_level. Exposed regardless of
+        # config.STRUCTURE_PROTECTED_LEVEL_ENABLED.
+        "structural_high": structure["structural_high"],
+        "structural_low": structure["structural_low"],
+        # The zigzagged swing list this snapshot was built from. Already
+        # computed above for find_liquidity_pools, so exposing it is free and
+        # lets find_break_ote_retest reuse it rather than redoing the
+        # fractal scan. Flag-independent - the swings themselves do not
+        # depend on which classification walk is selected.
+        "swings": swings,
         "zone": zone,
         "live_break": live_break,
         "efficiency_ratio": efficiency,

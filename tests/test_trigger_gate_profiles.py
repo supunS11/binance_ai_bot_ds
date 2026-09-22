@@ -7,7 +7,7 @@ import config
 ALL_TRIGGERS = (
     "STRUCTURE_BREAK", "OB_FVG_RETEST", "LIQUIDITY_SWEEP", "CHOCH_RETEST",
     "CVD_DIVERGENCE", "ORDER_BLOCK_RETEST", "OI_DIVERGENCE",
-    "LIQUIDATION_SWEEP_CONFIRMED", "EMA_PULLBACK",
+    "LIQUIDATION_SWEEP_CONFIRMED", "EMA_PULLBACK", "BREAK_OTE_RETEST",
 )
 ALL_VARIABLE_GATES = frozenset({
     "AGAINST_HTF_BIAS", "HTF_TREND_STALE", "MARKET_CHOPPY",
@@ -44,6 +44,10 @@ class TriggerGateProfilesTests(unittest.TestCase):
             # which would otherwise break test_structure_break_gets_every_
             # variable_gate the moment it is deployed.
             "MARKET_CHOPPY_EXEMPT_TRIGGERS": [],
+            # Same reason, same concrete risk: the enabling decision for
+            # this list is STRUCTURE_BREAK, which is precisely what
+            # test_structure_break_gets_every_variable_gate asserts about.
+            "OTE_GATE_EXEMPT_TRIGGERS": [],
         }
         for name, value in defaults.items():
             patcher = patch.object(config, name, value)
@@ -201,6 +205,54 @@ class TriggerGateProfilesTests(unittest.TestCase):
 
         with patch.object(config, "OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", False):
             self.assertIn("NOT_IN_OTE", config.trigger_gate_profiles()["CHOCH_RETEST"])
+
+
+class OteGateExemptTriggersTests(unittest.TestCase):
+    """config.OTE_GATE_EXEMPT_TRIGGERS - 2026-09-22 Phase 1d. NOT_IN_OTE
+    blocks 98.4% of STRUCTURE_BREAK detections because a break fires at a
+    retracement depth of ~0.16 while the band demands 0.705-0.79. These lock
+    in that the exemption is expressible at all - the pre-existing
+    OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED lever points the wrong way, since
+    turning it off applies the gate to EVERY trigger."""
+
+    def setUp(self):
+        for name, value in (
+            ("OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", True),
+            ("MARKET_CHOPPY_EXEMPT_TRIGGERS", []),
+        ):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_default_is_empty_so_structure_break_keeps_the_gate(self):
+        with patch.object(config, "OTE_GATE_EXEMPT_TRIGGERS", []):
+            self.assertIn(
+                "NOT_IN_OTE", config.trigger_gate_profiles()["STRUCTURE_BREAK"]
+            )
+
+    def test_listing_structure_break_removes_only_its_own_ote_gate(self):
+        with patch.object(config, "OTE_GATE_EXEMPT_TRIGGERS", ["STRUCTURE_BREAK"]):
+            profiles = config.trigger_gate_profiles()
+
+        self.assertNotIn("NOT_IN_OTE", profiles["STRUCTURE_BREAK"])
+        # every OTHER variable gate STRUCTURE_BREAK carries is untouched
+        self.assertEqual(
+            profiles["STRUCTURE_BREAK"], ALL_VARIABLE_GATES - {"NOT_IN_OTE"}
+        )
+
+    def test_the_source_default_is_an_empty_list(self):
+        """Asserted against the source literal rather than the imported
+        value, which the live .env can change - the same shape
+        test_market_structure.py uses for its own default proofs."""
+        import re
+        from pathlib import Path
+
+        source = Path(config.__file__).read_text(encoding="utf-8", errors="replace")
+        match = re.search(
+            r'OTE_GATE_EXEMPT_TRIGGERS\s*=\s*env_str_list\(\s*"OTE_GATE_EXEMPT_TRIGGERS"\s*,\s*\[\]\s*\)',
+            source,
+        )
+        self.assertIsNotNone(match, "OTE_GATE_EXEMPT_TRIGGERS must default to []")
 
 
 if __name__ == "__main__":

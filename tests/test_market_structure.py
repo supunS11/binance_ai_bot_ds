@@ -28,18 +28,45 @@ _ema_trend_patcher = patch.object(config, "EMA_PULLBACK_REQUIRE_TREND_ENABLED", 
 _anchored_pools_patcher = patch.object(
     config, "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", False
 )
+# config.STRUCTURE_PROTECTED_LEVEL_ENABLED - pinned inert for the same
+# reason. Every ClassifySwings/StructureState/LiveBreakCheck assertion below
+# was written against the previous-pivot rule, which is what the flag being
+# False selects. ProtectedLevelWalkTests / LiveBreakStructuralFieldTests
+# enable it locally where they need it.
+_protected_level_patcher = patch.object(
+    config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", False
+)
+# config.BREAK_OTE_RETEST_MAX_AGE_CANDLES - pinned at its own default so the
+# BreakOteRetest tests below assert against a fixed window even if .env
+# eventually tunes it. The trigger's ENABLED flag is not pinned here:
+# find_break_ote_retest never reads it (signal_engine gates the call), so a
+# live .env value cannot reach these tests.
+_break_ote_age_patcher = patch.object(config, "BREAK_OTE_RETEST_MAX_AGE_CANDLES", 12)
+# config.LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES - pinned inert (0).
+# Every FindLiquidityPoolsTests fixture builds swings at whatever indices are
+# convenient, mostly adjacent, so any real separation requirement would drop
+# pools those assertions expect. PoolTouchSeparationTests sets it locally.
+_pool_separation_patcher = patch.object(
+    config, "LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES", 0
+)
 
 
 def setUpModule():
     _ob_close_through_patcher.start()
     _ema_trend_patcher.start()
     _anchored_pools_patcher.start()
+    _protected_level_patcher.start()
+    _break_ote_age_patcher.start()
+    _pool_separation_patcher.start()
 
 
 def tearDownModule():
     _ob_close_through_patcher.stop()
     _ema_trend_patcher.stop()
     _anchored_pools_patcher.stop()
+    _protected_level_patcher.stop()
+    _break_ote_age_patcher.stop()
+    _pool_separation_patcher.stop()
 
 
 def _candle(open_time, high, low, close=None, open_=None, closed=True):
@@ -157,6 +184,347 @@ class ClassifySwingsTests(unittest.TestCase):
     def test_fewer_than_two_swings_is_unavailable(self):
         result = ms._classify_swings([self._swing(1, 10, "HIGH")])
         self.assertFalse(result["available"])
+
+
+def _swing(index, price, kind):
+    return ms.SwingPoint(index, index, price, kind)
+
+
+# The canonical sequence from the 2026-09-22 detector audit: a lower high
+# (95) followed by an ascending low (90) and a second lower high (97). 97
+# exceeds the PREVIOUS pivot (95) but not the PROTECTED extreme (100, never
+# broken), so the two walks disagree about whether anything happened at all.
+_LOWER_HIGH_SEQUENCE = [
+    _swing(1, 100, "HIGH"),
+    _swing(3, 80, "LOW"),
+    _swing(5, 95, "HIGH"),
+    _swing(7, 90, "LOW"),
+    _swing(9, 97, "HIGH"),
+]
+
+
+class ProtectedLevelWalkTests(unittest.TestCase):
+    """config.STRUCTURE_PROTECTED_LEVEL_ENABLED - the two classification
+    rules, tested directly against hand-built swing sequences so neither
+    depends on engineering fractal candle data."""
+
+    def test_previous_pivot_rule_fires_on_a_lower_high(self):
+        result = ms._walk_previous_pivot(_LOWER_HIGH_SEQUENCE)
+
+        # 97 > 95 is enough for this rule, even though 100 stands unbroken.
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["last_event"]["type"], "BOS")
+        self.assertEqual(result["last_event"]["direction"], "BULLISH")
+        self.assertEqual(result["last_event"]["price"], 97)
+        self.assertEqual(result["trend"], "BULLISH")
+
+    def test_protected_level_rule_does_not_fire_on_a_lower_high(self):
+        result = ms._walk_protected_level(_LOWER_HIGH_SEQUENCE)
+
+        # Nothing exceeded 100, so no break of structure occurred.
+        self.assertEqual(result["events"], [])
+        self.assertIsNone(result["last_event"])
+        self.assertIsNone(result["trend"])
+        self.assertEqual(result["structural_high"], 100)
+        self.assertEqual(result["structural_low"], 80)
+
+    def test_protected_level_rule_fires_when_the_extreme_is_exceeded(self):
+        result = ms._walk_protected_level([
+            _swing(1, 100, "HIGH"),
+            _swing(3, 80, "LOW"),
+            _swing(5, 105, "HIGH"),
+        ])
+
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["last_event"]["type"], "BOS")
+        self.assertEqual(result["last_event"]["price"], 105)
+        self.assertEqual(result["trend"], "BULLISH")
+        self.assertEqual(result["structural_high"], 105)
+
+    def test_choch_only_when_the_trend_actually_flips(self):
+        result = ms._walk_protected_level([
+            _swing(1, 100, "HIGH"),
+            _swing(3, 80, "LOW"),
+            _swing(5, 110, "HIGH"),   # > 100 -> BOS, trend BULLISH
+            _swing(7, 70, "LOW"),     # < 80  -> CHoCH into BEARISH
+            _swing(9, 90, "HIGH"),    # extreme was reset; records 90
+            _swing(11, 60, "LOW"),    # < 70  -> continuation BOS
+        ])
+
+        self.assertEqual(
+            [(e["type"], e["direction"]) for e in result["events"]],
+            [("BOS", "BULLISH"), ("CHoCH", "BEARISH"), ("BOS", "BEARISH")],
+        )
+        self.assertEqual(result["trend"], "BEARISH")
+
+    def test_the_opposing_extreme_resets_when_the_trend_flips(self):
+        """Without the reset, the final HIGH(95) would be compared against
+        110 and never fire - the market would be stuck unable to signal a
+        reversal back up until it exceeded a level it had already left."""
+        result = ms._walk_protected_level([
+            _swing(1, 100, "HIGH"),
+            _swing(3, 80, "LOW"),
+            _swing(5, 110, "HIGH"),   # BOS, trend BULLISH, structural_high 110
+            _swing(7, 70, "LOW"),     # CHoCH BEARISH -> structural_high reset
+            _swing(9, 90, "HIGH"),    # becomes the new protected high
+            _swing(11, 95, "HIGH"),   # > 90 -> CHoCH back into BULLISH
+        ])
+
+        self.assertEqual(result["last_event"]["type"], "CHoCH")
+        self.assertEqual(result["last_event"]["direction"], "BULLISH")
+        self.assertEqual(result["last_event"]["price"], 95)
+        self.assertEqual(result["trend"], "BULLISH")
+
+    def test_a_single_swing_list_produces_no_events_either_way(self):
+        one = [_swing(1, 10, "HIGH")]
+        self.assertEqual(ms._walk_previous_pivot(one)["events"], [])
+        self.assertEqual(ms._walk_protected_level(one)["events"], [])
+
+
+class ClassifySwingsFlagTests(unittest.TestCase):
+    """Which walk _classify_swings selects, and what it exposes regardless."""
+
+    def test_flag_off_matches_the_previous_pivot_walk(self):
+        with patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", False):
+            result = ms._classify_swings(_LOWER_HIGH_SEQUENCE)
+
+        expected = ms._walk_previous_pivot(_LOWER_HIGH_SEQUENCE)
+        self.assertEqual(result["trend"], expected["trend"])
+        self.assertEqual(result["last_event"], expected["last_event"])
+        self.assertEqual(result["events"], expected["events"])
+
+    def test_flag_on_matches_the_protected_level_walk(self):
+        with patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", True):
+            result = ms._classify_swings(_LOWER_HIGH_SEQUENCE)
+
+        expected = ms._walk_protected_level(_LOWER_HIGH_SEQUENCE)
+        self.assertEqual(result["trend"], expected["trend"])
+        self.assertEqual(result["last_event"], expected["last_event"])
+        self.assertEqual(result["events"], expected["events"])
+
+    def test_the_explicit_parameter_overrides_the_flag(self):
+        with patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", False):
+            result = ms._classify_swings(_LOWER_HIGH_SEQUENCE, structural=True)
+
+        self.assertIsNone(result["last_event"])
+
+    def test_structural_extremes_are_exposed_with_the_flag_off(self):
+        """live_break_check needs them to classify a break while the flag is
+        still off - that is the whole point of journaling before gating."""
+        with patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", False):
+            result = ms._classify_swings(_LOWER_HIGH_SEQUENCE)
+
+        self.assertEqual(result["structural_high"], 100)
+        self.assertEqual(result["structural_low"], 80)
+
+    def test_last_swing_levels_are_identical_under_both_flag_states(self):
+        """REGRESSION GUARD. position_manager._structure_stop_candidate
+        trails to last_swing_low/last_swing_high, where "most recent swing"
+        is the correct semantic - these must never become the structural
+        extremes. CHOCH_RETEST's retracement level depends on the same
+        fields."""
+        with patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", False):
+            off = ms._classify_swings(_LOWER_HIGH_SEQUENCE)
+        with patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", True):
+            on = ms._classify_swings(_LOWER_HIGH_SEQUENCE)
+
+        self.assertEqual(off["last_swing_high"], 97)
+        self.assertEqual(off["last_swing_low"], 90)
+        self.assertEqual(on["last_swing_high"], off["last_swing_high"])
+        self.assertEqual(on["last_swing_low"], off["last_swing_low"])
+        # ...and neither equals the structural extreme, which is the bug
+        # this guard exists to catch.
+        self.assertNotEqual(on["last_swing_high"], on["structural_high"])
+
+
+class LiveBreakStructuralFieldTests(unittest.TestCase):
+    """live_break_check's descriptive `structural` field. It must never
+    change `broken` or `direction` - it only records whether the break
+    cleared the protected extreme."""
+
+    def _structure(self, **overrides):
+        base = {
+            "available": True,
+            "last_swing_high": 97,
+            "last_swing_low": 90,
+            "structural_high": 100,
+            "structural_low": 80,
+        }
+        base.update(overrides)
+        return base
+
+    def test_a_minor_break_is_reported_but_not_structural(self):
+        # Closes above the most recent swing high (97) but below the
+        # protected extreme (100) - the 76.5% case.
+        candles = [_candle(0, high=99, low=95, close=98)]
+
+        result = ms.live_break_check(candles, self._structure())
+
+        self.assertTrue(result["broken"])
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertFalse(result["structural"])
+
+    def test_a_real_break_is_structural(self):
+        candles = [_candle(0, high=102, low=95, close=101)]
+
+        result = ms.live_break_check(candles, self._structure())
+
+        self.assertTrue(result["broken"])
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertTrue(result["structural"])
+
+    def test_a_minor_bearish_break_is_reported_but_not_structural(self):
+        candles = [_candle(0, high=92, low=84, close=85)]
+
+        result = ms.live_break_check(candles, self._structure())
+
+        self.assertTrue(result["broken"])
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertFalse(result["structural"])
+
+    def test_a_real_bearish_break_is_structural(self):
+        candles = [_candle(0, high=92, low=78, close=79)]
+
+        result = ms.live_break_check(candles, self._structure())
+
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertTrue(result["structural"])
+
+    def test_missing_extremes_read_as_not_structural(self):
+        """Fail-CLOSED, deliberately - "cannot confirm", not "confirmed".
+        Safe only because nothing rejects on this field."""
+        candles = [_candle(0, high=102, low=95, close=101)]
+        structure = self._structure(structural_high=None, structural_low=None)
+
+        result = ms.live_break_check(candles, structure)
+
+        self.assertTrue(result["broken"])
+        self.assertFalse(result["structural"])
+
+    def test_no_break_is_never_structural(self):
+        candles = [_candle(0, high=96, low=91, close=94)]
+
+        result = ms.live_break_check(candles, self._structure())
+
+        self.assertFalse(result["broken"])
+        self.assertFalse(result["structural"])
+
+
+class FindBreakOteRetestTests(unittest.TestCase):
+    """config.BREAK_OTE_RETEST_TRIGGER_ENABLED - the two-candle "break, then
+    retrace to OTE" pattern NOT_IN_OTE has always claimed to enforce but
+    tests simultaneously on one candle, which is why it blocks 98.4% of
+    STRUCTURE_BREAK detections.
+
+    Swings are supplied directly so these assert the detector's own logic
+    rather than depending on engineering fractal candle data, the same
+    approach ClassifySwingsTests uses."""
+
+    # A real protected-level break: HIGH(100), LOW(80), HIGH(120). 120
+    # clears the protected high of 100, so _walk_protected_level emits a
+    # BULLISH event at swing index 5. The broken leg is LOW(80) -> 120,
+    # so leg = 40 and the OTE band is 120 - 40*[0.79, 0.705] = [88.4, 91.8].
+    BULLISH_SWINGS = [
+        _swing(1, 100, "HIGH"),
+        _swing(3, 80, "LOW"),
+        _swing(5, 120, "HIGH"),
+    ]
+
+    def _candles(self, close, count=12, open_time_step=1):
+        """A candle list long enough that the tested index sits `count-1-5`
+        candles after the break at swing index 5."""
+        out = [_candle(i * open_time_step, high=close + 1, low=close - 1,
+                       close=close) for i in range(count)]
+        return out
+
+    def test_fires_when_price_retraces_into_the_legs_ote_band(self):
+        candles = self._candles(90.0)          # inside [88.4, 91.8]
+
+        result = ms.find_break_ote_retest(candles, swings=self.BULLISH_SWINGS)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BULLISH")
+        self.assertEqual(result["leg"]["high"], 120)
+        self.assertEqual(result["leg"]["low"], 80)
+        # structure_level is the leg ORIGIN - the level the setup is wrong
+        # beyond - not the break level.
+        self.assertEqual(result["level"], 80)
+
+    def test_does_not_fire_above_the_band(self):
+        # 100 is a shallower retracement than OTE_RETRACEMENT_MIN demands.
+        self.assertIsNone(
+            ms.find_break_ote_retest(self._candles(100.0), swings=self.BULLISH_SWINGS)
+        )
+
+    def test_does_not_fire_below_the_band(self):
+        # 85 is deeper than OTE_RETRACEMENT_MAX allows, but still above the
+        # leg origin - a near miss, not an invalidation.
+        self.assertIsNone(
+            ms.find_break_ote_retest(self._candles(85.0), swings=self.BULLISH_SWINGS)
+        )
+
+    def test_does_not_fire_once_the_leg_is_invalidated(self):
+        # Closing back under the leg origin kills the setup outright.
+        self.assertIsNone(
+            ms.find_break_ote_retest(self._candles(79.0), swings=self.BULLISH_SWINGS)
+        )
+
+    def test_does_not_fire_when_the_break_is_too_old(self):
+        candles = self._candles(90.0, count=40)   # break at index 5, tested ~39
+
+        self.assertIsNone(
+            ms.find_break_ote_retest(candles, swings=self.BULLISH_SWINGS)
+        )
+
+    def test_respects_an_explicit_max_age(self):
+        candles = self._candles(90.0, count=40)
+
+        self.assertIsNotNone(ms.find_break_ote_retest(
+            candles, swings=self.BULLISH_SWINGS, max_age_candles=40,
+        ))
+
+    def test_anchors_to_a_protected_level_break_not_a_previous_pivot_one(self):
+        """The 100/95/97 sequence fires a bullish BOS under the old
+        previous-pivot rule and nothing under the protected-level one. This
+        detector must see no break there at all, regardless of
+        config.STRUCTURE_PROTECTED_LEVEL_ENABLED - the whole point of it
+        calling _walk_protected_level directly."""
+        # depth-0.75 retrace of the 80->97 leg would be ~84.25 if a break
+        # were recognised at 97.
+        candles = self._candles(84.25)
+
+        for flag in (False, True):
+            with patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", flag):
+                self.assertIsNone(
+                    ms.find_break_ote_retest(candles, swings=_LOWER_HIGH_SEQUENCE)
+                )
+
+    def test_bearish_mirror(self):
+        swings = [
+            _swing(1, 80, "LOW"),
+            _swing(3, 100, "HIGH"),
+            _swing(5, 60, "LOW"),     # breaks the protected low of 80
+        ]
+        # leg = 100 -> 60, so leg size 40 and the band is
+        # 60 + 40*[0.705, 0.79] = [88.2, 91.6]
+        result = ms.find_break_ote_retest(self._candles(90.0), swings=swings)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertEqual(result["level"], 100)
+
+    def test_too_few_swings_is_none(self):
+        self.assertIsNone(
+            ms.find_break_ote_retest(self._candles(90.0),
+                                     swings=[_swing(1, 100, "HIGH")])
+        )
+
+    def test_setup_age_is_candles_since_the_break(self):
+        candles = self._candles(90.0, count=12)   # tested index 11, break at 5
+
+        result = ms.find_break_ote_retest(candles, swings=self.BULLISH_SWINGS)
+
+        self.assertEqual(result["setup_age_candles"], 6)
 
 
 class LiveBreakCheckTests(unittest.TestCase):
@@ -1048,6 +1416,107 @@ class AnchoredPoolClusteringTests(unittest.TestCase):
             with self.subTest(anchored=anchored):
                 self.assertEqual(
                     ms.find_liquidity_pools(self._swings([100.0]), anchored=anchored), [])
+
+
+class PoolTouchSeparationTests(unittest.TestCase):
+    """config.LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES (2026-09-22) -
+    find_liquidity_pools clusters purely on price, with no time axis, so a
+    run of consecutive fractal swings inside ONE impulse becomes a "pool".
+    Measured: 9.5% of pools have every touch on consecutive candles."""
+
+    def _swings(self, indexed_prices):
+        """[(index, price), ...] - index is what the separation rule reads."""
+        return [ms.SwingPoint(i, i, p, "HIGH") for i, p in indexed_prices]
+
+    # three near-equal highs on consecutive candles - one impulse, not a pool
+    ADJACENT = [(10, 100.0), (11, 100.02), (12, 100.04)]
+    # the same three prices, spread across two days
+    SEPARATED = [(10, 100.0), (30, 100.02), (60, 100.04)]
+
+    def test_default_zero_keeps_an_adjacent_cluster(self):
+        pools = ms.find_liquidity_pools(
+            self._swings(self.ADJACENT), tolerance_pct=0.01,
+            anchored=True, min_touch_separation=0,
+        )
+
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0]["touches"], 3)
+
+    def test_an_adjacent_cluster_is_dropped_once_separation_is_required(self):
+        pools = ms.find_liquidity_pools(
+            self._swings(self.ADJACENT), tolerance_pct=0.01,
+            anchored=True, min_touch_separation=5,
+        )
+
+        self.assertEqual(pools, [])
+
+    def test_a_separated_cluster_survives(self):
+        pools = ms.find_liquidity_pools(
+            self._swings(self.SEPARATED), tolerance_pct=0.01,
+            anchored=True, min_touch_separation=5,
+        )
+
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0]["touches"], 3)
+
+    def test_the_boundary_is_inclusive(self):
+        exactly_five = [(10, 100.0), (15, 100.02)]
+
+        pools = ms.find_liquidity_pools(
+            self._swings(exactly_five), tolerance_pct=0.01,
+            anchored=True, min_touch_separation=5,
+        )
+
+        self.assertEqual(len(pools), 1)
+
+    def test_span_not_pairwise_a_burst_plus_a_later_revisit_is_kept(self):
+        """The case a pairwise rule gets wrong. Four touches inside one
+        impulse and a fifth two days later IS accumulated liquidity - the
+        level was genuinely revisited - even though four of the five
+        consecutive gaps are 1 candle."""
+        burst_then_revisit = [
+            (10, 100.0), (11, 100.01), (12, 100.02), (13, 100.03), (80, 100.04),
+        ]
+
+        pools = ms.find_liquidity_pools(
+            self._swings(burst_then_revisit), tolerance_pct=0.01,
+            anchored=True, min_touch_separation=5,
+        )
+
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0]["touches"], 5)
+
+    def test_default_reads_the_config_flag(self):
+        swings = self._swings(self.ADJACENT)
+
+        with patch.object(config, "LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES", 0):
+            self.assertEqual(
+                len(ms.find_liquidity_pools(swings, tolerance_pct=0.01, anchored=True)), 1)
+
+        with patch.object(config, "LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES", 5):
+            self.assertEqual(
+                ms.find_liquidity_pools(swings, tolerance_pct=0.01, anchored=True), [])
+
+    def test_a_negative_value_is_clamped_to_no_requirement(self):
+        pools = ms.find_liquidity_pools(
+            self._swings(self.ADJACENT), tolerance_pct=0.01,
+            anchored=True, min_touch_separation=-5,
+        )
+
+        self.assertEqual(len(pools), 1)
+
+    def test_the_source_default_is_zero(self):
+        """Asserted against the source literal, not the imported value,
+        which the live .env can change."""
+        import re
+        from pathlib import Path
+
+        source = Path(config.__file__).read_text(encoding="utf-8", errors="replace")
+        self.assertIsNotNone(re.search(
+            r'LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES\s*=\s*env_int\(\s*'
+            r'"LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES"\s*,\s*0\s*\)',
+            source,
+        ))
 
 
 class OrderBlockScanLookbackTests(unittest.TestCase):

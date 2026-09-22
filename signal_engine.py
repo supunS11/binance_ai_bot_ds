@@ -445,6 +445,19 @@ def evaluate(
             ltf_candles, fvgs=ltf_analysis["fair_value_gaps"]
         )
 
+    # config.BREAK_OTE_RETEST_TRIGGER_ENABLED - the two-candle "break, then
+    # retrace to OTE" pattern, on the candle where it can actually occur (see
+    # market_structure.find_break_ote_retest, and OTE_GATE_EXEMPT_TRIGGERS in
+    # config.py for why the NOT_IN_OTE gate could never express it). Reuses
+    # the swing list ltf_analysis already computed - zero extra structure
+    # work - and costs nothing across the watchlist while the flag is off.
+    break_ote_retest = None
+
+    if config.BREAK_OTE_RETEST_TRIGGER_ENABLED:
+        break_ote_retest = market_structure.find_break_ote_retest(
+            ltf_candles, swings=ltf_analysis.get("swings")
+        )
+
     # config.CVD_DIVERGENCE_TRIGGER_ENABLED - a fifth, alternative entry
     # trigger: price's swing structure vs the CVD line at those same swing
     # points (see cvd_divergence.py). Needs its own swing computation, not
@@ -688,6 +701,13 @@ def evaluate(
             # Fresh by construction - reacts to the level breaking right
             # now, not a retest of something already formed.
             "setup_age_candles": 0,
+            # market_structure.live_break_check's descriptive classification
+            # (see its own comment, which carries the rate and why two
+            # different numbers for it exist): did this break exceed the
+            # protected extreme of the current leg, or only the most recent
+            # swing? Journaled ONLY - nothing gates on it - so the evidence
+            # exists before any decision to reject minor breaks is taken.
+            "break_is_structural": live_break.get("structural"),
         })
 
     if config.OB_FVG_RETEST_TRIGGER_ENABLED and fvg_retest is not None:
@@ -869,6 +889,21 @@ def evaluate(
             # None, not 0 - same reasoning as LIQUIDITY_SWEEP above (the
             # swept pool carries no formation index of its own).
             "setup_age_candles": None,
+        })
+
+    if config.BREAK_OTE_RETEST_TRIGGER_ENABLED and break_ote_retest is not None:
+        candidates.append({
+            "signal_trigger": "BREAK_OTE_RETEST",
+            "direction": break_ote_retest["direction"],
+            # The leg's origin - the level this setup is wrong beyond, not
+            # the break level itself (see find_break_ote_retest's own note).
+            "structure_level": break_ote_retest.get("level"),
+            "trigger_candle_open_time": break_ote_retest.get("open_time"),
+            # Candles since the BREAK, not since the leg's origin - the same
+            # "how stale is the setup" meaning OB_FVG_RETEST/ORDER_BLOCK_
+            # RETEST journal, and the exact age
+            # BREAK_OTE_RETEST_MAX_AGE_CANDLES enforced.
+            "setup_age_candles": break_ote_retest.get("setup_age_candles"),
         })
 
     if config.EMA_PULLBACK_TRIGGER_ENABLED and ema_pullback is not None:

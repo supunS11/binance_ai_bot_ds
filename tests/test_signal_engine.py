@@ -33,6 +33,24 @@ _audit_batch_patchers = [
     patch.object(config, "LIQUIDITY_SWEEP_MIN_WICK_ATR_MULTIPLE", 0.0),
     patch.object(config, "LIQUIDITY_SWEEP_SELECT_NEAREST_POOL_ENABLED", False),
     patch.object(config, "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", False),
+    # config.STRUCTURE_PROTECTED_LEVEL_ENABLED - these fixtures reach
+    # structure_state indirectly through evaluate(), and the flag decides
+    # which rule supplies trend/last_event/events. Every CHOCH_RETEST and
+    # STRUCTURE_BREAK assertion here was written against the previous-pivot
+    # rule. Pinned inert; the flag's own behaviour lives in
+    # tests/test_market_structure.py.
+    patch.object(config, "STRUCTURE_PROTECTED_LEVEL_ENABLED", False),
+    # config.BREAK_OTE_RETEST_TRIGGER_ENABLED / OTE_GATE_EXEMPT_TRIGGERS -
+    # a tenth trigger appearing in the candidate list, or NOT_IN_OTE
+    # disappearing from STRUCTURE_BREAK's profile, would change which trigger
+    # these fixtures' assertions are about. Pinned inert; their own behaviour
+    # is covered by BreakOteRetestTriggerTests / OteGateExemptTriggersTests.
+    patch.object(config, "BREAK_OTE_RETEST_TRIGGER_ENABLED", False),
+    patch.object(config, "OTE_GATE_EXEMPT_TRIGGERS", []),
+    # config.LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES - these fixtures
+    # build pools from swings at adjacent indices, so a live separation
+    # requirement would silently remove the pool a sweep assertion depends on.
+    patch.object(config, "LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES", 0),
 ]
 
 
@@ -137,6 +155,13 @@ class SignalEngineTests(unittest.TestCase):
         ema_pullback_direction=None,
         ema_pullback_level=None,
         ema_pullback_open_time=555,
+        # config.BREAK_OTE_RETEST_TRIGGER_ENABLED - mocked the same way as
+        # every other detector here; find_break_ote_retest's own logic is
+        # covered by FindBreakOteRetestTests in test_market_structure.py.
+        break_ote_retest_direction=None,
+        break_ote_retest_level=None,
+        break_ote_retest_open_time=777,
+        break_ote_retest_age=4,
         # config.CHOCH_RETEST_TRIGGER_ENABLED's real retest condition
         # (detect_level_pullback) - defaults to matching whatever
         # ltf_analysis's own CHoCH last_event already describes, so every
@@ -273,6 +298,15 @@ class SignalEngineTests(unittest.TestCase):
                 "open_time": ema_pullback_open_time,
             }
             if ema_pullback_direction else None
+        )
+        break_ote_retest = (
+            {
+                "direction": break_ote_retest_direction,
+                "level": break_ote_retest_level,
+                "open_time": break_ote_retest_open_time,
+                "setup_age_candles": break_ote_retest_age,
+            }
+            if break_ote_retest_direction else None
         )
         oi_snapshot = OI_RISING if oi_snapshot is None else oi_snapshot
         liquidation_snapshot = (
@@ -422,6 +456,7 @@ class SignalEngineTests(unittest.TestCase):
             stack.enter_context(patch.object(market_structure, "find_fvg_retest", return_value=fvg_retest))
             stack.enter_context(patch.object(market_structure, "find_order_block_retest", return_value=order_block_retest))
             stack.enter_context(patch.object(market_structure, "detect_ema_pullback", return_value=ema_pullback))
+            stack.enter_context(patch.object(market_structure, "find_break_ote_retest", return_value=break_ote_retest))
             stack.enter_context(patch.object(market_structure, "detect_level_pullback", return_value=choch_retest_result))
             stack.enter_context(patch.object(config, "LIQUIDATION_HEATMAP_ENABLED", True))
             stack.enter_context(patch.object(liquidation_heatmap, "get_liquidation_pools", return_value=liquidation_pools))
@@ -4566,6 +4601,54 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual(result["signal_trigger"], "EMA_PULLBACK")
         self.assertEqual(result["structure_level"], 88)
         self.assertEqual(result["trigger_candle_open_time"], 321)
+
+    # config.BREAK_OTE_RETEST_TRIGGER_ENABLED - 2026-09-22 Phase 1d. The
+    # two-candle "break, then retrace to OTE" pattern NOT_IN_OTE claims to
+    # enforce but tests on one candle. find_break_ote_retest is mocked here
+    # (see _run()'s break_ote_retest_* params).
+
+    def test_break_ote_retest_produces_no_candidate_when_disabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "BREAK_OTE_RETEST_TRIGGER_ENABLED", False):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                break_ote_retest_direction="BULLISH", break_ote_retest_level=80,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_break_ote_retest_triggered_signal_when_enabled(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "BREAK_OTE_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                break_ote_retest_direction="BULLISH", break_ote_retest_level=80,
+                break_ote_retest_open_time=777,
+            )
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "BREAK_OTE_RETEST")
+        # the leg ORIGIN, not the break level
+        self.assertEqual(result["structure_level"], 80)
+        self.assertEqual(result["trigger_candle_open_time"], 777)
+
+    def test_break_ote_retest_journals_candles_since_the_break(self):
+        analysis = dict(LTF_BULLISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "BREAK_OTE_RETEST_TRIGGER_ENABLED", True):
+            result = self._run(
+                ltf_analysis=analysis, sweep_direction=None,
+                break_ote_retest_direction="BULLISH", break_ote_retest_level=80,
+                break_ote_retest_age=7,
+            )
+
+        self.assertEqual(result["setup_age_candles"], 7)
 
     def test_liquidation_sweep_confirmed_takes_priority_over_ema_pullback(self):
         analysis = dict(LTF_BULLISH_BREAK)

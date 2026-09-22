@@ -316,6 +316,30 @@ class TriggerEvidenceJournalTests(unittest.TestCase):
         for baked in ("liquidation_cluster", "liquidation_aligned", "cvd_confirmed"):
             self.assertNotIn(baked, row)
 
+    def test_break_is_structural_is_blank_for_non_structure_break_triggers(self):
+        """Blank, not 0 - every trigger other than STRUCTURE_BREAK has no
+        break to classify, and "no break" must not read as "minor break"
+        when this column is analysed."""
+        self._append()
+
+        self.assertEqual(self._rows()[0]["break_is_structural"], "")
+
+    def test_break_is_structural_is_written_as_one_or_zero(self):
+        self._append(candidates=[{
+            "signal_trigger": "STRUCTURE_BREAK", "direction": "BULLISH",
+            "structure_level": 98.5, "setup_age_candles": 0,
+            "break_is_structural": True,
+        }])
+        self.assertEqual(self._rows()[0]["break_is_structural"], "1")
+
+        signal_journal._evidence_seen.clear()
+        self._append(candles_open_time=1788663600000, candidates=[{
+            "signal_trigger": "STRUCTURE_BREAK", "direction": "BEARISH",
+            "structure_level": 98.5, "setup_age_candles": 0,
+            "break_is_structural": False,
+        }])
+        self.assertEqual(self._rows()[1]["break_is_structural"], "0")
+
     def test_one_row_per_candidate(self):
         self._append(candidates=[
             {"signal_trigger": "ORDER_BLOCK_RETEST", "direction": "BULLISH",

@@ -452,6 +452,43 @@ VP_INSIDE_VALUE_AREA_REQUIRED_ENABLED = env_bool("VP_INSIDE_VALUE_AREA_REQUIRED_
 # =========================
 SWING_LEFT = env_int("SWING_LEFT", 2)
 SWING_RIGHT = env_int("SWING_RIGHT", 2)
+# 2026-09-22 ground-up detector audit, Phase 1. market_structure.
+# _classify_swings fires a "trend break" whenever the newest pivot exceeds
+# the IMMEDIATELY PRECEDING pivot of the same kind - never the protected
+# extreme that defines the current leg. The system had no concept of a
+# structural level at all. Highs of 100, 95, 97 fire a bullish BOS at 97
+# while 100 stands unbroken.
+#
+# Measured, 110 symbols x 30 days of 1h klines, 14,125 evaluations:
+#
+#   events not exceeding the structural extreme    55.5%
+#     CHoCH                                        71.9%
+#     BOS                                          36.4%
+#   CHoCH OUTNUMBERS BOS (40,990 vs 35,188) - backwards for real markets,
+#   where continuation should dominate reversal.
+#
+# Against market_structure._walk_protected_level, last_event - the field
+# CHOCH_RETEST, ltf_analysis["trend"] and the HTF swing age all read -
+# agrees on TYPE 54.3%, DIRECTION 66.5%, INDEX 47.8% of the time.
+#
+# What turning this ON would do (same replay):
+#   total events           76,178 -> 41,960   (-44.9%)
+#   CHoCH                  40,990 -> 14,258   (-65.2%)
+#   CHOCH_RETEST candidates    67 ->     19   (-71.6%, and 5 of the 19 are
+#                                      NEW - genuine reversals the current
+#                                      rule had already mislabelled as
+#                                      continuation; 0 direction conflicts)
+#   ORDER_BLOCK_RETEST blocks  -13.1% net, but only 47.7% of today's blocks
+#                              survive - a TURNOVER, not a reduction
+#
+# Ships OFF and is deliberately NOT set in .env yet. This is a larger lever
+# than any flag deployed to date: it changes the trend label on ~46% of
+# evaluations, which feeds AGAINST_HTF_BIAS / LTF_TREND_OPPOSED /
+# HTF_TREND_STALE. Every per-gate measurement in this file was taken on the
+# CURRENT classifier's candidate population and needs re-deriving before
+# this is enabled - the same era-contamination discipline the reject-journal
+# work already follows, applied one layer further upstream.
+STRUCTURE_PROTECTED_LEVEL_ENABLED = env_bool("STRUCTURE_PROTECTED_LEVEL_ENABLED", "False")
 STRUCTURE_LOOKBACK_CANDLES = env_int("STRUCTURE_LOOKBACK_CANDLES", 150)
 FVG_LOOKBACK_CANDLES = env_int("FVG_LOOKBACK_CANDLES", 50)
 LIQUIDITY_POOL_TOLERANCE_PCT = env_float("LIQUIDITY_POOL_TOLERANCE_PCT", 0.001)
@@ -477,6 +514,38 @@ LIQUIDITY_POOL_TOLERANCE_PCT = env_float("LIQUIDITY_POOL_TOLERANCE_PCT", 0.001)
 # untouched. Default False reproduces today's chaining exactly.
 LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED = env_bool(
     "LIQUIDITY_POOL_ANCHORED_CLUSTERING_ENABLED", "False"
+)
+# 2026-09-22 detector audit, Phase 1. find_liquidity_pools clusters purely on
+# PRICE - it has no time axis at all. A pool is supposed to be multiple
+# SEPARATE VISITS to a level, which is what makes stops accumulate there; a
+# run of consecutive fractal swings inside a single impulse is not that,
+# however close in price the touches sit.
+#
+# Measured (110 symbols x 30 days of 1h klines, 22,744 pools):
+#   every touch on CONSECUTIVE candles   9.5%
+#   touches spanning <= 3 candles       13.4%
+#   touches spanning <= 10 candles      32.9%
+#
+# Sizing the requirement (30 symbols x 30 days, 5,220 evaluations):
+#   min sep    pools kept    LIQUIDITY_SWEEP detections kept
+#        0        100.0%              100.0%   <- today
+#        3         88.8%               92.7%
+#        5         86.3%               89.4%
+#        8         74.4%               79.9%
+#       12         66.2%               74.6%
+#       20         53.2%               60.0%
+#
+# 5 is the value to use, and it is DERIVED rather than fitted: SWING_LEFT and
+# SWING_RIGHT are both 4, so the fractal window is 9 candles and two same-kind
+# swings fewer than 5 apart sit inside one window - they cannot be independent
+# visits. That it also removes 13.7% of pools, closely matching the 13.4%
+# measured at span <= 3, is corroboration rather than the reason.
+#
+# A SPAN test (first touch to last), not pairwise - see find_liquidity_pools'
+# own docstring for why. Ships at 0 (no requirement, byte-identical to
+# before); .env opts in.
+LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES = env_int(
+    "LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES", 0
 )
 # How far back find_order_block scans from a confirmed break for the last
 # opposite-coloured candle. Was a hardcoded 10 until 2026-09-22 (audit D6) -
@@ -1091,6 +1160,27 @@ OI_LOOKBACK_SECONDS = env_int("OI_LOOKBACK_SECONDS", 900)
 # samples = ~24h at the default poll interval - cheap (one float per
 # sample) and a reasoned starting point, not calibrated against how far
 # apart real swing pairs actually land.
+#
+# 2026-09-22 Phase 1d - THAT CALIBRATION, and 24h is not enough. Real
+# distance between the two swings oi_divergence actually compares
+# (30 symbols x 30 days of 1h klines, 10,440 pairs):
+#
+#   p25 17.0h   MEDIAN 22.0h   p75 29.0h   p90 36.0h
+#   41.0% of pairs reference a swing OLDER than the retained history
+#
+# _oi_at_or_before returns None for those, and a None silently reads as "no
+# divergence" - the detector cannot tell missing data from a real absence, so
+# it has been running at ~59% capability with the loss biased toward the
+# longer-span divergences, which are the more meaningful ones.
+#
+# The lever chosen is OI_POLL_INTERVAL_SECONDS (60 -> 120), NOT this number.
+# Measured 112 bytes per sample across a 401-symbol watchlist:
+#   1440 @  60s = 24h,  65 MB   <- was
+#   2880 @  60s = 48h, 129 MB   (+65 MB)
+#   1440 @ 120s = 48h,  65 MB   (+0, and HALVES the OI REST load)
+# Same coverage for no memory and less API pressure on the 2400/min budget
+# shared with the live bot. Raise this number instead only if 48h ever turns
+# out to be short - p90 is 36h, so it should not.
 OI_HISTORY_MAX_SAMPLES = env_int("OI_HISTORY_MAX_SAMPLES", 1440)
 # Evidence (2026-08-08, live, WATCHING=519): a large watchlist includes
 # symbols the OI endpoint will never answer for - delisted/settling/
@@ -1995,6 +2085,35 @@ HTF_TREND_STALE_SKIP_FOR_REVERSAL_TRIGGERS_ENABLED = env_bool(
 # per-trigger default from day one rather than re-deriving it as an
 # opt-in.
 OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED = env_bool("OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED", "True")
+# 2026-09-22 detector audit, Phase 1d. The reasoning in the comment above is
+# sound and the code does not implement it. "Structure break, THEN retrace to
+# OTE" is a TWO-CANDLE pattern; NOT_IN_OTE checks both halves SIMULTANEOUSLY
+# on the break candle itself, which demands a state that cannot exist.
+#
+# Measured, 30 symbols x 30 days of 1h klines, 15,600 evaluations:
+#
+#   STRUCTURE_BREAK detections                       5,222
+#   pass BOTH zone gates (today)                        69     1.3%
+#   pass premium/discount once NOT_IN_OTE is removed   631    12.1%   9.1x
+#   blocked by NOT_IN_OTE alone                               98.4%
+#
+#   retracement depth when STRUCTURE_BREAK fires (0 = at the extreme):
+#     p10 0.028   p25 0.071   MEDIAN 0.158   p75 0.322   p90 0.533
+#   depth the OTE band demands:  0.705 - 0.79
+#   detections landing inside the band:  28 of 1,756  (1.6%)
+#
+# A break fires AT an extreme; OTE requires price to have ALREADY retraced
+# 70-79% away from it. This went unnoticed for so long because NOT_IN_OTE is
+# not in REJECT_JOURNAL_REASONS - the deaths are invisible in the journal.
+#
+# Ships EMPTY. Setting STRUCTURE_BREAK here removes only the impossible
+# condition; the coherent one (premium/discount) still blocks 87.9% of what
+# survives. The two-candle pattern the comment describes is implemented
+# properly as its own trigger - see BREAK_OTE_RETEST_TRIGGER_ENABLED - and
+# enabling that first is the recommended order, since this list adds volume
+# to the one trigger whose minor-break rate (~49%, see market_structure.
+# live_break_check) still has no outcome data behind it.
+OTE_GATE_EXEMPT_TRIGGERS = env_str_list("OTE_GATE_EXEMPT_TRIGGERS", [])
 # Carried forward, same audit: CVD_DIVERGENCE fires when price and CVD
 # *disagree* at swing points; CVD_NOT_CONFIRMED then separately requires
 # the RECENT-WINDOW CVD score to already *agree* with that same new
@@ -2047,7 +2166,7 @@ def trigger_gate_profiles():
     for trigger in (
         "STRUCTURE_BREAK", "OB_FVG_RETEST", "LIQUIDITY_SWEEP", "CHOCH_RETEST",
         "CVD_DIVERGENCE", "ORDER_BLOCK_RETEST", "OI_DIVERGENCE",
-        "LIQUIDATION_SWEEP_CONFIRMED", "EMA_PULLBACK",
+        "LIQUIDATION_SWEEP_CONFIRMED", "EMA_PULLBACK", "BREAK_OTE_RETEST",
     ):
         gates = set(all_variable_gates)
 
@@ -2071,6 +2190,18 @@ def trigger_gate_profiles():
             gates.discard("MARKET_CHOPPY")
 
         if OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED and trigger != "STRUCTURE_BREAK":
+            gates.discard("NOT_IN_OTE")
+
+        # OTE_GATE_EXEMPT_TRIGGERS - deliberately a SEPARATE discard from the
+        # structure-break-only skip above, not an extension of it. That one
+        # encodes a scoping claim ("only STRUCTURE_BREAK has a structural
+        # reason to sit in this band"); this one encodes a measured claim
+        # ("the band and the trigger are incompatible"). Same separation, and
+        # for the same reason, as MARKET_CHOPPY_EXEMPT_TRIGGERS sitting apart
+        # from the reversal-trigger skip. Note the two levers point opposite
+        # ways: turning OTE_GATE_STRUCTURE_BREAK_ONLY_ENABLED off would apply
+        # NOT_IN_OTE to EVERY trigger, so it cannot express this.
+        if trigger in OTE_GATE_EXEMPT_TRIGGERS:
             gates.discard("NOT_IN_OTE")
 
         if trigger in _OB_FVG_TAUTOLOGICAL_TRIGGERS:
@@ -2317,6 +2448,42 @@ EMA_PULLBACK_REQUIRE_TREND_ENABLED = env_bool(
 # for the HTF slope read (HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES) - same
 # helper, same span, no second concept.
 EMA_PULLBACK_TREND_LOOKBACK_CANDLES = env_int("EMA_PULLBACK_TREND_LOOKBACK_CANDLES", 3)
+# Tenth entry trigger (2026-09-22 detector audit, Phase 1d). The two-candle
+# pattern NOT_IN_OTE has always claimed to enforce and never could: structure
+# broke up to BREAK_OTE_RETEST_MAX_AGE_CANDLES ago, and price has NOW retraced
+# into the OTE band OF THE BROKEN LEG. See market_structure.
+# find_break_ote_retest and OTE_GATE_EXEMPT_TRIGGERS above for why the
+# existing gate cannot express this.
+#
+# Not a relaxation of anything - it fires on a DIFFERENT candle than
+# STRUCTURE_BREAK does, on a condition no current trigger tests. Sizing
+# measured against THIS detector as shipped (30 symbols x 30 days of 1h
+# klines, 15,600 evaluations):
+#
+#   setups found                                209   1.34% of bars
+#     BULLISH 128 / BEARISH 81
+#   ALSO clear the premium/discount gate         70   33.5%
+#     (raw STRUCTURE_BREAK clears it: 12.1%)
+#   entry retracement depth, leg-anchored:  p10 0.713  median 0.742  p90 0.783
+#   overlap with OB_FVG_RETEST / ORDER_BLOCK_RETEST firing the same bar and
+#   side: 35.9% - so 64.1% are setups nothing else currently catches.
+#
+# An earlier estimate said 543 setups / 57.5% zone-clearing. That was measured
+# with the leg's break identified by live_break_check; this detector uses the
+# stricter _walk_protected_level anchor, which requires the break to clear the
+# protected extreme. Fewer, larger legs qualify - hence 209, not 543, and
+# 33.5%, not 57.5%. The numbers above are the ones that describe the code.
+#
+# 33.5% vs STRUCTURE_BREAK's 12.1% is still the finding that matters: waiting
+# for the retrace roughly triples how often the OTE band and the
+# premium/discount gate agree. They were never in conflict with each other -
+# the break candle was in conflict with both.
+BREAK_OTE_RETEST_TRIGGER_ENABLED = env_bool("BREAK_OTE_RETEST_TRIGGER_ENABLED", "False")
+# How long a break stays eligible for its retrace. 12 candles is the window
+# the sizing above used, not a tuned value - a retrace that takes longer than
+# half a day on 1h is not obviously the same setup any more, but nothing has
+# measured where the real boundary sits.
+BREAK_OTE_RETEST_MAX_AGE_CANDLES = env_int("BREAK_OTE_RETEST_MAX_AGE_CANDLES", 12)
 
 # =========================
 # RISK MANAGEMENT (ported convention from v7/v8)

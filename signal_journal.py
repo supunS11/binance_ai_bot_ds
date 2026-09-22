@@ -270,6 +270,14 @@ EVIDENCE_JOURNAL_PATH = Path(__file__).resolve().parent / "data" / "trigger_evid
 EVIDENCE_FIELDNAMES = [
     "timestamp", "candle_open_time", "symbol", "signal_trigger", "direction",
     "entry_price", "atr", "htf_atr", "structure_level", "setup_age_candles",
+    # market_structure.live_break_check's `structural` classification, carried
+    # on STRUCTURE_BREAK candidates only (blank for every other trigger, which
+    # has no break to classify). 1/0, never True/False, matching
+    # liq_available's shape. Descriptive - nothing gates on it. Exists so the
+    # minor-break rate measured on 2026-09-22 (~49% under this field's own
+    # definition - see live_break_check's comment) can be checked against real
+    # outcomes before any flag rejects on it.
+    "break_is_structural",
     # order flow (order_flow.CVDEngine.snapshot)
     "cvd_score", "cvd_sample_count", "whale_notional", "whale_direction",
     # order book (orderbook.DepthEngine.snapshot)
@@ -397,6 +405,14 @@ def append_trigger_evidence(
         row["direction"] = _blank(direction)
         row["structure_level"] = _blank(candidate.get("structure_level"))
         row["setup_age_candles"] = _blank(candidate.get("setup_age_candles"))
+        # STRUCTURE_BREAK only - every other trigger leaves it blank, which
+        # is the honest reading ("no break to classify"), not False.
+        # int(bool(...)) matches liq_available's 1/0 shape rather than
+        # writing Python's "True"/"False" into a CSV column.
+        structural = candidate.get("break_is_structural")
+        row["break_is_structural"] = (
+            "" if structural is None else int(bool(structural))
+        )
         rows.append(row)
 
     if not rows:
