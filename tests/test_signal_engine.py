@@ -51,6 +51,11 @@ _audit_batch_patchers = [
     # build pools from swings at adjacent indices, so a live separation
     # requirement would silently remove the pool a sweep assertion depends on.
     patch.object(config, "LIQUIDITY_POOL_MIN_TOUCH_SEPARATION_CANDLES", 0),
+    # config.STRUCTURE_BREAK_MINOR_REJECT_ENABLED - default False anyway,
+    # but pinned explicitly since STRUCTURE_BREAK fixtures in this module
+    # build live_break dicts directly and several omit "structural"
+    # entirely; a live True here would change what those assert about.
+    patch.object(config, "STRUCTURE_BREAK_MINOR_REJECT_ENABLED", False),
 ]
 
 
@@ -2978,6 +2983,56 @@ class SignalEngineTests(unittest.TestCase):
 
         self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
         self.assertEqual(result["setup_age_candles"], 0)
+
+    # config.STRUCTURE_BREAK_MINOR_REJECT_ENABLED - 2026-09-23 audit item #1.
+    # live_break_check's own `structural` field, measured against real
+    # outcomes: structural=False candidates carry NEGATIVE expectancy
+    # (-0.1473R) while structural=True ones are positive (+0.0951R) - see
+    # this flag's config.py comment for the full replay.
+
+    def _minor_break_analysis(self, structural):
+        live_break = dict(LTF_BULLISH_BREAK["live_break"])
+        live_break["structural"] = structural
+        return dict(LTF_BULLISH_BREAK, live_break=live_break)
+
+    def test_minor_break_unaffected_when_flag_off(self):
+        # sweep_direction=None - the default fixture also produces a
+        # LIQUIDITY_SWEEP candidate; isolating STRUCTURE_BREAK avoids that
+        # candidate silently winning once TRIGGER_QUALITY_RANKING_ENABLED
+        # falls through to it, same isolation every sibling test here uses.
+        with patch.object(config, "STRUCTURE_BREAK_MINOR_REJECT_ENABLED", False):
+            result = self._run(sweep_direction=None,
+                               ltf_analysis=self._minor_break_analysis(False))
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+
+    def test_minor_break_rejected_when_flag_on(self):
+        with patch.object(config, "STRUCTURE_BREAK_MINOR_REJECT_ENABLED", True):
+            result = self._run(sweep_direction=None,
+                               ltf_analysis=self._minor_break_analysis(False))
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "STRUCTURE_BREAK_MINOR")
+
+    def test_real_break_unaffected_when_flag_on(self):
+        with patch.object(config, "STRUCTURE_BREAK_MINOR_REJECT_ENABLED", True):
+            result = self._run(sweep_direction=None,
+                               ltf_analysis=self._minor_break_analysis(True))
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+
+    def test_unreadable_structural_fails_open_when_flag_on(self):
+        # structural=None (protected extremes unavailable) must never
+        # reject on its own - same fail-open convention as every other
+        # read in this engine. LTF_BULLISH_BREAK's own live_break already
+        # omits "structural" entirely, so this is byte-identical to it.
+        with patch.object(config, "STRUCTURE_BREAK_MINOR_REJECT_ENABLED", True):
+            result = self._run(sweep_direction=None,
+                               ltf_analysis=self._minor_break_analysis(None))
+
+        self.assertEqual(result["signal"], "BUY")
 
     def test_setup_age_is_zero_for_ema_pullback(self):
         with patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", True):

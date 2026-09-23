@@ -1850,6 +1850,26 @@ def evaluate(
             if side == "SELL" and depth_imbalance > min_depth:
                 return _reject("DEPTH_OPPOSING")
 
+        # STRUCTURE_BREAK_MINOR - config.STRUCTURE_BREAK_MINOR_REJECT_ENABLED.
+        # Same family as CHOCH_RETEST_DEPTH_WEAK/OB_FVG_RETEST_DEPTH_WEAK
+        # below: does THIS trigger's own construction indicate genuine
+        # strength, not a downstream market-context read. live_break is
+        # evaluate()'s own variable (captured by closure, same as
+        # depth_snapshot/zone above) - the live_break_check.structural field
+        # its own config.py comment carries the real evidence for.
+        #
+        # `is False` deliberately, not falsy: None (protected extremes
+        # unavailable) fails OPEN, same convention as every other read in
+        # this engine. Trigger-scoped - every other trigger's candidates
+        # never touch live_break at all, so this can only ever affect
+        # STRUCTURE_BREAK.
+        if (
+            trigger == "STRUCTURE_BREAK"
+            and config.STRUCTURE_BREAK_MINOR_REJECT_ENABLED
+            and live_break.get("structural") is False
+        ):
+            return _reject("STRUCTURE_BREAK_MINOR")
+
         # DEPTH_TREND_UNSTABLE - config.DEPTH_TREND_MIN_CONSISTENCY_REJECT_
         # ENABLED. Catches the gap DEPTH_OPPOSING above can't: an
         # instantaneous EMA'd reading that passes but was actually just a

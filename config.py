@@ -489,6 +489,27 @@ SWING_RIGHT = env_int("SWING_RIGHT", 2)
 # this is enabled - the same era-contamination discipline the reject-journal
 # work already follows, applied one layer further upstream.
 STRUCTURE_PROTECTED_LEVEL_ENABLED = env_bool("STRUCTURE_PROTECTED_LEVEL_ENABLED", "False")
+# 2026-09-23 - the audit item this flag's own live_break_check.structural
+# field was built to answer. Re-detected STRUCTURE_BREAK against real
+# klines with THIS flag on (447 symbols, 30 days, 17,859 candidates):
+#
+#   structural=True  (real break)   n=8,202  win=56.6%  netR=+0.0951
+#   structural=False (minor break)  n=9,657  win=44.5%  netR=-0.1473
+#   LIFT +0.2423R, 95% CI [+0.2111, +0.2736], split-half STABLE both cohorts
+#
+# Opposite-sign populations, not just a weaker one - minor breaks lose
+# money on their own, and they are 54% of ALL STRUCTURE_BREAK volume
+# (9,657 of 17,859). This is the first time structural has been checked
+# against real outcomes at all.
+#
+# Ships OFF despite the strength of the evidence: STRUCTURE_BREAK is the
+# always-on, highest-priority trigger, and enabling this roughly HALVES its
+# effective flow - the same "prove inert, enable as a separate decision"
+# discipline every flag this session has followed, applied here because of
+# how large a lever this one is, not because the evidence is thin.
+STRUCTURE_BREAK_MINOR_REJECT_ENABLED = env_bool(
+    "STRUCTURE_BREAK_MINOR_REJECT_ENABLED", "False"
+)
 STRUCTURE_LOOKBACK_CANDLES = env_int("STRUCTURE_LOOKBACK_CANDLES", 150)
 FVG_LOOKBACK_CANDLES = env_int("FVG_LOOKBACK_CANDLES", 50)
 LIQUIDITY_POOL_TOLERANCE_PCT = env_float("LIQUIDITY_POOL_TOLERANCE_PCT", 0.001)
@@ -2066,6 +2087,21 @@ AGAINST_HTF_BIAS_SHADOW_PROBE_EXCLUDE_TRIGGERS = env_str_list(
 # NOT_IN_PREMIUM_EXEMPT_TRIGGERS. Reject-only-safer: can only ever let
 # MORE trades through, never fewer. Default empty, so this is a no-op
 # until the operator opts specific triggers in.
+#
+# 2026-09-23 CORRECTION - the evidence above did not survive re-derivation.
+# Re-detected ORDER_BLOCK_RETEST against real klines using TODAY's detector
+# (STRUCTURE_PROTECTED_LEVEL_ENABLED + ORDER_BLOCK_RETEST_MIN_CLOSE_
+# THROUGH_PCT=0.5), with real 4h-derived HTF trend, not the reject journal:
+#
+#   09-15 evidence (above)   n=431  win=40.8%  avg_r=+0.2251
+#   09-23 re-derivation      n=405  win=49.1%  avg_r=-0.0157
+#     split-half STABLE, both negative
+#
+# The 09-15 window (2026-09-05..2026-09-21) is when TP1_R_MULTIPLE was
+# 2.0R, later reverted for cause, and predates both fixes above. The
+# exempted population is no longer a winner - .env now ships this list
+# EMPTY. Left here, not deleted, so the next reader sees both numbers and
+# why they diverge rather than re-discovering the same trap.
 AGAINST_HTF_BIAS_EXEMPT_TRIGGERS = env_str_list("AGAINST_HTF_BIAS_EXEMPT_TRIGGERS", [])
 # Same reasoning and same exempt-trigger group as AGAINST_HTF_BIAS above -
 # HTF_TREND_STALE is just a second, faster-updating measure of the same
