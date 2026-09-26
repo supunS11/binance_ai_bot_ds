@@ -351,6 +351,26 @@ def evaluate(
         elif latest_ltf_close < ltf_trend_ema:
             ltf_trend_live = "BEARISH"
 
+    # config.LTF_TREND_SLOPE_TRIGGERS - is the 1h EMA20 itself rising or
+    # falling, as opposed to where price sits relative to it (ltf_trend_live
+    # just above). Direction-independent, so hoisted here with its sibling.
+    # Reuses ltf_trend_ema rather than recomputing the same EMA. See that
+    # flag's config.py comment for the held-out evidence and for why this
+    # exists instead of retuning AGAINST_HTF_BIAS's 4h read.
+    ltf_trend_slope = None
+
+    if ltf_trend_ema is not None:
+        ltf_trend_ema_prior = market_structure.ema_prior_value(
+            ltf_candles, period=config.LTF_TREND_EMA_PERIOD,
+            candles_back=config.LTF_TREND_SLOPE_LOOKBACK_CANDLES,
+        )
+
+        if ltf_trend_ema_prior is not None:
+            if ltf_trend_ema > ltf_trend_ema_prior:
+                ltf_trend_slope = "BULLISH"
+            elif ltf_trend_ema < ltf_trend_ema_prior:
+                ltf_trend_slope = "BEARISH"
+
     # config.EMA_TREND_MIXED_REJECT_ENABLED - EMA50-vs-EMA200 regime on each
     # timeframe, read off the dedicated deeper buffers (ws_client.
     # trend_candles/htf_trend_candles) rather than the 200-deep structure
@@ -692,7 +712,11 @@ def evaluate(
     # lookups either way.
     candidates = []
 
-    if live_break.get("broken"):
+    # config.STRUCTURE_BREAK_TRIGGER_ENABLED - see that flag's own comment.
+    # Until 2026-09-26 this candidate was appended unconditionally, the only
+    # trigger here without an enable gate; it defaults True, so this is inert
+    # unless .env turns it off for a one-trigger-at-a-time Phase 2 stage.
+    if config.STRUCTURE_BREAK_TRIGGER_ENABLED and live_break.get("broken"):
         candidates.append({
             "signal_trigger": "STRUCTURE_BREAK",
             "direction": live_break["direction"],
@@ -1293,6 +1317,23 @@ def evaluate(
             if ltf_side and side != ltf_side:
                 return _reject("LTF_TREND_OPPOSED")
 
+        # config.LTF_TREND_SLOPE_TRIGGERS - the 1h EMA20's own SLOPE, placed
+        # beside its price-vs-EMA sibling above so both 1h trend reads sit
+        # together. Deliberately an APPLY list rather than the universal
+        # treatment above or an exempt list: its evidence is
+        # ORDER_BLOCK_RETEST-only (290 held-out symbols, +0.0257R pooled on the
+        # zone-OK population, SELL-concentrated), so it must stay inert for
+        # triggers that have not been measured. Fails open on a None slope
+        # (too little history, or an exactly flat EMA), same convention as
+        # ltf_trend_live/htf_trend_live. Reason carries no continuous value,
+        # keeping main.py's reject tally aggregatable.
+        if (
+            trigger in config.LTF_TREND_SLOPE_TRIGGERS
+            and ltf_trend_slope is not None
+            and ltf_trend_slope != direction
+        ):
+            return _reject("LTF_TREND_SLOPE_OPPOSED")
+
         # config.EMA_TREND_MIXED_REJECT_ENABLED - the operator's "Mixed"
         # gate. Counts how many of the two EMA50/200 regimes agree with this
         # side; ONLY the 1-of-2 (MIXED) bucket rejects.
@@ -1485,15 +1526,13 @@ def evaluate(
             return _reject(f"NOT_IN_DISCOUNT price_zone={price_zone}")
 
         # config.NOT_IN_PREMIUM_EXEMPT_TRIGGERS (2026-09-13, see config.py's
-        # own comment for the full per-trigger evidence table and the
-        # 2026-09-14 correction) - ORDER_BLOCK_RETEST/CHOCH_RETEST showed a
-        # real, split-half-consistent positive expectancy in their blocked
-        # population under strict exact-match grouping; STRUCTURE_BREAK/
-        # LIQUIDITY_SWEEP looked the same only under a looser multi-trigger-
-        # row grouping and were removed once independent review caught that.
-        # Every other trigger stays gated. NOT_IN_DISCOUNT above is
-        # deliberately untouched - separately confirmed protective, no
-        # per-trigger breakdown done for it.
+        # own comment for the full per-trigger evidence table, the
+        # 2026-09-14 correction, and the 2026-09-26 correction that removed
+        # ORDER_BLOCK_RETEST after net-of-fees re-derivation found its
+        # exempted SELL population was the losing one). Only CHOCH_RETEST
+        # remains in the default list now. Every other trigger stays gated.
+        # NOT_IN_DISCOUNT above is deliberately untouched - separately
+        # confirmed protective, no per-trigger breakdown done for it.
         if (
             side == "SELL" and price_zone != "PREMIUM"
             and trigger not in config.NOT_IN_PREMIUM_EXEMPT_TRIGGERS

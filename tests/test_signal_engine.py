@@ -56,6 +56,27 @@ _audit_batch_patchers = [
     # build live_break dicts directly and several omit "structural"
     # entirely; a live True here would change what those assert about.
     patch.object(config, "STRUCTURE_BREAK_MINOR_REJECT_ENABLED", False),
+    # config.STRUCTURE_BREAK_TRIGGER_ENABLED / LIQUIDITY_SWEEP_TRIGGER_ENABLED
+    # - pinned TRUE (not inert-False like the rest of this list), because both
+    # are now False in the live .env for the 2026-09-26 Phase 2 staging that
+    # runs ORDER_BLOCK_RETEST alone. These fixtures build a live_break and a
+    # sweep pool directly and assert on the resulting candidates - including
+    # two tests that assert the exact triggers list
+    # (["LIQUIDITY_SWEEP", "STRUCTURE_BREAK"]) - so the live values would
+    # remove the very triggers those assertions are about. True is what every
+    # assertion in this module was written against. Each flag's own gating
+    # behaviour is covered separately (StructureBreakTriggerEnabledTests
+    # below; the sweep trigger's own tests enable it locally).
+    patch.object(config, "STRUCTURE_BREAK_TRIGGER_ENABLED", True),
+    patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", True),
+    # config.LTF_TREND_SLOPE_TRIGGERS - live .env sets this to
+    # ORDER_BLOCK_RETEST, so every OBR fixture in this module would newly pass
+    # through a 1h-EMA-slope reject whose direction these fixtures never
+    # controlled for (their ltf_candles are minimal and mostly cannot even
+    # produce an EMA, but where they can the slope is incidental). Pinned inert
+    # (empty) - the gate's own behaviour is covered by
+    # LtfTrendSlopeGateTests below.
+    patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", []),
 ]
 
 
@@ -5636,6 +5657,171 @@ class TriggerEvidenceJournalIsInertTests(unittest.TestCase):
                                  "dedupe must give one row per trigger/direction")
 
             signal_journal._evidence_seen.clear()
+
+
+class LtfTrendSlopeGateTests(unittest.TestCase):
+    """config.LTF_TREND_SLOPE_TRIGGERS (2026-09-26) - rejects when the 1h EMA20
+    is sloping AGAINST the trade. An APPLY list, not an exempt list: its
+    evidence is ORDER_BLOCK_RETEST-only, so it must stay inert for every
+    trigger not explicitly named.
+
+    Fixture note: _run mocks market_structure.ema_prior_value with a FLAT
+    return_value=htf_trend_ema_prior (line ~490), so that one kwarg supplies
+    the prior EMA for BOTH the 4h strength check and this 1h slope read. Here
+    it is driven together with ltf_trend_ema to set the slope direction:
+    ltf_trend_ema > htf_trend_ema_prior reads BULLISH, below it BEARISH.
+    HTF_TREND_EMA_PRIMARY_ENABLED stays pinned False by _run, so the 4h
+    strength gate that shares the kwarg stays inert."""
+
+    _run = SignalEngineTests._run
+
+    # sweep_direction=None throughout: _run's default also builds a BULLISH
+    # LIQUIDITY_SWEEP candidate, and because this gate is PER-TRIGGER, rejecting
+    # STRUCTURE_BREAK simply lets that un-scoped candidate win instead (a real
+    # behaviour, found while writing these - a scoped gate does not suppress the
+    # signal, only that one candidate). Isolating the trigger keeps these tests
+    # about the gate rather than about candidate selection.
+    def test_rejects_when_slope_opposes_the_trade(self):
+        # default _run() is a BULLISH/BUY STRUCTURE_BREAK; EMA 100 vs prior
+        # 105 slopes DOWN, against the BUY.
+        with patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", ["STRUCTURE_BREAK"]):
+            result = self._run(ltf_trend_ema=100.0, htf_trend_ema_prior=105.0,
+                               sweep_direction=None)
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "LTF_TREND_SLOPE_OPPOSED")
+
+    def test_allows_when_slope_agrees_with_the_trade(self):
+        with patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", ["STRUCTURE_BREAK"]):
+            result = self._run(ltf_trend_ema=100.0, htf_trend_ema_prior=95.0,
+                               sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+
+    def test_inert_for_a_trigger_not_in_the_apply_list(self):
+        # Same opposing slope as the reject test above, but the firing trigger
+        # is not named - the gate must not fire. This is the scoping guarantee
+        # the ORDER_BLOCK_RETEST-only evidence depends on.
+        with patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", ["ORDER_BLOCK_RETEST"]):
+            result = self._run(ltf_trend_ema=100.0, htf_trend_ema_prior=105.0,
+                               sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+
+    def test_inert_when_list_is_empty(self):
+        with patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", []):
+            result = self._run(ltf_trend_ema=100.0, htf_trend_ema_prior=105.0,
+                               sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_fails_open_on_a_flat_ema(self):
+        # Exactly equal EMA and prior EMA -> no direction -> must not reject,
+        # same fail-open convention as ltf_trend_live/htf_trend_live.
+        with patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", ["STRUCTURE_BREAK"]):
+            result = self._run(ltf_trend_ema=100.0, htf_trend_ema_prior=100.0,
+                               sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_fails_open_without_an_ltf_ema(self):
+        # ltf_trend_ema None (the _run default) -> slope never computed.
+        with patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", ["STRUCTURE_BREAK"]):
+            result = self._run(htf_trend_ema_prior=105.0, sweep_direction=None)
+
+        self.assertEqual(result["signal"], "BUY")
+
+    def test_gates_order_block_retest_when_scoped_to_it(self):
+        # The actual live configuration: scoped to ORDER_BLOCK_RETEST, which
+        # must therefore be rejectable by it.
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", ["ORDER_BLOCK_RETEST"]), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "NOT_IN_PREMIUM_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]):
+            result = self._run(
+                ltf_close=93.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH,
+                ltf_analysis=analysis,
+                sweep_direction=None,
+                ema_value=115.0,
+                order_block_retest_direction="BEARISH",
+                order_block_retest_level=88,
+                # BEARISH trade, EMA sloping UP -> opposed
+                ltf_trend_ema=100.0,
+                htf_trend_ema_prior=95.0,
+            )
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "LTF_TREND_SLOPE_OPPOSED")
+
+
+class StructureBreakTriggerEnabledTests(unittest.TestCase):
+    """config.STRUCTURE_BREAK_TRIGGER_ENABLED (2026-09-26) - the original
+    trigger had no enable gate until Phase 2 needed to run one trigger at a
+    time. Default True, so these assert the gate is actually WIRED rather
+    than merely declared: the module-level pin keeps it True for every other
+    test in this file, so without a real gate a False here would change
+    nothing and this class would silently pass on a no-op.
+
+    Deliberately NOT subclassing SignalEngineTests - that would re-run all of
+    its ~326 test methods under this class name too (caught doing exactly
+    that: the suite jumped 2312 -> 2641). `_run` touches no instance state, so
+    it is rebound here as a plain helper instead."""
+
+    _run = SignalEngineTests._run
+
+    def test_structure_break_fires_when_enabled(self):
+        with patch.object(config, "STRUCTURE_BREAK_TRIGGER_ENABLED", True):
+            result = self._run()
+
+        self.assertEqual(result["signal"], "BUY")
+        self.assertEqual(result["signal_trigger"], "STRUCTURE_BREAK")
+
+    def test_structure_break_produces_no_candidate_when_disabled(self):
+        # Same fixture as above, and sweep/OB-FVG/CHoCH are all off here too,
+        # so STRUCTURE_BREAK is the ONLY trigger that could qualify - with it
+        # gated off the candidate list must be empty, which signal_engine
+        # reports as NO_LIVE_STRUCTURE_BREAK.
+        with patch.object(config, "STRUCTURE_BREAK_TRIGGER_ENABLED", False), \
+             patch.object(config, "LIQUIDITY_SWEEP_TRIGGER_ENABLED", False), \
+             patch.object(config, "OB_FVG_RETEST_TRIGGER_ENABLED", False), \
+             patch.object(config, "CHOCH_RETEST_TRIGGER_ENABLED", False), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", False), \
+             patch.object(config, "EMA_PULLBACK_TRIGGER_ENABLED", False):
+            result = self._run()
+
+        self.assertIsNone(result["signal"])
+        self.assertEqual(result["reason"], "NO_LIVE_STRUCTURE_BREAK")
+
+    def test_disabling_structure_break_lets_a_lower_priority_trigger_win(self):
+        # The point of the flag: STRUCTURE_BREAK is priority #1 and otherwise
+        # masks lower-priority triggers that also qualify on the same candle.
+        analysis = dict(LTF_BEARISH_BREAK)
+        analysis["live_break"] = {"broken": False}
+
+        with patch.object(config, "STRUCTURE_BREAK_TRIGGER_ENABLED", False), \
+             patch.object(config, "ORDER_BLOCK_RETEST_TRIGGER_ENABLED", True), \
+             patch.object(config, "NOT_IN_PREMIUM_EXEMPT_TRIGGERS", ["ORDER_BLOCK_RETEST"]):
+            result = self._run(
+                ltf_close=93.0,
+                cvd={"available": True, "cvd_score": -0.5},
+                depth={"available": True, "depth_imbalance": -0.2},
+                htf_structure=HTF_BEARISH,
+                ltf_analysis=analysis,
+                sweep_direction=None,
+                ema_value=115.0,
+                order_block_retest_direction="BEARISH",
+                order_block_retest_level=88,
+            )
+
+        self.assertEqual(result["signal"], "SELL")
+        self.assertEqual(result["signal_trigger"], "ORDER_BLOCK_RETEST")
 
 
 if __name__ == "__main__":

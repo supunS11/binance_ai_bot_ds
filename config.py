@@ -672,6 +672,36 @@ PREMIUM_DISCOUNT_LOOKBACK_CANDLES = env_int(
 # tighter, so if anything this understates how often SL would have hit,
 # making these positive numbers a conservative floor. Default empty - same
 # env_str_list empty-default gotcha as every other *_EXEMPT_TRIGGERS flag.
+#
+# 2026-09-26 CORRECTION, ORDER_BLOCK_RETEST removed from .env's default -
+# re-derived against real klines under today's live config rather than the
+# reject journal above: 300 symbols x 365d, the project's own stop/target
+# model (trigger_lab.stop_price "structure", TP1_R_MULTIPLE target),
+# first-touch-wins, net of fees (gate_lab's 0.07% round trip), n=19,288
+# resolved trades. The exempted (zone-WRONG) SELL population - the one this
+# flag actually ungates, since NOT_IN_DISCOUNT already gates BUYs - nets
+# -0.0526R/trade (-492.8R total, consistently worse both out-of-sample
+# halves) against +0.0127R/trade (+19.1R total) for zone-OK SELLs. Whole-
+# trigger effect: live-equivalent population -0.0388R/trade (-511.6R over
+# the sample, n=13,181) -> zone required both sides -0.0049R/trade (-18.8R,
+# n=3,815, 29% of volume) - turns a losing trigger into roughly breakeven,
+# not into a profit; there is no directional edge being unlocked here, only
+# a bad population being filtered out (consistent with this trigger's
+# direction being separately measured as unresolved, ~48.8% vs ~49% random
+# - see project_order_block_retest_sell_side_no_edge.md).
+#
+# This is the third NOT_IN_PREMIUM/AGAINST_HTF_BIAS-style exemption built
+# from the reject-journal replay method that did not survive re-derivation
+# against real klines under the current live config - see the 2026-09-14
+# correction just above (STRUCTURE_BREAK/LIQUIDITY_SWEEP) and the
+# 2026-09-23 correction on AGAINST_HTF_BIAS_EXEMPT_TRIGGERS further down
+# this file for the other two instances of the same pattern.
+#
+# CHOCH_RETEST is untouched - not audited this pass (one-trigger-at-a-time),
+# stays exempted pending its own turn. A related hypothesis that
+# AGAINST_HTF_BIAS rejects the more accurate population was tested the same
+# way and refuted (pooled result looked stable but flips when split by
+# side) - no change proposed there.
 NOT_IN_PREMIUM_EXEMPT_TRIGGERS = env_str_list("NOT_IN_PREMIUM_EXEMPT_TRIGGERS", [])
 # 2026-09-06, real evidence, operator-proposed. The NOT_IN_DISCOUNT/
 # NOT_IN_PREMIUM gate (signal_engine._evaluate_direction) asks only WHERE
@@ -958,6 +988,50 @@ LTF_TREND_FILTER_ENABLED = env_bool("LTF_TREND_FILTER_ENABLED", "False")
 # NOT_IN_DISCOUNT/NOT_IN_PREMIUM, DEPTH_OPPOSING,
 # HTF_TREND_SWING_AGE_REJECT_ENABLED.
 LTF_TREND_EMA_PERIOD = env_int("LTF_TREND_EMA_PERIOD", 20)
+# --- 1H EMA SLOPE GATE (LTF_TREND_SLOPE_OPPOSED) --------------------------
+# 2026-09-26. A different read from LTF_TREND_FILTER_ENABLED above: that asks
+# WHERE PRICE SITS relative to its 1h EMA20; this asks whether the EMA ITSELF
+# is rising or falling (EMA now vs EMA LTF_TREND_SLOPE_LOOKBACK_CANDLES ago),
+# the 1h sibling of HTF_TREND_LIVE_STRENGTH_REJECT_ENABLED's slope check.
+#
+# WHY A NEW GATE RATHER THAN RETUNING AGAINST_HTF_BIAS. The live trend read
+# (htf_trend_live, 4h EMA20 = 80h of memory) was measured NOT WORKING for
+# ORDER_BLOCK_RETEST: on 290 held-out symbols it failed all three
+# pre-registered criteria (net R gap -0.0109R, ordering FLIPS between calendar
+# halves, specific lift -1.0pp vs a matched random control). OBR's own median
+# resolution is 8h (p75 17h) with a median 2.23% stop / 3.35% target, so an 80h
+# read is ~10x the trade's clock. Faster 1h reads were stable where the 4h one
+# was not - see [[project-trend-ema-horizon-matters]].
+#
+# EVIDENCE (300 symbols x 365d in-sample, then 290 UNSEEN symbols held-out;
+# candidates and pass criteria pre-registered before the held-out data existed;
+# pure direction AND net-of-fees R under the live stop/target model, matched
+# random twin, split-half on the ORDERING):
+#   full population, held-out:  ALL +0.0470R  BUY +0.0569R  SELL +0.0401R, all CONSISTENT
+#   zone-OK (the live population, post NOT_IN_PREMIUM fix), held-out:
+#                               pooled +0.0257R CONSISTENT specific +1.9pp  -> PASS
+#                               SELL   +0.0856R CONSISTENT specific +1.4pp  -> PASS
+#                               BUY    -0.0050R FLIPS                       -> FAIL
+# So the deployable unit (the whole OBR population) passes, but the BENEFIT IS
+# SELL-CONCENTRATED and the BUY half is a small unvalidated drag (~-0.005R,
+# essentially noise, not a measured harm). Stated plainly rather than hidden in
+# a pooled average - the zone gate and a trend filter overlap on BUY (price in
+# discount and price above its own 1h EMA are correlated), which is why the
+# in-sample BUY result (+0.0877R) did not replicate.
+#
+# SCOPED BY TRIGGER, not universal - the opposite choice from
+# LTF_TREND_FILTER_ENABLED above, and for the opposite reason: that flag's
+# validation covered EVERY trigger with no exemption, while this one was
+# measured on ORDER_BLOCK_RETEST ONLY. An APPLY list (not an exempt list) so it
+# is inert until a trigger has its own evidence, which is exactly the Phase 2
+# one-trigger-at-a-time shape. Default [] = inert, so this ships as a no-op
+# until .env opts a trigger in. Same env_str_list empty-default gotcha as every
+# other list flag here: a blank .env value falls back to this default.
+LTF_TREND_SLOPE_TRIGGERS = env_str_list("LTF_TREND_SLOPE_TRIGGERS", [])
+# Candles back for the slope comparison. 3 is the value the evidence above was
+# measured with (the run reused HTF_TREND_LIVE_SLOPE_LOOKBACK_CANDLES' default);
+# kept as its own knob since this reads 1h candles, not 4h.
+LTF_TREND_SLOPE_LOOKBACK_CANDLES = env_int("LTF_TREND_SLOPE_LOOKBACK_CANDLES", 3)
 # config.EMA_TREND_MIXED_REJECT_ENABLED - 2026-09-05, operator-requested
 # ("Mixed" gate), real evidence over 111 resolved LIVE trades. EMA50 vs
 # EMA200 read on BOTH 1h and 4h at entry (EMA50 > EMA200 = BULLISH), then
@@ -1553,6 +1627,27 @@ LONG_SHORT_RATIO_CROWD_THRESHOLD = env_float("LONG_SHORT_RATIO_CROWD_THRESHOLD",
 # latency. Reversible at zero cost if the next batch doesn't show
 # separation - see market_structure.live_break_check.
 REQUIRE_CLOSE_CONFIRMED_BREAK = env_bool("REQUIRE_CLOSE_CONFIRMED_BREAK", "True")
+# config.STRUCTURE_BREAK_TRIGGER_ENABLED - 2026-09-26. The ORIGINAL trigger,
+# which until now had no flag at all: signal_engine.py appended its candidate
+# unconditionally on `live_break["broken"]`, unlike all eight alternative
+# triggers below/above, each of which has its own *_TRIGGER_ENABLED gate.
+# Added so Phase 2 can run ONE trigger at a time (audit it, then re-enable it),
+# which is impossible while the priority-#1 trigger cannot be switched off.
+#
+# Why this matters beyond tidiness: candidates are built for EVERY qualifying
+# trigger and one wins on priority (signal_engine.py:681-692). STRUCTURE_BREAK
+# is priority #1 and fires on ~30.9% of bars while ORDER_BLOCK_RETEST is #6 at
+# ~3.6%, so a large share of OBR detections measured in replay would have been
+# overridden live and never traded as OBR at all. Every per-trigger replay
+# result is therefore measured on a broader population than live trading
+# reaches, until the higher-priority triggers can actually be turned off.
+#
+# DEFAULT "True", deliberately INVERTING this file's "new trigger flags default
+# OFF" convention. That convention exists because those flags gate NEW,
+# unvalidated triggers, where OFF is the inert/no-op default. This one gates the
+# INCUMBENT, so inert-when-absent means True - defaulting it False would
+# silently disable the base trigger on any deploy whose .env lacks the line.
+STRUCTURE_BREAK_TRIGGER_ENABLED = env_bool("STRUCTURE_BREAK_TRIGGER_ENABLED", "True")
 # Second, alternative entry trigger alongside a live LTF structure break -
 # a detected liquidity sweep (liquidity_sweep.detect_sweep: a wick through
 # a known pool that closes back inside, the "run the stops then reverse"

@@ -24,14 +24,31 @@ import signal_journal
 _confluence_flag_patcher = patch.object(
     config, "CONFLUENCE_INDEPENDENT_EVIDENCE_ONLY_ENABLED", False
 )
+# config.STRUCTURE_BREAK_TRIGGER_ENABLED - pinned TRUE for the whole module.
+# The live .env sets it False (Phase 2 runs one trigger at a time), but the
+# fixtures here drive signal_engine.evaluate() through a live_break and assert
+# on the resulting STRUCTURE_BREAK signal/reject tally, so the live value would
+# remove the trigger those assertions are about. Same insulation pattern as the
+# confluence pin above and tests/test_signal_engine.py's _audit_batch_patchers.
+_structure_break_trigger_patcher = patch.object(
+    config, "STRUCTURE_BREAK_TRIGGER_ENABLED", True
+)
+# config.LTF_TREND_SLOPE_TRIGGERS - pinned inert (empty). The live .env scopes
+# this gate to ORDER_BLOCK_RETEST; these fixtures drive evaluate() and assert on
+# specific reject reasons/tallies, which a new reject reason would shift.
+_ltf_trend_slope_patcher = patch.object(config, "LTF_TREND_SLOPE_TRIGGERS", [])
 
 
 def setUpModule():
     _confluence_flag_patcher.start()
+    _structure_break_trigger_patcher.start()
+    _ltf_trend_slope_patcher.start()
 
 
 def tearDownModule():
     _confluence_flag_patcher.stop()
+    _structure_break_trigger_patcher.stop()
+    _ltf_trend_slope_patcher.stop()
 
 
 class RejectJournalGatingTests(unittest.TestCase):
